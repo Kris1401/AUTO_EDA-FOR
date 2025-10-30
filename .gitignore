@@ -1,0 +1,48 @@
+# ── środowiska / venv / conda
+.vscode/
+*.code-workspace
+.venv/
+venv/
+env/
+*.egg-info/
+
+# ── cache'y i kompilaty Pythona
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# ── lokalne artefakty danych i logi
+AUTO_EDA_FOR/
+C:/AUTO_EDA_FOR/
+**/ingest/*.csv
+**/ingest/*.xlsx
+**/ingest/*.json
+**/ingest/*.zip
+**/ingest/*.pdf
+**/ingest/*.parquet
+**/ingest/*_masked*.*
+**/ingest/*_full_*.*
+
+# katalog z artefaktami, który tworzymy przy „Przelicz na całości”
+ingest/**/world-happiness-report__*__full_masked.csv
+ingest/**/world-happiness-report__*__meta.json
+
+# ── session_state snapshoty / tymczasowe pliki użytkownika
+**/tmp/
+tmp/
+*.tmp
+
+# ── sekrety i klucze
+.env
+.env.local
+secrets.toml
+
+# ── rzeczy specyficzne dla Streamlit / cache
+.streamlit/secrets.toml
+.streamlit/*.json
+.streamlit/cache/
+.streamlit/.cache/
+
+# ── systemowe
+.DS_Store
+Thumbs.db
