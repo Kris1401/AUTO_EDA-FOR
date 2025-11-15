@@ -4,7 +4,7 @@ from ui.theme import apply_theme
 from core.config import load_config
 import os
 
-st.set_page_config(page_title="AUTO EDA FOR — MVP", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="AUTO EDA FOR", page_icon="🔮", layout="wide")
 apply_theme()
 
 lang = st.sidebar.selectbox("Language / Język", options=["PL", "EN"], index=0 if get_locale()=="PL" else 1)

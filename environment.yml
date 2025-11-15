@@ -38,4 +38,6 @@ dependencies:
       - catboost==1.2.*
       - sktime==0.26.0
       - date-a-scientist==0.1.19  # opcjonalne (tryb "Laboratorium" w Data Chat)
+      - elevenlabs
+      - pyttsx3
       
