@@ -1,4 +1,4 @@
-# AUTO EDA FOR — MVP (Etap 0 → Etap 1)
+# AUTO EDA FOR (Etap 0 → Etap 1)
 
 Asystent analizy danych i przygotowania modelu ML w Streamlit:
 - Wgrywasz plik (CSV / XLSX / PDF-tabela),
@@ -64,15 +64,15 @@ W tej chwili **nie wymagamy osobnego wirtualnego środowiska**, ale zalecamy mie
 2. Zainstaluj zależności:
    ```bash
    pip install -r requirements.txt
-
+   
 Jeśli używasz conda i chcesz mieć powtarzalne środowisko, możesz też zrobić:
-   ```bash
-    conda env create -f environment.yml
-    conda activate auto-eda-for
-ale nie jest to wymagane do prostego uruchomienia aplikacji.
+    ```bash
+conda env create -f environment.yml
+conda activate auto-eda-for
+    ale nie jest to wymagane do prostego uruchomienia aplikacji.
 
 3. Uruchom aplikację Streamlit:
-   ```bash
+  ```bash
    streamlit run app/app.py
    
 4. Aplikacja otworzy się w przeglądarce (domyślnie http://localhost:8501).

@@ -2,7 +2,7 @@ import streamlit as st
 _DEFAULT = "PL"
 _STRINGS = {
  "PL": {
-  "app.title": "AUTO EDA FOR — MVP",
+  "app.title": "AUTO EDA FOR",
   "app.subtitle": "Szkielet aplikacji (Etap 0): nawigacja, i18n, motyw, walidacja konfiguracji.",
   "home.config_status": "Status konfiguracji",
   "home.config_ok": "Konfiguracja wygląda dobrze. Możesz przejść dalej.",
@@ -20,7 +20,7 @@ _STRINGS = {
   "settings.values": "Bieżące (maskowane) wartości",
  },
  "EN": {
-  "app.title": "AUTO EDA FOR — MVP",
+  "app.title": "AUTO EDA FOR",
   "app.subtitle": "Application skeleton (Stage 0): navigation, i18n, theme, config validation.",
   "home.config_status": "Configuration status",
   "home.config_ok": "Configuration looks good. You can proceed.",

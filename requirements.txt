@@ -9,3 +9,9 @@ itables>=2.1
 pyyaml>=6.0
 openai>=1.51
 langfuse>=2.33
+altair==5.2.0
+openai
+elevenlabs
+pyttsx3
+python-dotenv
+langfuse==3.8.1*  # Python SDK
