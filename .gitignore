@@ -47,6 +47,7 @@ secrets.toml
 .DS_Store
 Thumbs.db
 
+logs.log
 *.log
 data/
 mlruns/
