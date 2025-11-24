@@ -7,15 +7,17 @@ import pandas as pd
 
 @dataclass
 class LoadMeta:
-    source_name: str
-    file_size_mb: float
     n_rows: int
     n_cols: int
-    sample_used: bool
-    engine: str
+    source_name: str           # np. nazwa pliku
+    engine: str                # np. 'csv_pandas', 'excel_openpyxl', 'parquet_pyarrow'
     encoding: Optional[str] = None
-    sheet_name: Optional[str] = None
-    notes: Optional[str] = None
+    notes: str = ""
+    # ile wierszy jest w PREVIEW (podglądzie); None = brak informacji
+    preview_rows: Optional[int] = None
+    # nowe pola – opcjonalne (ważne!)
+    file_size_mb: Optional[float] = None
+    sample_used: bool = False
 
 # ---------- helpers ----------
 def excel_sheet_names(file_bytes: bytes) -> List[str]:
@@ -160,6 +162,49 @@ def load_pdf_tables(
     )
     return df, meta
 
+# ---------- PARQUET ----------
+
+def load_parquet_smart(
+    file_bytes: bytes,
+    file_name: str,
+    preview_limit: int | None = None,
+) -> tuple[pd.DataFrame, LoadMeta]:
+    """Wczytanie pliku .parquet z próbkowaniem jak w CSV/XLSX."""
+
+    # 1. Wczytujemy pełny plik do DataFrame
+    buffer = io.BytesIO(file_bytes)
+    df_full = pd.read_parquet(buffer, engine="pyarrow")
+
+    n_full_rows, n_cols = df_full.shape
+
+    # 2. Przygotowujemy podgląd (tak jak w CSV/XLSX)
+    if preview_limit is not None and n_full_rows > preview_limit:
+        df_preview = df_full.head(preview_limit).copy()
+        n_prev_rows = preview_limit
+        sample_used = True
+    else:
+        df_preview = df_full.copy()
+        n_prev_rows = n_full_rows
+        sample_used = False
+
+    # 3. Meta dane
+    base_name = os.path.basename(file_name)
+    size_mb = round(len(file_bytes) / (1024 ** 2), 2)
+
+    meta = LoadMeta(
+        n_rows=n_prev_rows,
+        n_cols=n_cols,
+        source_name=base_name,
+        engine="parquet_pyarrow",
+        encoding=None,
+        notes="Plik Parquet (PyArrow)",
+        preview_rows=n_prev_rows,   # <<--- NAZWA ZGODNA Z KLASĄ
+        file_size_mb=size_mb,
+        sample_used=sample_used,
+    )
+
+    return df_preview, meta
+
 # ---------- Router ----------
 def load_any(
     file_bytes: bytes,
@@ -171,10 +216,46 @@ def load_any(
     pdf_flavor: str = "lattice",
 ) -> Tuple[pd.DataFrame, LoadMeta]:
     name = file_name.lower()
+
+    # CSV
     if name.endswith(".csv"):
-        return load_csv_smart(file_bytes, file_name, preview_limit, sep_choice=csv_sep)
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        return load_excel_smart(file_bytes, file_name, sheet_name=xlsx_sheet, preview_limit=preview_limit)
-    if name.endswith(".pdf"):
-        return load_pdf_tables(file_bytes, file_name, pages=pdf_pages, flavor=pdf_flavor, preview_limit=preview_limit)
-    raise ValueError("Nieobsługiwane rozszerzenie: CSV, XLSX, PDF.")
+        return load_csv_smart(
+            file_bytes,
+            file_name,
+            preview_limit,
+            sep_choice=csv_sep,
+        )
+
+    # XLS / XLSX
+    elif name.endswith(".xlsx") or name.endswith(".xls"):
+        return load_excel_smart(
+            file_bytes,
+            file_name,
+            sheet_name=xlsx_sheet,
+            preview_limit=preview_limit,
+        )
+
+    # PDF
+    elif name.endswith(".pdf"):
+        return load_pdf_tables(
+            file_bytes,
+            file_name,
+            pages=pdf_pages,
+            flavor=pdf_flavor,
+            preview_limit=preview_limit,
+        )
+
+    # PARQUET  <<< NOWY BLOK >>>
+    elif name.endswith(".parquet"):
+        return load_parquet_smart(
+            file_bytes,
+            file_name,
+            preview_limit=preview_limit,
+        )
+
+
+    # nic nie pasuje
+    else:
+        raise ValueError("Nieobsługiwane rozszerzenie: CSV, XLSX, PDF, PARQUET.")
+
+

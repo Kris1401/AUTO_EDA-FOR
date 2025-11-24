@@ -1,10 +1,17 @@
 # app/pages/01_Analiza_Danych.py
 from __future__ import annotations
-import os, io, json, zipfile
+
+import os
+import io
+import json
+import zipfile
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+
 import streamlit as st
 import pandas as pd
+from pandas.api.types import is_datetime64_any_dtype
 
 from core.i18n import t
 from core.config import load_config, resolve_artifacts_dir
@@ -12,29 +19,86 @@ from core.pii import mask_dataframe
 from ingest import load_any, excel_sheet_names
 
 from streamlit.components.v1 import html as st_html
-from itables import to_html_datatable
 
-try:
-    from itables.streamlit import interactive_table
-    HAS_ITABLES = True
-except Exception:
-    HAS_ITABLES = False
+# -------------------------------------------------
+# GLOBALNY STYL — spójny z Etapem 2 + uploader
+# -------------------------------------------------
+st.markdown(
+    """
+<style>
+/* =========================================================
+   1) FILE UPLOADER – ukryj wbudowany pasek z nazwą pliku + X
+   ========================================================= */
 
-try:
-    from itables import options as itbl_options
-    # Ustawienia DataTables — domyślnie 25 wierszy i pionowy scroll
-    itbl_options.classes = "display stripe compact"
-    itbl_options.pageLength = 25
-    itbl_options.lengthMenu = [10, 25, 50]
-    # itbl_options.scrollY = "60vh"       # przewijanie wewnątrz tabeli
-    # itbl_options.scrollCollapse = True
-    # itbl_options.scrollX = True
-except Exception:
-    pass
+/* Cała linia z nazwą pliku i X-em pod dropzone */
+div[data-testid="stFileUploaderFile"] {
+    display: none !important;
+}
 
 
-# === itables via iframe (DataTables) — render helper (minimal patch) ===
-def _render_itables_html(df, body_px: int, page_len: int) -> tuple[str, int]:
+/* Na wszelki wypadek – nazwa pliku i przycisk kasowania */
+[data-testid="stFileUploaderFileName"],
+[data-testid="stFileUploaderDeleteBtn"],
+[data-testid="stFileUploaderPagination"] {
+    display: none !important;
+}
+
+/* =========================================================
+   2) KPI – taki sam wygląd jak w Etapie 2
+   ========================================================= */
+
+.kpi-card {
+    background-color: #f5f5f7;
+    border-radius: 0.75rem;
+    padding: 0.75rem 1rem;
+    border: 1px solid #e5e7eb;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    min-height: 90px;
+}
+
+.kpi-label {
+    font-size: 0.78rem;
+    font-weight: 500;
+    letter-spacing: 0;
+    text-transform: none;
+    color: #6b7280;
+}
+
+.kpi-value {
+    font-size: 1.25rem;
+    font-weight: 600;
+    margin-top: 0.1rem;
+    color: #111827;
+}
+
+.kpi-sub {
+    font-size: 0.75rem;
+    margin-top: 0.1rem;
+    color: #6b7280;
+}
+
+.kpi-value--ok {
+    color: #16a34a;
+}
+
+.kpi-value--warn {
+    color: #ea580c;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# =================================================
+# itables / DataTables – helper
+# =================================================
+
+
+def _render_itables_html(
+    df: pd.DataFrame, body_px: int, page_len: int
+) -> tuple[str, int]:
     """
     body_px  -> wysokość przewijanej części tabeli (scrollY) sterowana suwakiem
     page_len -> entries per page (np. 10/25/50/100)
@@ -42,13 +106,11 @@ def _render_itables_html(df, body_px: int, page_len: int) -> tuple[str, int]:
     """
     import json as _json
 
-    # Stałe „nad i pod” ciałem tabeli (nagłówek, info+pagination, obramowania)
     HEADER = 56
     FOOTER = 54
     BORDERS = 10
     iframe_h = int(body_px + HEADER + FOOTER + BORDERS)
 
-    # Dane i kolumny
     records = df.to_dict(orient="records")
     columns = [{"title": c, "data": c} for c in df.columns]
 
@@ -59,10 +121,9 @@ def _render_itables_html(df, body_px: int, page_len: int) -> tuple[str, int]:
 
 <style>
   html, body, #wrap {{ margin:0 !important; padding:0 !important; }}
-  .dataTables_scroll {{ margin-bottom:0 !important; }}  /* zero luzu pod scrollem */
+  .dataTables_scroll {{ margin-bottom:0 !important; }}
   .dataTables_wrapper .dataTables_info {{ margin-top:6px !important; }}
   .dataTables_wrapper .dataTables_paginate {{ margin-top:6px !important; }}
-  /* spójna czcionka jak w reszcie aplikacji */
   .dataTables_wrapper, table.dataTable thead th, table.dataTable tbody td {{
       font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif !important;
       font-size: 14px !important;
@@ -77,7 +138,7 @@ def _render_itables_html(df, body_px: int, page_len: int) -> tuple[str, int]:
 <script>
   const data = {_json.dumps(records)};
   const columns = {_json.dumps(columns)};
-  const scrollY = {int(body_px)};  // sterowane suwakiem
+  const scrollY = {int(body_px)};
   const pageLen = {int(page_len)};
 
   $(document).ready(function(){{
@@ -98,6 +159,7 @@ def _render_itables_html(df, body_px: int, page_len: int) -> tuple[str, int]:
 """
     return html, iframe_h
 
+
 def _to_excel_bytes(df: pd.DataFrame) -> bytes:
     """
     Zwraca bytes gotowego pliku XLSX.
@@ -105,27 +167,20 @@ def _to_excel_bytes(df: pd.DataFrame) -> bytes:
     a jeśli go nie ma – fallback do openpyxl.
     """
     buf = io.BytesIO()
-
-    # spróbuj xlsxwriter
     try:
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
             df.to_excel(writer, sheet_name="data", index=False)
     except ModuleNotFoundError:
-        # brak xlsxwriter -> użyj openpyxl
-        buf = io.BytesIO()  # nowy bufor, żeby nie zwrócić śmieci po nieudanej próbie
+        buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name="data", index=False)
-
-    # bardzo ważne: przewiń bufor na początek przed zwrotem
     buf.seek(0)
     return buf.getvalue()
 
 
 def _preview_download_buttons(df_view: pd.DataFrame):
     """
-    Rysuje przyciski pobierania podglądu danych (CSV / XLSX),
-    żeby użytkownik mógł od razu zabrać dane 'jak je widzi', tzn.
-    po ewentualnym maskowaniu PII.
+    Przyciski pobierania podglądu (CSV / XLSX) – na df po maskowaniu PII.
     """
     col_csv, col_xlsx, _ = st.columns([1, 1, 6])
 
@@ -136,7 +191,7 @@ def _preview_download_buttons(df_view: pd.DataFrame):
             file_name="preview_masked.csv",
             mime="text/csv",
             key="dl_csv_preview",
-            help="Eksport podglądu (po maskowaniu PII) do CSV."
+            help="Eksport podglądu (po maskowaniu PII) do CSV.",
         )
 
     with col_xlsx:
@@ -144,129 +199,722 @@ def _preview_download_buttons(df_view: pd.DataFrame):
             "⬇ XLSX (podgląd)",
             data=_to_excel_bytes(df_view),
             file_name="preview_masked.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
             key="dl_xlsx_preview",
-            help="Eksport podglądu (po maskowaniu PII) do Excela."
+            help="Eksport podglądu (po maskowaniu PII) do Excela.",
         )
 
+
+def _zip_bytes(df_out: pd.DataFrame, meta_obj, base_name: str) -> bytes:
+    """
+    ZIP z artefaktami podglądu (CSV + meta.json).
+    """
+    buf = io.BytesIO()
+    safe_base = base_name.replace(" ", "_")
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(f"{safe_base}__preview_masked.csv", df_out.to_csv(index=False))
+        z.writestr(
+            f"{safe_base}__meta.json",
+            json.dumps(meta_obj.__dict__, ensure_ascii=False, indent=2),
+        )
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# =================================================
+# KPI – kafelki jak w Etapie 2
+# =================================================
+
+def _show_kpi_block(df_preview: pd.DataFrame, mask_pii: bool, meta_obj):
+    """
+    Lekkie KPI po wczytaniu:
+    - Wiersze × Kolumny
+    - Typy (num / kat / data)
+    - Status maskowania PII
+    """
+    num_cols = df_preview.select_dtypes(include="number").columns
+    cat_cols = df_preview.select_dtypes(
+        include=["object", "category", "bool"]
+    ).columns
+    date_cols = [
+        col for col in df_preview.columns
+        if is_datetime64_any_dtype(df_preview[col])
+    ]
+
+    rows_txt = f"{meta_obj.n_rows:,}"
+    cols_txt = f"{meta_obj.n_cols:,}"
+    types_txt = (
+        f"{len(num_cols)} num · {len(cat_cols)} kat · {len(date_cols)} data"
+    )
+    pii_txt = "Włączone" if mask_pii else "Wyłączone"
+    pii_class = "kpi-value kpi-value--ok" if mask_pii else "kpi-value"
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+              <div class="kpi-label">Wiersze × Kolumny</div>
+              <div class="kpi-value">{rows_txt} × {cols_txt}</div>
+              <div class="kpi-sub">Rozmiar próbki podglądu</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+              <div class="kpi-label">Kolumny numeryczne</div>
+              <div class="kpi-value">{len(num_cols)}</div>
+              <div class="kpi-sub">
+                Możliwe cechy do modeli regresji / klasyfikacji
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with c3:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+              <div class="kpi-label">Typy kolumn</div>
+              <div class="kpi-value">{types_txt}</div>
+              <div class="kpi-sub">Rozkład typów w aktualnym podglądzie</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with c4:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+              <div class="kpi-label">Maskowanie PII</div>
+              <div class="{pii_class}">{pii_txt}</div>
+              <div class="kpi-sub">
+                Ochrona danych wrażliwych w podglądzie
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+# =================================================
+# DEMO – PyCaret + 3 publiczne TimeSeries (DO)
+# =================================================
+
+# 3 publiczne szeregi czasowe – wczytywane z URL (np. DigitalOcean Spaces).
+# Użytkownik ustawia zmienne środowiskowe:
+# TS_RETAIL_URL, TS_TEMPERATURE_URL, TS_ENERGY_URL
+PUBLIC_TS_DEMOS: dict[str, dict] = {
+    "🌍 Publiczny TS (DO) · Sprzedaż detaliczna": {
+        # uniwersalny typ: remote_file (CSV lub Parquet)
+        "kind": "remote_file",
+        "url_env": "TS_RETAIL_URL",
+        # lokalny fallback jest w formacie Parquet:
+        "local_path": "data/ts_online_retail_transactions.parquet",
+        "file_format": "parquet",  # ⬅️ nowy klucz: jasno mówimy, że to Parquet
+        "task": "Szereg czasowy",
+        "description": "Miesięczna sprzedaż detaliczna (dane publiczne).",
+        "label_short": "TS: sprzedaż detaliczna",
+    },
+    "🌍 Publiczny TS (DO) · Temperatury": {
+        "kind": "remote_file",
+        "url_env": "TS_TEMPERATURE_URL",
+        "local_path": "data/ts_temperature_global_berkeley_monthly.csv",
+        "file_format": "csv",
+        "task": "Szereg czasowy",
+        "description": "Długoterminowe pomiary temperatury.",
+        "label_short": "TS: temperatury",
+    },
+    "🌍 Publiczny TS (DO) · Zużycie energii": {
+        "kind": "remote_file",
+        "url_env": "TS_ENERGY_URL",
+        "local_path": "data/ts_energy_household_daily.csv",
+        "file_format": "csv",
+        "task": "Szereg czasowy",
+        "description": "Profil zużycia energii elektrycznej.",
+        "label_short": "TS: energia",
+    },
+}
+
+
+
+@st.cache_data(show_spinner=False)
+def _build_pycaret_demo_index() -> dict[str, dict]:
+    """
+    Buduje słownik demo-zbiorów z PyCaret dla zadań:
+    klasyfikacja, regresja, klastrowanie, time series.
+    Klucz: label dla selectboxa (bez słowa 'PyCaret').
+    """
+    try:
+        from pycaret.datasets import get_data
+    except Exception:
+        return {}
+
+    try:
+        idx = get_data("index")
+    except Exception:
+        return {}
+
+    df_idx = pd.DataFrame(idx)
+    lower_map = {c.lower(): c for c in df_idx.columns}
+
+    dataset_col = next(
+        (orig for low, orig in lower_map.items() if "dataset" in low),
+        df_idx.columns[0],
+    )
+    task_col = next(
+        (orig for low, orig in lower_map.items() if "task" in low),
+        None,
+    )
+    desc_col = next(
+        (orig for low, orig in lower_map.items()
+         if "description" in low or "desc" in low or "brief" in low),
+        None,
+    )
+
+    demos: dict[str, dict] = {}
+
+    for _, row in df_idx.iterrows():
+        raw_task = str(row[task_col]).lower() if task_col else ""
+        if not any(
+            kw in raw_task
+            for kw in ["classification", "regression", "cluster", "time series", "forecast"]
+        ):
+            continue
+
+        ds_name = str(row[dataset_col])
+        if not ds_name or ds_name.lower() == "nan":
+            continue
+
+        if "class" in raw_task:
+            nice_task = "Klasyfikacja"
+        elif "regress" in raw_task:
+            nice_task = "Regresja"
+        elif "cluster" in raw_task:
+            nice_task = "Klasteryzacja"
+        else:
+            nice_task = "Szereg czasowy"
+
+        desc = str(row[desc_col]) if desc_col else ""
+        if desc.lower() == "nan":
+            desc = ""
+
+        label = f"{nice_task} · {ds_name}"
+        if desc:
+            label += f" — {desc}"
+
+        demos[label] = {
+            "kind": "pycaret",
+            "dataset": ds_name,
+            "task": nice_task,
+            "description": desc,
+            "label_short": f"{nice_task}: {ds_name}",
+        }
+
+    # Ręczne dociągnięcie klasycznych TS z PyCaret TimeSeries (jeśli brak w index)
+    for extra_ds, extra_label in {
+        "airline": "Szereg czasowy · Linie lotnicze (airline)",
+        "uschange": "Szereg czasowy · Zmiany gospodarcze USA (uschange)",
+    }.items():
+        if extra_label not in demos:
+            demos[extra_label] = {
+                "kind": "pycaret",
+                "dataset": extra_ds,
+                "task": "Szereg czasowy",
+                "description": "",
+                "label_short": f"Szereg czasowy: {extra_ds}",
+            }
+
+    return demos
+
+
+def _load_demo_dataset(spec: dict, preview_limit: int | None = None):
+    """
+    Ładuje zestaw demo (PyCaret / remote CSV/Parquet).
+
+    Zwraca:
+    df_preview, df_full, meta_preview, meta_full, approx_size_mb
+    """
+    kind = spec.get("kind")
+    task = spec.get("task") or ""
+
+    # 1) Wczytanie pełnego zbioru
+    if kind == "pycaret":
+        try:
+            from pycaret.datasets import get_data
+        except Exception as e:
+            st.error(
+                "Nie mogę załadować danych demo, bo pakiet **pycaret** "
+                f"nie jest dostępny.\n\nSzczegóły: {e}"
+            )
+            st.stop()
+
+        df_full = get_data(spec["dataset"])
+
+    elif kind in ("remote_csv", "remote_file"):
+        url_env    = spec.get("url_env", "")
+        url        = os.getenv(url_env, "").strip()
+        local_path = spec.get("local_path")
+        file_format = (spec.get("file_format") or "").lower()
+
+        def _infer_format(path: str) -> str:
+            """Ustala format tabeli na podstawie spec/file extension."""
+            if file_format in ("csv", "parquet"):
+                return file_format
+            if path.lower().endswith(".parquet"):
+                return "parquet"
+            return "csv"
+
+        def _read_table(path: str) -> pd.DataFrame:
+            fmt = _infer_format(path)
+            if fmt == "parquet":
+                # Parquet (np. z DigitalOcean Spaces)
+                return pd.read_parquet(path)
+            else:
+                # CSV – domyślnie
+                return pd.read_csv(path)
+
+        if url:
+            # wariant 1: wczytujemy tabelę z URL (CSV lub Parquet)
+            df_full = _read_table(url)
+        elif local_path and Path(local_path).exists():
+            # wariant 2: fallback – lokalny plik w repo
+            df_full = _read_table(local_path)
+        else:
+            fmt_txt = spec.get("file_format", "CSV lub Parquet")
+            msg = (
+                f"Zestaw demo wymaga zdefiniowania zmiennej środowiskowej "
+                f"`{url_env}` z adresem URL do pliku ({fmt_txt}, np. z DigitalOcean "
+                "Spaces) **lub** umieszczenia pliku lokalnie pod ścieżką "
+                f"`{local_path}`.\n\n"
+                "Ustaw URL w `.env` **albo** dodaj lokalny plik i spróbuj ponownie."
+            )
+            st.error(msg)
+            st.stop()
+
+    else:
+        st.error(f"Nieznany typ zestawu demo: {kind}")
+        st.stop()
+
+    # 2) Bezpieczne rzutowanie na DataFrame (naprawia możliwy błąd 'not enough values to unpack')
+    if isinstance(df_full, pd.Series):
+        df_full = df_full.to_frame()
+    elif not isinstance(df_full, pd.DataFrame):
+        df_full = pd.DataFrame(df_full)
+
+    n_full_rows, n_cols = df_full.shape
+
+    # 3) Podgląd (preview) – lekkie przycięcie do preview_limit
+    if preview_limit is not None and n_full_rows > preview_limit:
+        df_preview = df_full.head(preview_limit).copy()
+        n_prev_rows = preview_limit
+    else:
+        df_preview = df_full.copy()
+        n_prev_rows = n_full_rows
+
+    # 4) Notatki + opis silnika
+    notes = spec.get("description") or ""
+    if kind == "pycaret":
+        notes = (notes + " (źródło: pycaret.datasets.get_data)").strip()
+    elif kind in ("remote_csv", "remote_file"):
+        fmt = (spec.get("file_format") or "").lower()
+        if fmt == "parquet":
+            suffix = " (plik z URL, Parquet)"
+        elif fmt == "csv":
+            suffix = " (plik z URL, CSV)"
+        else:
+            suffix = " (plik z URL)"
+        notes = (notes + suffix).strip()
+
+    source_name = spec.get("label_short") or spec.get("dataset") or spec.get("url_env")
+
+    # 5) Engine – rozróżniamy demo_pycaret / demo_remote_csv / demo_remote_parquet
+    if kind == "pycaret":
+        engine_name = "demo_pycaret"
+    else:
+        fmt = (spec.get("file_format") or "").lower()
+        engine_name = "demo_remote_parquet" if fmt == "parquet" else "demo_remote_csv"
+
+    # 6) Metadane – TU dodajemy task, żeby Etap 2 widział „Szereg czasowy”
+    meta_preview = SimpleNamespace(
+        n_rows=n_prev_rows,
+        n_cols=n_cols,
+        source_name=str(source_name),
+        engine=engine_name,
+        encoding=None,
+        notes=notes,
+        task=task,        # ⬅️ KLUCZOWE: zadanie trafia do meta.json
+    )
+    meta_full = SimpleNamespace(
+        n_rows=n_full_rows,
+        n_cols=n_cols,
+        source_name=str(source_name),
+        engine=engine_name,
+        encoding=None,
+        notes=notes,
+        task=task,        # ⬅️ to samo dla pełnego meta
+    )
+
+    # 7) Szacowany rozmiar w MB – tylko info, nie wpływa na CPU
+    approx_size_mb = round(
+        df_full.memory_usage(deep=True).sum() / (1024 ** 2),
+        2,
+    )
+
+    return df_preview, df_full, meta_preview, meta_full, approx_size_mb
+
+
+# =================================================
+# GŁÓWNA LOGIKA STRONY
+# =================================================
+
 st.title("Analiza Danych — Wczytywanie (Etap 1)")
+st.caption(
+    "Etap **1 z 4** – wczytujesz dane i robisz szybki sanity check, "
+    "zanim przejdziesz do pełnej analizy i trenowania modelu."
+)
 
 cfg, problems = load_config()
 MAX_MB, WARN_ROWS, SAMPLE_ROWS = cfg.max_file_mb, cfg.warn_rows, cfg.sample_rows
+
+# 🔧 Lokalna korekta limitu – pozwól na pliki do 200 MB
+# (nie zmieniamy configu globalnego, tylko to co widzi ta strona)
+MAX_MB = max(MAX_MB, 200)
 
 # ---------------- Sidebar: wspólne ustawienia ----------------
 with st.sidebar:
     st.subheader("Import — ustawienia")
     mask_pii = st.checkbox("Maskuj PII (zalecane)", value=True)
-    preview_rows = st.number_input("Podgląd — maks. wierszy", 1000, 200_000, 5000, step=1000)
-    st.caption(f"Limity: max plik {MAX_MB} MB; ostrzeżenie > {WARN_ROWS:,} wierszy; próbkowanie > {SAMPLE_ROWS:,}.")
+    preview_rows = st.number_input(
+        "Podgląd — maks. wierszy",
+        1000,
+        200_000,
+        5000,
+        step=1000,
+    )
+    st.caption(
+        f"Limity: max plik {MAX_MB} MB; ostrzeżenie > {WARN_ROWS:,} wierszy; "
+        f"próbkowanie > {SAMPLE_ROWS:,}."
+    )
 
-uploaded = st.file_uploader("Wgraj plik CSV / XLSX / PDF", type=["csv","xlsx","xls","pdf"])
+# ---------------- 1. ŹRÓDŁO DANYCH ----------------
+st.header("1. Źródło danych")
+st.write(
+    "Wybierz, czy pracujesz na **własnym pliku**, czy na jednym z przygotowanych "
+    "**zestawów demo** (klasyfikacja, regresja, klastrowanie, szeregi czasowe)."
+)
 
-if not uploaded:
-    st.info("Wgraj plik, aby rozpocząć. Obsługujemy: CSV, XLSX, PDF (tabele).")
-    st.stop()
+source_mode = st.radio(
+    "Skąd chcesz wziąć dane?",
+    ["Mój plik", "Dane demo"],
+    index=0,
+    horizontal=True,
+)
 
-# plik w pamięci (możemy czytać wielokrotnie)
-file_bytes = uploaded.getvalue()
-name_lower = uploaded.name.lower()
-size_mb = round(len(file_bytes) / (1024**2), 2)
-if size_mb > MAX_MB:
-    st.error(f"Plik ma {size_mb} MB, a limit to {MAX_MB} MB.")
-    st.stop()
+is_demo = source_mode == "Dane demo"
 
-# ---------------- Dynamiczne opcje per typ ----------------
 csv_sep = None
 xlsx_sheet = None
 pdf_pages = "1-end"
 pdf_flavor = "lattice"
 
-with st.sidebar:
-    if name_lower.endswith(".csv"):
-        st.markdown("**CSV — ustawienia**")
-        sep_label = st.selectbox("Separator", ["Auto", ",", ";", "\\t"])
-        csv_sep = {",": ",", ";": ";", "\\t": "\t"}.get(sep_label, None)
+file_bytes: bytes | None = None
+base_name = ""
+meta = None
+df_preview: pd.DataFrame | None = None
+df_full_demo: pd.DataFrame | None = None
+meta_full_demo = None
+size_mb = None
 
-    elif name_lower.endswith((".xlsx",".xls")):
-        st.markdown("**XLSX — ustawienia**")
-        try:
-            sheets = excel_sheet_names(file_bytes)
-        except Exception as e:
-            st.error(f"Nie mogę odczytać listy arkuszy: {e}")
-            sheets = []
-        if sheets:
-            xlsx_sheet = st.selectbox("Arkusz", sheets, index=0)
+if not is_demo:
+    # ----- tryb: MÓJ PLIK -----
+    st.caption("Wgraj plik CSV / XLSX / PDF / Parquet")
 
-    elif name_lower.endswith(".pdf"):
-        st.markdown("**PDF — ustawienia**")
-        pdf_pages = st.text_input("Zakres stron (np. 1, 1-3, 1-end)", "1-end")
-        pdf_flavor = st.radio("Tryb detekcji tabel", ["lattice","stream"], index=0, horizontal=True)
+    # prosty mechanizm „resetu” uploadera przez zmianę key
+    if "upload_rev" not in st.session_state:
+        st.session_state.upload_rev = 0
 
-# ---------------- Wczytanie podglądu ----------------
-with st.spinner("Wczytywanie podglądu…"):
-    try:
-        df_preview, meta = load_any(
-            file_bytes, uploaded.name,
-            preview_limit=preview_rows,
-            csv_sep=csv_sep,
-            xlsx_sheet=xlsx_sheet,
-            pdf_pages=pdf_pages,
-            pdf_flavor=pdf_flavor,
+    def _clear_upload():
+        """Czyści wgrany plik przez zmianę key uploadera."""
+        st.session_state.upload_rev += 1
+
+    rev = st.session_state.upload_rev
+    upload_key = f"file_uploader_main_{rev}"
+
+    # --- jeden wiersz: po lewej dropzone, po prawej panel kasowania ---
+    col_up, col_clear = st.columns([2, 1])
+
+    with col_up:
+        uploaded = st.file_uploader(
+            "Wgraj plik CSV / XLSX / PDF / Parquet",
+            type=["csv", "xlsx", "xls", "pdf", "parquet"],
+            key=upload_key,
+            label_visibility="collapsed",
         )
-    except Exception as e:
-        st.exception(e)
+
+    with col_clear:
+        box = st.container()
+        if uploaded is None:
+            # pusty panel – zarezerwowane miejsce
+            box.markdown(
+                """
+<div style="
+    background-color:#fef9c3;
+    border:1px solid #fde68a;
+    border-radius:0.75rem;
+    padding:0.55rem 0.9rem;
+    font-size:0.8rem;
+    color:#92400e;
+">
+  <strong>Nie ten plik? Skasuj ładowanie</strong><br>
+  Plik nie został jeszcze załadowany.
+</div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            size_mb_panel = len(uploaded.getvalue()) / (1024 ** 2)
+            box.markdown(
+                f"""
+<div style="
+    background-color:#fef3c7;
+    border:1px solid #facc15;
+    border-radius:0.75rem;
+    padding:0.55rem 0.9rem;
+    font-size:0.8rem;
+    color:#92400e;
+    margin-bottom:0.35rem;
+">
+  <strong>Nie ten plik? Skasuj ładowanie</strong><br>
+  {uploaded.name} · {size_mb_panel:.2f} MB
+</div>
+                """,
+                unsafe_allow_html=True,
+            )
+            box.button(
+                "✖ Skasuj ładowanie",
+                type="secondary",
+                use_container_width=True,
+                on_click=_clear_upload,
+                key=f"clear_upload_{rev}",
+            )
+
+    # jeśli pliku brak – komunikat + stop (jak wcześniej)
+    if not uploaded:
+        st.info(
+            "Wgraj plik, aby rozpocząć. Obsługujemy: CSV, XLSX, PDF (tabele) "
+            "oraz Parquet. Jeśli chcesz tylko przetestować działanie, "
+            "przełącz się na zakładkę **Dane demo**."
+        )
         st.stop()
 
+
+    # --- mamy plik: przygotowanie do wczytania podglądu ---
+    file_bytes = uploaded.getvalue()
+    name_lower = uploaded.name.lower()
+    size_mb = round(len(file_bytes) / (1024 ** 2), 2)
+    base_name = os.path.splitext(os.path.basename(uploaded.name))[0]
+
+    if size_mb > MAX_MB:
+        st.error(f"Plik ma {size_mb} MB, a limit to {MAX_MB} MB.")
+        st.stop()
+
+    # ustawienia CSV/XLSX/PDF jak wcześniej – w sidebarze
+    with st.sidebar:
+        if name_lower.endswith(".csv"):
+            st.markdown("**CSV — ustawienia**")
+            sep_label = st.selectbox("Separator", ["Auto", ",", ";", "\\t"])
+            csv_sep = {",": ",", ";": ";", "\\t": "\t"}.get(sep_label, None)
+
+        elif name_lower.endswith((".xlsx", ".xls")):
+            st.markdown("**XLSX — ustawienia**")
+            try:
+                sheets = excel_sheet_names(file_bytes)
+            except Exception as e:
+                st.error(f"Nie mogę odczytać listy arkuszy: {e}")
+                sheets = []
+            if sheets:
+                xlsx_sheet = st.selectbox("Arkusz", sheets, index=0)
+
+        elif name_lower.endswith(".pdf"):
+            st.markdown("**PDF — ustawienia**")
+            pdf_pages = st.text_input("Zakres stron (np. 1, 1-3, 1-end)", "1-end")
+            pdf_flavor = st.radio(
+                "Tryb detekcji tabel",
+                ["lattice", "stream"],
+                index=0,
+                horizontal=True,
+            )
+
+        elif name_lower.endswith(".parquet"):
+            st.markdown("**Parquet — ustawienia**")
+            st.caption("Format kolumnowy – nie wymaga dodatkowych ustawień.")
+
+
+    with st.spinner("Wczytywanie podglądu…"):
+        try:
+            df_preview, meta = load_any(
+                file_bytes,
+                uploaded.name,
+                preview_limit=preview_rows,
+                csv_sep=csv_sep,
+                xlsx_sheet=xlsx_sheet,
+                pdf_pages=pdf_pages,
+                pdf_flavor=pdf_flavor,
+            )
+        except Exception as e:
+            st.exception(e)
+            st.stop()
+else:
+    # ----- tryb: DANE DEMO -----
+    st.markdown(
+        "Dane demo pozwalają **bez ryzyka** zobaczyć cały pipeline: od wczytania, "
+        "przez EDA, aż po trenowanie modelu – bez przygotowywania własnego pliku."
+    )
+
+    pycaret_demos = _build_pycaret_demo_index()
+    public_demos = PUBLIC_TS_DEMOS
+
+    all_demo_specs: dict[str, dict] = {}
+    all_demo_specs.update(pycaret_demos)
+    all_demo_specs.update(public_demos)
+
+    def _sort_key(k: str):
+        spec = all_demo_specs[k]
+        return (spec.get("task", ""), k.lower())
+
+    pycaret_options = sorted(pycaret_demos.keys(), key=_sort_key)
+    public_options = sorted(public_demos.keys(), key=_sort_key)
+
+    # Najpierw zestawy PyCaret, potem dane publiczne z DO
+    options = pycaret_options + public_options
+
+    demo_label = st.selectbox(
+        "Wybierz zestaw demo",
+        options,
+        index=0,
+    )
+    demo_spec = all_demo_specs[demo_label]
+
+    # --- STAN DEMO W SESSION_STATE (żeby nie znikało po kliknięciu innych przycisków) ---
+    demo_state_key = "demo_ingest_state"
+    demo_state = st.session_state.get(demo_state_key, {})
+
+    already_loaded = (
+        demo_state.get("label") == demo_label
+        and demo_state.get("df_preview") is not None
+        and demo_state.get("df_full_demo") is not None
+        and demo_state.get("meta") is not None
+        and demo_state.get("meta_full_demo") is not None
+    )
+
+    load_demo = st.button(
+        "Załaduj dane demo",
+        type="secondary",
+        help="Jeśli zmienisz zestaw demo, kliknij ponownie, aby przeładować dane.",
+    )
+
+    # 1) Pierwsze użycie – wymagamy kliknięcia przycisku
+    if not already_loaded and not load_demo:
+        st.info("Wybierz zestaw i kliknij **Załaduj dane demo**, aby przejść dalej.")
+        st.stop()
+
+    # 2) Gdy użytkownik kliknie przycisk LUB zmieni wybrany zestaw – przeładuj dane
+    if load_demo or not already_loaded:
+        with st.spinner("Wczytywanie danych demo…"):
+            (
+                df_preview,
+                df_full_demo,
+                meta,
+                meta_full_demo,
+                size_mb,
+            ) = _load_demo_dataset(demo_spec, preview_limit=preview_rows)
+
+        demo_state = {
+            "label": demo_label,
+            "df_preview": df_preview,
+            "df_full_demo": df_full_demo,
+            "meta": meta,
+            "meta_full_demo": meta_full_demo,
+            "size_mb": size_mb,
+        }
+        st.session_state[demo_state_key] = demo_state
+    else:
+        # 3) Kolejne reruny – korzystamy z danych zapisanych w stanie
+        df_preview = demo_state["df_preview"]
+        df_full_demo = demo_state["df_full_demo"]
+        meta = demo_state["meta"]
+        meta_full_demo = demo_state["meta_full_demo"]
+        size_mb = demo_state["size_mb"]
+
+    base_name = str(meta.source_name)
+
+
+# ---- wspólna dalsza część (po wczytaniu df_preview + meta) ----
 if meta.n_rows > WARN_ROWS:
     st.warning(f"Duży zbiór (>{WARN_ROWS:,} wierszy). Uważaj na ciężkie operacje.")
 if meta.n_rows >= preview_rows:
-    st.info("To jest **podgląd**. Użyj przycisku niżej, aby przeliczyć **na pełnym zbiorze**.")
+    st.info(
+        "To jest **podgląd** (próbka danych). Pełny zbiór zostanie wczytany "
+        "dopiero przy kroku 👉 **Przelicz na całości i zapisz artefakty**."
+    )
 
-# ---------------- Maskowanie PII (podgląd) ----------------
-df_masked_preview, pii_report_preview = mask_dataframe(df_preview) if mask_pii else (df_preview, {})
+# ---------------- 2. STATUS + KPI ----------------
+st.header("2. Status wczytania i krótkie KPI")
+
+# Spinner obejmuje maskowanie PII na podglądzie – przy dużych podglądach
+# użytkownik widzi, że aplikacja „pracuje”, a nie zawiesiła się.
+with st.spinner("Przygotowywanie podglądu (maskowanie PII)…"):
+    df_masked_preview, pii_report_preview = (
+        mask_dataframe(df_preview) if mask_pii else (df_preview, {})
+    )
 
 st.success(
-    f"Wczytano: **{meta.source_name}** · {size_mb} MB · "
-    f"podgląd: {meta.n_rows}×{meta.n_cols} · silnik: {meta.engine}"
-    + (f" · kodowanie: {meta.encoding}" if meta.encoding else "")
-    + (f" · notatki: {meta.notes}" if meta.notes else "")
+    f"Wczytano: **{meta.source_name}**"
+    + (f" · {size_mb} MB" if size_mb is not None else "")
+    + f" · podgląd: {meta.n_rows}×{meta.n_cols} · silnik: {meta.engine}"
+    + (f" · kodowanie: {meta.encoding}" if getattr(meta, "encoding", None) else "")
+    + (f" · notatki: {meta.notes}" if getattr(meta, "notes", None) else "")
 )
 
-with st.expander("Podsumowanie i schema", expanded=True):
-    st.write("**Wymiary (podgląd):**", df_preview.shape)
-    st.write("**Typy kolumn (podgląd):**")
-    st.dataframe(pd.DataFrame({"dtype": df_preview.dtypes.astype(str)}))
-    nulls = df_preview.isna().sum()
-    st.write("**Braki danych (podgląd):**")
-    st.dataframe(pd.DataFrame({"nulls": nulls, "null_%": (nulls/len(df_preview))*100}).round(2))
-    if pii_report_preview:
-        st.write("**Maskowanie PII – liczba zmian (podgląd):**")
-        st.json(pii_report_preview)
+_show_kpi_block(df_masked_preview, mask_pii=mask_pii, meta_obj=meta)
 
-st.subheader("Podgląd danych")
+# ---------------- 3. PODGLĄD DANYCH ----------------
+st.header("3. Podgląd danych (próbka)")
+st.caption(
+    "Poniżej widzisz maksymalnie tyle wierszy, ile określono w ustawieniach "
+    "podglądu. Pełny zbiór zostanie wczytany dopiero przy kroku "
+    "👉 **Przelicz na całości i zapisz artefakty**."
+)
 
-# Wybór trybu renderu tabeli
 mode = st.radio(
     "Tryb podglądu tabeli",
     ["Przewijalna (szybka)", "Paginacja + wyszukiwarka (itables)"],
     index=0,
     horizontal=True,
-    help="Przewijalna (st.dataframe) ma sticky header i spójny font. "
-         "Tryb itables daje paginację i wyszukiwarkę."
+    help=(
+        "Przewijalna (st.dataframe) ma sticky header i spójny font. "
+        "Tryb itables daje paginację i wyszukiwarkę."
+    ),
 )
 
 if mode.startswith("Przewijalna"):
-    # przyciski pobierania (CSV / XLSX) - zawsze patrzymy na df_masked_preview
     _preview_download_buttons(df_masked_preview)
 
-    # wysokość widoku do wygodnego scrollowania
     height = st.slider(
         "Wysokość widoku (px)",
         min_value=300,
         max_value=1200,
         value=650,
         step=50,
-        key="scroll_height"
+        key="scroll_height",
     )
 
     st.dataframe(
@@ -276,62 +924,53 @@ if mode.startswith("Przewijalna"):
         hide_index=True,
     )
 
-
 else:
     # === ITABLES VIEW: paginacja + wyszukiwarka ===
-    from itables import to_html_datatable
 
-    # przyciski pobierania (CSV / XLSX) - nad tabelą
     _preview_download_buttons(df_masked_preview)
 
-    # 1) Suwak wysokości przewijania w środku tabeli (px) + wybór liczby wierszy
     scrolly = st.slider(
-        "Wysokość tabeli (px, itables)", 300, 1200, 600, 20,
-        key="itable_scrolly"
+        "Wysokość tabeli (px, itables)",
+        300,
+        1200,
+        600,
+        20,
+        key="itable_scrolly",
     )
     page_len = st.selectbox(
-        "Wierszy na stronę", (10, 25, 50), index=1, key="itable_page_len"
+        "Wierszy na stronę",
+        (10, 25, 50),
+        index=1,
+        key="itable_page_len",
     )
-    
-    # 3) wygeneruj pełny HTML tabeli (z JS i CSS) + policz wysokość iframe
-    #    WAŻNE: używamy df_masked_preview, żeby respektować maskowanie PII
+
     html, iframe_h = _render_itables_html(
         df_masked_preview,
         body_px=int(scrolly),
         page_len=int(page_len),
     )
 
-    # 4) wstaw gotowy HTML (DataTables) do iframa o policzonej wysokości
     st_html(
         html,
         height=int(iframe_h),
         scrolling=False,
     )
 
-    # 5) CSS hack – zbij zbędny „oddech” pod komponentem iframe,
-    #    który Streamlit potrafi dodać jako margin/padding.
     st.markdown(
         """
         <style>
-        /* iframe wygenerowane przez components.html / st_html */
         div[data-testid="stIFrame"] {
             margin-bottom: 0 !important;
             padding-bottom: 0 !important;
         }
-
-        /* wrapper tuż POD iframe w pionowym layoucie Streamlita */
         div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stIFrame"]) {
             margin-bottom: 0 !important;
             padding-bottom: 0 !important;
         }
-
-        /* ostatnie dziecko w kolumnie również bez wielkiego dołu */
         div[data-testid="stVerticalBlock"] > div:last-child {
             margin-bottom: 0 !important;
             padding-bottom: 0 !important;
         }
-
-        /* każdy element-container — też przytnij dolny margines */
         div.element-container {
             margin-bottom: 0 !important;
             padding-bottom: 0 !important;
@@ -341,38 +980,32 @@ else:
         unsafe_allow_html=True,
     )
 
-# ---------------- Przyciski: ZIP (podgląd) + pełne przeliczenie ----------------
-def _zip_bytes(df_out: pd.DataFrame, meta_obj) -> bytes:
-    buf = io.BytesIO()
-    base = os.path.splitext(os.path.basename(uploaded.name))[0]
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(f"{base}__preview_masked.csv", df_out.to_csv(index=False))
-        z.writestr(f"{base}__meta.json", json.dumps(meta_obj.__dict__, ensure_ascii=False, indent=2))
-    return buf.getvalue()
-
 st.download_button(
     "📦 Pobierz artefakty podglądu (ZIP)",
-    data=_zip_bytes(df_masked_preview, meta),
+    data=_zip_bytes(df_masked_preview, meta, base_name),
     file_name="ingest_preview.zip",
     mime="application/zip",
-    help="ZIP zawiera: preview_masked.csv (po maskowaniu PII) i meta.json z informacjami o źródle."
+    help=(
+        "ZIP zawiera: preview_masked.csv (po maskowaniu PII) i meta.json "
+        "z informacjami o źródle."
+    ),
 )
 
 st.write("---")
-# --- KROK: pełne przetworzenie danych i zapis artefaktów ---
-st.subheader("Przelicz na całości i zapisz artefakty")
 
-# stałe wyjaśnienie (widoczne ZAWSZE, zanim ktoś kliknie)
+# ---------------- 4. PRZELICZ NA CAŁOŚCI ----------------
+st.header("4. Przelicz na całości i zapisz artefakty")
+
 st.caption(
-    "To polecenie wczytuje pełne dane (cały plik), maskuje PII, "
-    "zapisuje artefakty lokalnie i oznacza je jako gotowe "
-    "do trenowania modelu. Ten krok jest obowiązkowy – "
-    "bez niego zakładka „Trenowanie Modelu” nie będzie miała gotowych danych."
+    "To polecenie wczytuje **pełne dane (cały plik / cały zestaw demo)**, maskuje PII, "
+    "zapisuje artefakty lokalnie i oznacza je jako gotowe do trenowania modelu. "
+    "Ten krok jest obowiązkowy – bez niego zakładka „Trenowanie Modelu” "
+    "nie będzie miała gotowych danych."
 )
 
 tooltip_text = (
     "Uruchamia pełne przetwarzanie danych:\n"
-    "• wczytuje CAŁY plik (nie tylko podgląd),\n"
+    "• wczytuje CAŁY plik / zestaw demo (nie tylko podgląd),\n"
     "• maskuje PII,\n"
     "• zapisuje dane i metadane lokalnie,\n"
     "• ustawia te dane jako 'gotowe do uczenia modelu'.\n\n"
@@ -385,71 +1018,125 @@ clicked = st.button(
     key="full_run_button",
     type="primary",
     help=tooltip_text,
-    use_container_width=False,
 )
 
 if clicked:
-    # 1. wczytaj CAŁY zbiór bez limitu wierszy
-    with st.spinner("Wczytywanie pełnego zbioru…"):
-        try:
-            df_full, meta_full = load_any(
-                file_bytes,
-                uploaded.name,
-                preview_limit=None,      # <-- pełny zbiór
-                csv_sep=csv_sep,
-                xlsx_sheet=xlsx_sheet,
-                pdf_pages=pdf_pages,
-                pdf_flavor=pdf_flavor,
-            )
-        except Exception as e:
-            st.exception(e)
-            st.stop()
+    # Pasek statusu obejmuje CAŁY pipeline:
+    # 1/3 – wczytywanie pełnego zbioru
+    # 2/3 – maskowanie PII
+    # 3/3 – zapis artefaktów (CSV + meta.json)
+    with st.status(
+        "1/3 – Wczytywanie pełnego zbioru…",
+        expanded=False,
+    ) as status:
+        # ------------------ Krok 1/3: wczytywanie pełnego zbioru ------------------
+        status.write("1/3 – Wczytywanie pełnego zbioru do pamięci…")
 
-    # 2. maskowanie PII na całości
-    with st.spinner("Maskowanie PII…"):
+        if is_demo:
+            df_full = df_full_demo.copy()
+            meta_full = meta_full_demo
+            status.write("✔ 1/3 – Wczytywanie pełnego zbioru zakończone (demo).")
+        else:
+            try:
+                df_full, meta_full = load_any(
+                    file_bytes,
+                    uploaded.name,
+                    preview_limit=None,
+                    csv_sep=csv_sep,
+                    xlsx_sheet=xlsx_sheet,
+                    pdf_pages=pdf_pages,
+                    pdf_flavor=pdf_flavor,
+                )
+                status.write("✔ 1/3 – Wczytywanie pełnego zbioru zakończone (plik użytkownika).")
+            except Exception as e:
+                status.update(
+                    label="❌ Błąd podczas wczytywania pełnego zbioru",
+                    state="error",
+                )
+                st.exception(e)
+                st.stop()
+
+        status.update(
+            label="2/3 – Maskowanie PII…",
+            state="running",
+        )
+
+        # ------------------ Krok 2/3: maskowanie PII na pełnym zbiorze ------------------
+        if mask_pii:
+            status.write("2/3 – Maskowanie PII w pełnym zbiorze…")
+        else:
+            status.write("2/3 – Pomijanie maskowania PII (opcja wyłączona)…")
+
         df_full_masked, pii_report_full = (
             mask_dataframe(df_full) if mask_pii else (df_full, {})
         )
 
-    # 3. zapis plików wyjściowych do katalogu artefaktów
-    out_dir = resolve_artifacts_dir(cfg) / "ingest"
-    out_dir.mkdir(parents=True, exist_ok=True)
+        status.write("✔ 2/3 – Etap maskowania PII zakończony.")
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = os.path.splitext(os.path.basename(uploaded.name))[0]
-    run_dir = out_dir / f"{base}__{ts}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+        status.update(
+            label="3/3 – Zapis artefaktów (CSV + meta.json)…",
+            state="running",
+        )
 
-    csv_path = run_dir / f"{base}__full_masked.csv"
-    meta_path = run_dir / f"{base}__meta.json"
+        # ------------------ Krok 3/3: zapis artefaktów ------------------
+        out_dir = resolve_artifacts_dir(cfg) / "ingest"
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    # zapis danych z PII zamaskowanym (lub oryginalnych, jeśli mask_pii=False)
-    df_full_masked.to_csv(csv_path, index=False, encoding="utf-8")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # metadane + info o maskowaniu
-    meta_dump = meta_full.__dict__ | {
-        "pii_masked": bool(mask_pii),
-        "pii_changes": pii_report_full,
-    }
-    meta_path.write_text(
-        json.dumps(meta_dump, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+        # Bezpieczna nazwa dla systemu plików (bez dwukropków itp.)
+        def _slugify_for_fs(name: str) -> str:
+            import re
 
-    # 4. przekaż opis najnowszego przetworzenia dalej (do zakładki "Trenowanie Modelu")
-    st.session_state["latest_artifacts"] = {
-        "csv_path": str(csv_path),
-        "meta_path": str(meta_path),
-        "run_dir": str(run_dir),
-        "n_rows": int(df_full_masked.shape[0]),
-        "n_cols": int(df_full_masked.shape[1]),
-        "pii_masked": bool(mask_pii),
-        "source_name": meta_full.source_name,
-        "timestamp": ts,
-    }
+            if not name:
+                return "dataset"
+            # najpierw spacje -> podkreślenia
+            name = name.strip().replace(" ", "_")
+            # zostaw tylko bezpieczne znaki (litery, cyfry, ., _, -)
+            name = re.sub(r"[^0-9A-Za-z._-]+", "_", name)
+            # przytnij, żeby nie robić super długich ścieżek
+            name = name[:80]
+            return name or "dataset"
 
-    # 5. komunikat końcowy dla użytkownika — tylko zielony sukces,
-    #    bez dodatkowego niebieskiego info bloku
+        safe_base = _slugify_for_fs(base_name)
+        run_dir = out_dir / f"{safe_base}__{ts}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        csv_path = run_dir / f"{safe_base}__full_masked.csv"
+        meta_path = run_dir / f"{safe_base}__meta.json"
+
+        status.write("3/3 – Zapis pełnego zbioru do CSV (może chwilę potrwać przy dużych plikach)…")
+        df_full_masked.to_csv(csv_path, index=False, encoding="utf-8")
+
+        meta_dump = meta_full.__dict__ | {
+            "pii_masked": bool(mask_pii),
+            "pii_changes": pii_report_full,
+            "source_kind": "demo" if is_demo else "uploaded",
+        }
+        meta_path.write_text(
+            json.dumps(meta_dump, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        st.session_state["latest_artifacts"] = {
+            "csv_path": str(csv_path),
+            "meta_path": str(meta_path),
+            "run_dir": str(run_dir),
+            "n_rows": int(df_full_masked.shape[0]),
+            "n_cols": int(df_full_masked.shape[1]),
+            "pii_masked": bool(mask_pii),
+            "source_name": meta_full.source_name,
+            "timestamp": ts,
+            "source_kind": "demo" if is_demo else "uploaded",
+        }
+
+        status.write("✔ 3/3 – Artefakty zapisane. Dane są gotowe do trenowania modelu.")
+        status.update(
+            label="Pipeline pełnego przygotowania danych zakończony ✅",
+            state="complete",
+        )
+
+    # Po wyjściu z kontekstu st.status wyświetlamy końcowe podsumowanie
     st.success(
         "✅ Dane przygotowane do trenowania modelu.\n\n"
         f"• Pełny zbiór (po maskowaniu PII): `{csv_path}`\n"

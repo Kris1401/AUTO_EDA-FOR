@@ -46,3 +46,7 @@ secrets.toml
 # ── systemowe
 .DS_Store
 Thumbs.db
+
+*.log
+data/
+mlruns/

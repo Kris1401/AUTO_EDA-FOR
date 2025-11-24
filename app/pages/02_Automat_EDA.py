@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
+import math
+
 # --- wspólna paleta barw ---
 PALETTE_MAIN = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -100,7 +102,184 @@ def get_lf_openai_client():
     except Exception:
         return None
 
+def _describe_clusters_with_llm(
+    df: pd.DataFrame,
+    cluster_col: str,
+    max_features: int = 8,
+    max_examples_per_cluster: int = 3,
+    model: str = "gpt-4o-mini",
+    object_label: str | None = None,
+) -> dict[str, dict]:
+    """
+    Generuje AI-nazwy i opisy klastrów na podstawie krótkich statystyk.
 
+    object_label – ogólna nazwa obiektów w liczbie mnogiej (np. 'klienci', 'produkty',
+    'pokemony', 'miasta'). Jeśli None, używamy neutralnego określenia 'obiekty'.
+    """
+    if cluster_col not in df.columns:
+        return {}
+
+    if not os.getenv("OPENAI_API_KEY"):
+        return {}
+
+    # Neutralna, inkluzywna nazwa obiektów
+    label = (object_label or "obiekty").strip()
+    if len(label) > 40:
+        label = "obiekty"
+
+    # Kopia danych + wyrzucenie wierszy bez klastra
+    work = df.copy()
+    work = work.dropna(subset=[cluster_col])
+    if work.empty:
+        return {}
+
+    max_rows = 5000
+    if len(work) > max_rows:
+        work = work.sample(max_rows, random_state=0)
+
+    work["_cluster_id"] = work[cluster_col].astype(str)
+
+    # Wybór cech numerycznych i kategorycznych
+    num_cols = [
+        c for c in work.select_dtypes(include="number").columns
+        if c not in (cluster_col, "_cluster_id")
+    ][:max_features]
+
+    cat_cols = [
+        c for c in work.select_dtypes(exclude="number").columns
+        if c not in (cluster_col, "_cluster_id")
+    ][:max_features]
+
+    cluster_summaries: dict[str, dict] = {}
+
+    global_means = work[num_cols].mean(numeric_only=True) if num_cols else pd.Series(dtype=float)
+    global_stds = work[num_cols].std(numeric_only=True) if num_cols else pd.Series(dtype=float)
+
+    # Budujemy podsumowania dla każdego klastra
+    for cid, grp in work.groupby("_cluster_id"):
+        size = int(len(grp))
+        share = float(size / len(work)) if len(work) > 0 else 0.0
+
+        summary: dict[str, Any] = {
+            "size": size,
+            "share": round(share, 4),
+            "numeric_features": {},
+            "categorical_features": {},
+            "examples": [],
+        }
+
+        # Statystyki numeryczne: średnia w klastrze vs globalnie
+        for col in num_cols:
+            summary["numeric_features"][col] = {
+                "mean_cluster": float(grp[col].mean()),
+                "mean_global": float(global_means.get(col, np.nan)),
+                "std_global": float(global_stds.get(col, np.nan)),
+            }
+
+        # Statystyki kategoryczne: TOP 3 wartości
+        for col in cat_cols:
+            vc = grp[col].astype(str).value_counts().head(3)
+            if vc.empty:
+                continue
+            total = int(vc.sum())
+            summary["categorical_features"][col] = [
+                {
+                    "value": str(v),
+                    "count": int(cnt),
+                    "share": float(cnt / total) if total > 0 else 0.0,
+                }
+                for v, cnt in vc.items()
+            ]
+
+        # Kilka przykładowych rekordów
+        ex_cols = [cluster_col] + num_cols + cat_cols
+        ex_df = grp[ex_cols].head(max_examples_per_cluster)
+        summary["examples"] = ex_df.to_dict(orient="records")
+
+        cluster_summaries[str(cid)] = summary
+
+    if not cluster_summaries:
+        return {}
+
+    # ---------- Budowa promptu ----------
+    prompt = (
+        "Jesteś doświadczonym analitykiem danych.\n"
+        "Na podstawie krótkich statystyk klastrów przygotuj zwięzłe, praktyczne nazwy "
+        f"i opisy segmentów takich {label}.\n\n"
+        "Dla każdego klastra przygotuj:\n"
+        "  - \"name\": pełna, czytelna nazwa segmentu (np. \"Młodzi cyfrowi entuzjaści\"),\n"
+        "  - \"short_label\": bardzo krótka etykieta (2–4 słowa, np. \"Młodzi digitalowi\"),\n"
+        f"  - \"description\": 2–3 zdania opisu po polsku, opisujące typowe cechy tych {label}.\n\n"
+        "Zwróć **tylko** jeden obiekt JSON o strukturze:\n"
+        "{\n"
+        "  \"<cluster_id>\": {\n"
+        "    \"name\": \"...\",\n"
+        "    \"short_label\": \"...\",\n"
+        "    \"description\": \"...\"\n"
+        "  }, ...\n"
+        "}\n\n"
+        "Nie dodawaj żadnych komentarzy poza JSON-em.\n\n"
+        "Oto dane klastrów:\n"
+    )
+    prompt += json.dumps(cluster_summaries, ensure_ascii=False, indent=2)
+
+    # ---------- Wywołanie OpenAI / Langfuse ----------
+    lf_client = get_lf_openai_client()
+
+    try:
+        if lf_client is not None:
+            resp = lf_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+        else:
+            import openai as _openai
+            client = _openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+
+        raw = (resp.choices[0].message.content or "").strip()
+
+        # ---------- Bezpieczne parsowanie JSON ----------
+        def _parse_json_like(s: str) -> dict:
+            s = s.strip()
+
+            # Usuwamy ewentualne ```json ... ```
+            if s.startswith("```"):
+                parts = s.split("```")
+                if len(parts) >= 3:
+                    s = parts[1]
+                else:
+                    s = s.replace("```json", "").replace("```", "").strip()
+
+            # Wytnij od pierwszej '{' do ostatniej '}'
+            first = s.find("{")
+            last = s.rfind("}")
+            if first != -1 and last != -1 and last > first:
+                s = s[first : last + 1]
+
+            return json.loads(s)
+
+        parsed = _parse_json_like(raw)
+        if isinstance(parsed, dict):
+            cleaned: dict[str, dict] = {}
+            for k, v in parsed.items():
+                if isinstance(v, dict):
+                    cleaned[str(k)] = {
+                        "name": str(v.get("name", "")),
+                        "short_label": str(v.get("short_label", "")),
+                        "description": str(v.get("description", "")),
+                    }
+            return cleaned
+
+    except Exception:
+        return {}
+
+    return {}
 
 # --- OpenAI TTS: listy wyboru ---
 # --- OpenAI: głosy podzielone wg płci (praktyczny podział) ---
@@ -187,6 +366,138 @@ def _calc_global_missing_pct(df: pd.DataFrame) -> float:
     missing_cells = tmp.isna().sum().sum()
     return round(100.0 * (missing_cells / max(total_cells, 1)), 2)
 
+# ───────────────────── ROLES & HERO CHARTS (TASK-AWARE EDA) ─────────────────────
+
+def _infer_eda_roles(df: pd.DataFrame, latest_info: dict | None) -> dict:
+    """Heurystyczne wykrywanie typu zadania i ról kolumn.
+    Korzysta z meta (task) oraz source_name z Etapu 1, a jak trzeba – z samych danych.
+    """
+    from typing import Any
+    import json
+    import os
+
+    roles: dict[str, Any] = {
+        "task": "regression",   # domyślnie
+        "target": None,
+        "time_col": None,
+        "cluster_col": None,
+    }
+
+    latest_info = latest_info or {}
+
+    # ===================== 1. TASK z meta / source_name =====================
+
+    meta_task = None
+    meta_path = latest_info.get("meta_path")
+    if meta_path and os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta_json = json.load(f)
+            raw = str(meta_json.get("task", "") or "")
+            if raw:
+                meta_task = raw.lower()
+        except Exception:
+            meta_task = None
+
+    src_raw = str(latest_info.get("source_name", "") or "")
+    src_low = src_raw.lower()
+
+    # preferuj task z meta, jeśli jest – inaczej patrz na source_name
+    raw_task = meta_task or src_low
+    task = None
+
+    # polskie + angielskie warianty
+    if any(t in raw_task for t in ["szereg czasowy", "time series", "czasowy"]):
+        task = "time_series"
+    elif any(t in raw_task for t in ["klasteryzacja", "cluster", "segment"]):
+        task = "clustering"
+    elif any(t in raw_task for t in ["klasyfikacja", "classification"]):
+        task = "classification"
+    elif any(t in raw_task for t in ["regresja", "regression"]):
+        task = "regression"
+
+    # ===================== 2. Heurystyki z samych danych =====================
+
+    nunique = df.nunique(dropna=True)
+
+    # kandydaci na kolumnę klastrów
+    cluster_candidates = [
+        c for c in df.columns
+        if any(tok in c.lower() for tok in ["cluster", "segment", "segm", "klaster", "grupa", "group"])
+    ]
+
+    # małoliczne kolumny (kandydaci na target klasyfikacyjny / kolumnę klastrów)
+    small_card_cols = [
+        c for c in df.columns
+        if 1 < nunique.get(c, 0) <= min(50, max(10, df.shape[0] // 10))
+    ]
+
+    if task is None:
+        if cluster_candidates:
+            task = "clustering"
+        elif small_card_cols:
+            task = "classification"
+        else:
+            task = "regression"
+
+    roles["task"] = task
+
+    # ===================== 3. time_col (dla szeregów czasowych) =====================
+
+    time_col = None
+    dt_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
+    if dt_cols:
+        time_col = dt_cols[0]
+    else:
+        for c in df.columns:
+            cl = c.lower()
+            if any(tok in cl for tok in ["date", "data", "czas", "time", "timestamp", "ds"]):
+                time_col = c
+                break
+    roles["time_col"] = time_col
+
+    # zapamiętaj, czy meta/source sugerowały szereg czasowy
+    roles["ts_suspected"] = (roles.get("task") == "time_series")
+
+    # jeśli sugerowano TS, ale nie ma jawnej kolumny czasu,
+    # nie wymuszaj tego automatycznie (user może wybrać time_series ręcznie w override)
+    if roles["ts_suspected"] and roles["time_col"] is None:
+        roles["task"] = "regression"
+
+
+    # ===================== 4. cluster_col (dla klasteryzacji) =====================
+
+    cluster_col = None
+    if cluster_candidates:
+        cluster_col = cluster_candidates[0]
+    elif task == "clustering" and small_card_cols:
+        # jeżeli nie ma oczywistej nazwy, weź pierwszą małoliczną
+        cluster_col = small_card_cols[0]
+    roles["cluster_col"] = cluster_col
+
+    # ===================== 5. target (dla klasyfikacji / regresji) =====================
+
+    target = None
+    if task in ("classification", "regression"):
+        # kandydaci po nazwie
+        name_cands = [
+            c for c in df.columns
+            if any(tok in c.lower() for tok in [
+                "target", "label", "class", "klasa", "y_", "_y", "wynik", "outcome", "score"
+            ])
+        ]
+        if name_cands:
+            target = name_cands[0]
+        else:
+            if task == "classification" and small_card_cols:
+                target = small_card_cols[0]
+            elif task == "regression":
+                num_cols = df.select_dtypes(include="number").columns.tolist()
+                if num_cols:
+                    target = num_cols[-1]
+    roles["target"] = target
+
+    return roles
 
 def _infer_logical_type(series: pd.Series) -> str:
     """
@@ -612,45 +923,6 @@ def hist_kde(df: pd.DataFrame, value_col: str, maxbins: int = 30) -> alt.Chart:
         .properties(height=220)
     )
     return alt.layer(hist, kde).resolve_scale(y="independent")
-
-def violin_or_box(df: pd.DataFrame, value_col: str, cat_label: str, show: str = "violin") -> alt.Chart:
-    """
-    „Violin” dla jednej kategorii (cat_label) lub klasyczny boxplot.
-    cat_label to etykieta na osi (np. 'female • survived').
-    """
-    use = pd.DataFrame({value_col: pd.to_numeric(df[value_col], errors="coerce")}).dropna()
-    if use.empty:
-        return alt.Chart(pd.DataFrame({"msg":["Brak danych"]})).mark_text(size=14).encode(text="msg")
-
-    use["label"] = cat_label
-
-    if show == "box":
-        return (
-            alt.Chart(use).mark_boxplot()
-            .encode(x=alt.X("label:N", title=""), y=alt.Y(f"{value_col}:Q", title=value_col))
-            .properties(height=180)
-        )
-
-    # violin (lustrzane density po osi X)
-    dens = (
-        alt.Chart(use)
-        .transform_density(value_col, groupby=["label"], as_=[value_col, "density"])
-        .properties(height=180)
-    )
-    left = dens.mark_area(opacity=0.85).encode(
-        x=alt.X("density:Q", title=None, axis=None),
-        y=alt.Y(f"{value_col}:Q", title=value_col),
-        row=None,
-        color=alt.Color("label:N", legend=None),
-    )
-    right = dens.mark_area(opacity=0.85).encode(
-        x=alt.X("calculate(-datum.density):Q", title=None, axis=None),
-        y=alt.Y(f"{value_col}:Q", title=value_col),
-        color=alt.Color("label:N", legend=None),
-    )
-    # oś kategorii jako kolumna z jedną etykietą
-    base = alt.hconcat(left, right)
-    return base
 
 # ---------- Czynniki eliminujące (Sekcja 5) ----------
 
@@ -1465,11 +1737,26 @@ def _reset_sec7_state():
     # 🔄 czyścimy cache wyników winsoryzacji (dla bezpieczeństwa przy zmianie zbioru)
     st.session_state.pop("winsor_cache", None)
 
+# alias kompatybilności wstecznej (stare wywołania bez "_")
+def reset_sec7_state():
+    """Alias do _reset_sec7_state() – nie usuwać, bo używane w main()."""
+    _reset_sec7_state()
+
 # ---------- UI helpers ----------
 
 def _metric_card_html(title: str, value: str, subtitle: str, bg: str = "#f8f9fa", fg: str = "#111", border: str = "#ddd") -> str:
     return f"""
-    <div style="border:1px solid {border}; border-radius:0.5rem; padding:0.75rem 1rem; background:{bg};">
+    <div style="
+        border:1px solid {border};
+        border-radius:0.5rem;
+        padding:0.75rem 1rem;
+        background:{bg};
+        min-height:6.9rem;
+        display:flex;
+        flex-direction:column;
+        justify-content:space-between;
+        box-sizing:border-box;
+    ">
       <div style="font-size:0.75rem; color:#666; line-height:1.2; font-weight:500;">{title}</div>
       <div style="font-size:1.5rem; font-weight:600; color:{fg}; line-height:1.4; margin-top:0.25rem;">{value}</div>
       <div style="font-size:0.8rem; color:#666; line-height:1.2; margin-top:0.25rem;">{subtitle}</div>
@@ -1956,6 +2243,510 @@ def _save_datachat_handoff(
     st.session_state["datachat_handoff_path"] = handoff_path
     return handoff_path
 
+# ============================================================
+#  HERO: KLASYFIKACJA – rozkład klas + ocena równowagi
+# ============================================================
+def _hero_classification_overview(
+    df: pd.DataFrame,
+    target: str | None,
+) -> None:
+    st.subheader("Rozkład klas (target)", divider="gray")
+    # minimalnie zmniejszamy odstęp pod tytułem
+    st.markdown("<div style='margin-top:-0.40rem'></div>", unsafe_allow_html=True)
+
+    if not target or target not in df.columns:
+        st.info(
+            "Najpierw wybierz kolumnę **celu (target)** w sekcji 1 / 2, "
+            "żeby zobaczyć rozkład klas."
+        )
+        return
+
+    s = df[target].copy()
+    s = s.fillna("(brak)")
+
+    counts = (
+        s.value_counts(dropna=False)
+        .rename_axis("class")
+        .reset_index(name="count")
+    )
+    total = int(counts["count"].sum()) or 1
+    counts["share"] = counts["count"] / total * 100.0
+
+    # największa klasa
+    idx_max = counts["count"].idxmax()
+    main_class = counts.loc[idx_max, "class"]
+    main_share = float(counts.loc[idx_max, "share"])
+
+    col_chart, col_panel = st.columns([4, 1.4])
+
+    # ----------------- LEWA STRONA – WYKRES -----------------
+    with col_chart:
+        chart = (
+            alt.Chart(counts)
+            .mark_bar()
+            .encode(
+                x=alt.X("class:N", title=target, axis=alt.Axis(labelAngle=0),), # poziome etykiety na osi X
+                y=alt.Y("count:Q", title="Liczba rekordów"),
+                tooltip=[
+                    alt.Tooltip("class:N", title="Klasa"),
+                    alt.Tooltip("count:Q", title="Liczba rekordów", format=","),
+                    alt.Tooltip("share:Q", title="Udział [%]", format=".1f"),
+                ],
+            )
+            .properties(height=380)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+    # ----------------- PRAWA STRONA – PANEL OCENY -----------------
+    with col_panel:
+        st.markdown("**Szybka ocena równowagi klas**")
+        st.write("Największa klasa:", f"`{main_class}`")
+        st.write("Udział:", f"{main_share:.1f}%")
+
+        if main_share >= 80:
+            st.warning(
+                "⚠ Dane są **silnie niezbalansowane** – model będzie wymagał "
+                "specjalnego traktowania (wagi klas, zaawansowany re-sampling)."
+            )
+        elif main_share >= 60:
+            st.info(
+                "⚠ Klasy są dość nierówne – rozważ wagi klas lub prostszy re-sampling."
+            )
+        else:
+            st.success(
+                "✅ Rozkład klas wygląda wstępnie akceptowalnie."
+            )
+
+
+# ============================================================
+#  HERO: SZEREG CZASOWY – podgląd serii + ocena
+# ============================================================
+def _hero_time_series_overview(
+    df: pd.DataFrame,
+    time_col: str | None,
+    roles: dict,
+) -> None:
+    st.subheader("Podgląd szeregu czasowego", divider="gray")
+    st.markdown("<div style='margin-top:-0.40rem'></div>", unsafe_allow_html=True)
+
+    col_left, col_right = st.columns([4, 1.5])
+
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if not num_cols:
+        st.info("Brak kolumn liczbowych – nie można narysować szeregu.")
+        return
+
+    # zmienne na globalny trend szeregu (wykorzystamy po prawej stronie)
+    trend_text: str | None = None
+
+    # -------- lewa kolumna – wybory + wykres linii -----------
+    with col_left:
+        # oś czasu – kandydaci
+        x_options = ["Numer wiersza (pseudo-czas)"]
+        if time_col and time_col in df.columns:
+            x_options.insert(0, time_col)
+
+        # trzy selectboxy w jednej linii
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            x_choice = st.selectbox(
+                "Oś czasu (oś X)",
+                x_options,
+                key="ts_hero_x",
+            )
+
+        with c2:
+            y_col = st.selectbox(
+                "Kolumna wartości (oś Y)",
+                num_cols,
+                key="ts_hero_y",
+            )
+
+        with c3:
+            agg_choice = st.selectbox(
+                "Agregacja czasu",
+                ["Dzień", "Tydzień", "Miesiąc", "Rok"],
+                index=0,
+                key="ts_hero_agg",
+            )
+
+# --- przygotowanie danych do wykresu ---
+        cols_used = [y_col]
+        plot_df = df[cols_used].copy()
+
+        # mapowanie agregacji
+        rule_map = {"Dzień": "D", "Tydzień": "W", "Miesiąc": "M", "Rok": "Y"}
+        rule = rule_map.get(agg_choice)
+
+        if x_choice == "Numer wiersza (pseudo-czas)":
+            # pseudo-czas → oś numeryczna; agregujemy przez grupowanie co N wierszy
+            plot_df["__x__"] = np.arange(len(df))
+            plot_df = plot_df.dropna(subset=[y_col])
+
+            if rule is not None and not plot_df.empty:
+                # przybliżone okna dla pseudo-czasu (w wierszach)
+                pseudo_window_map = {"D": 1, "W": 7, "M": 30, "Y": 365}
+                win = int(pseudo_window_map.get(rule, 1))
+
+                plot_df["_grp"] = (plot_df["__x__"] // win).astype(int)
+                plot_df = (
+                    plot_df.groupby("_grp", as_index=False)[y_col]
+                    .mean()
+                )
+                plot_df["__x__"] = plot_df["_grp"] * win
+                plot_df = plot_df.drop(columns=["_grp"])
+
+            x_enc = alt.X("__x__:Q", title="Numer wiersza (pseudo-czas)")
+
+        else:
+            # prawdziwy czas
+            t = pd.to_datetime(df[x_choice], errors="coerce")
+            plot_df["__x__"] = t
+            plot_df = plot_df.dropna(subset=["__x__", y_col]).sort_values("__x__")
+
+            # resample tylko dla datetime
+            if (
+                rule is not None
+                and not plot_df.empty
+                and pd.api.types.is_datetime64_any_dtype(plot_df["__x__"])
+            ):
+                plot_df = (
+                    plot_df.set_index("__x__")[y_col]
+                    .resample(rule)
+                    .mean()
+                    .dropna()
+                    .reset_index()
+                    .rename(columns={"__x__": "__x__", y_col: y_col})
+                )
+
+            x_enc = alt.X("__x__:T", title=x_choice)
+
+        # finalne czyszczenie po wcześniejszej agregacji
+        plot_df = plot_df.dropna(subset=["__x__", y_col])
+
+        if plot_df.empty:
+            st.info("Brak danych po agregacji do wyświetlenia szeregu.")
+            return
+
+        # --- globalny trend szeregu (skala -3..0..+3) ---
+        plot_df_sorted = plot_df.sort_values("__x__")
+        y_vals = plot_df_sorted[y_col].to_numpy(dtype=float)
+
+        if len(y_vals) >= 2 and np.isfinite(y_vals).sum() >= 2:
+            x_idx = np.arange(len(y_vals), dtype=float)
+
+            # --- stabilizacja polyfit: tylko wartości skończone ---
+            finite_mask = np.isfinite(y_vals)
+            x_fit = x_idx[finite_mask]
+            y_fit = y_vals[finite_mask]
+
+            if len(y_fit) < 2:
+                slope = 0.0
+            else:
+                # polyfit na czystych danych + bezpieczne obejście błędów LAPACK/SVD
+                try:
+                    slope = float(np.polyfit(x_idx, y_vals, 1)[0])
+                except np.linalg.LinAlgError:
+                    slope = 0.0
+
+            y_range = float(np.nanmax(y_vals) - np.nanmin(y_vals)) if np.isfinite(y_vals).any() else 0.0
+            if y_range == 0.0:
+                norm = 0.0
+            else:
+                norm = slope / (y_range / max(len(y_vals) - 1, 1))
+
+            abs_norm = abs(norm)
+
+            if abs_norm < 0.02:
+                strength = "brak wyraźnego trendu"
+                level = 0
+            elif abs_norm < 0.07:
+                strength = "lekki trend"
+                level = 1
+            elif abs_norm < 0.15:
+                strength = "średni trend"
+                level = 2
+            else:
+                strength = "silny trend"
+                level = 3
+
+            if norm > 0:
+                direction = "wzrostowy"
+                arrow = "↗"
+                signed_level = level
+            elif norm < 0:
+                direction = "spadkowy"
+                arrow = "↘"
+                signed_level = -level
+            else:
+                direction = "płaski"
+                arrow = "→"
+                signed_level = 0
+
+            trend_text = (
+                f"{arrow} {strength} {direction} "
+                f"(poziom {signed_level:+d}/3, znormalizowane nachylenie ≈ {norm:+.3f})."
+            )
+
+        # --- Altair ma limit 5000 wierszy → rysujemy próbkę równomierną ---
+        plot_df_sorted = plot_df.sort_values("__x__")
+        plot_df_plot = plot_df_sorted
+        MAX_PLOT_POINTS = 5000
+
+        if len(plot_df_sorted) > MAX_PLOT_POINTS:
+            idx = np.linspace(0, len(plot_df_sorted) - 1, MAX_PLOT_POINTS).astype(int)
+            plot_df_plot = plot_df_sorted.iloc[idx].copy()
+
+        # --- Altair ma limit ~5000 wierszy → rysujemy próbkę równomierną ---
+        plot_df_sorted = plot_df.sort_values("__x__")
+        plot_df_plot = plot_df_sorted
+        MAX_PLOT_POINTS = 5000
+
+        if len(plot_df_sorted) > MAX_PLOT_POINTS:
+            idx = np.linspace(0, len(plot_df_sorted) - 1, MAX_PLOT_POINTS).astype(int)
+            plot_df_plot = plot_df_sorted.iloc[idx].copy()
+
+        # --- wykres linii (z paddingiem, żeby nie ucinało osi) ---
+        chart = (
+            alt.Chart(plot_df_plot)
+            .mark_line()
+            .encode(
+                x=x_enc,
+                y=alt.Y(f"{y_col}:Q", title=y_col),
+                tooltip=[
+                    alt.Tooltip("__x__:T" if x_choice != "Numer wiersza (pseudo-czas)" else "__x__:Q", title=x_choice),
+                    alt.Tooltip(f"{y_col}:Q", title=y_col, format=".3g"),
+                ],
+            )
+            .properties(
+                height=380,
+                padding={"left": 10, "right": 20, "top": 10, "bottom": 45},
+            )
+            .configure_axis(titlePadding=10, labelPadding=6)
+            .configure_view(stroke=None)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+
+    # -------- prawa kolumna – karta z oceną + badge trendu -----------
+    with col_right:
+        st.markdown("**Szybka ocena szeregu**")
+
+        n_raw = len(df)
+        st.markdown(f"**Liczba obserwacji:** {n_raw:,}")
+
+        if time_col and time_col in df.columns:
+            t = pd.to_datetime(df[time_col], errors="coerce").dropna()
+            if not t.empty:
+                st.markdown(
+                    f"**Okres:** {t.min().date()} – {t.max().date()}"
+                )
+
+        st.markdown(f"**Agregacja:** {agg_choice}")
+        st.markdown(f"**Punkty po agregacji:** {len(plot_df_sorted):,}")
+
+        if n_raw >= 100:
+            st.success("✅ Seria ma wystarczająco dużo punktów do podstawowej analizy.")
+        else:
+            st.warning("⚠ Seria ma mało punktów – wnioski mogą być niestabilne.")
+
+        if trend_text:
+            st.markdown(
+                f"""
+                <div style="
+                    margin-top:0.75rem;
+                    padding:0.6rem 0.75rem;
+                    border-radius:0.6rem;
+                    background:#eff6ff;
+                    border:1px solid #bfdbfe;
+                    font-size:0.85rem;
+                    line-height:1.4;
+                ">
+                  <div style="font-weight:600;margin-bottom:0.20rem;">
+                    Trend globalny szeregu
+                  </div>
+                  <div>{trend_text}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="margin-top:0.75rem;font-size:0.80rem;color:#6b7280;">'
+                "Brak wystarczających danych, aby wiarygodnie ocenić trend."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+# ============================================================
+#  HERO: KLASTERYZACJA – przestrzeń cech
+# ============================================================
+def _hero_clustering_overview(df: pd.DataFrame, cluster_col: str | None) -> None:
+    st.subheader("Przestrzeń cech do klasteryzacji", divider="gray")
+    st.markdown("<div style='margin-top:-0.40rem'></div>", unsafe_allow_html=True)
+
+    col_left, col_right = st.columns([4, 1.5])
+
+    # -------- LEWA: wybór osi + wykres -----------------
+    with col_left:
+        # kolumny numeryczne do osi X/Y
+        num_cols = [
+            c for c in df.columns
+            if pd.api.types.is_numeric_dtype(df[c])
+        ]
+
+        if len(num_cols) < 2:
+            st.info(
+                "Do wizualizacji przestrzeni cech potrzebne są przynajmniej dwie kolumny liczbowe."
+            )
+            return
+
+        # kolumny kategoryczne do kolorowania
+        cat_cols = [
+            c for c in df.columns
+            if not pd.api.types.is_numeric_dtype(df[c])
+        ]
+
+        # --- trzy selectboxy w jednej linii ---
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            x_col = st.selectbox(
+                "Cecha na osi X",
+                num_cols,
+                index=0,
+                key="cluster_x",
+            )
+
+        with c2:
+            # domyślnie pierwsza inna kolumna niż X
+            y_candidates = [c for c in num_cols if c != x_col] or num_cols
+            y_col = st.selectbox(
+                "Cecha na osi Y",
+                y_candidates,
+                index=0,
+                key="cluster_y",
+            )
+
+        with c3:
+            color_options = ["(Brak)"]
+            # najpierw sugerujemy kolumnę klastrów, jeśli istnieje
+            if cluster_col and cluster_col in df.columns:
+                color_options.append(cluster_col)
+            # potem pozostałe kategoryczne (bez duplikatów)
+            for c in cat_cols:
+                if c not in color_options:
+                    color_options.append(c)
+
+            color_choice = st.selectbox(
+                "Kolor punktów (segment / kategoria)",
+                color_options,
+                index=0,
+                key="cluster_color",
+            )
+
+        # --- przygotowanie danych do wykresu ---
+        cols_for_plot = [x_col, y_col]
+        if color_choice != "(Brak)":
+            cols_for_plot.append(color_choice)
+
+        df_plot = df[cols_for_plot].dropna()
+
+        if df_plot.empty:
+            st.info("Brak danych do wyświetlenia przestrzeni cech dla wybranych kolumn.")
+            return
+
+        tooltip_fields = [x_col, y_col]
+        encodings = {
+            "x": alt.X(x_col, title=x_col),
+            "y": alt.Y(y_col, title=y_col),
+        }
+
+        if color_choice != "(Brak)":
+            encodings["color"] = alt.Color(
+                color_choice,
+                title=color_choice,
+                legend=alt.Legend(title=color_choice),
+            )
+            tooltip_fields.append(color_choice)
+
+        chart = (
+            alt.Chart(df_plot)
+            .mark_circle(size=50, opacity=0.7)
+            .encode(
+                tooltip=tooltip_fields,
+                **encodings,
+            )
+            .properties(height=320)
+        )
+
+        st.altair_chart(chart, use_container_width=True)
+
+    # -------- PRAWA: szybka ocena -----------------------
+    with col_right:
+        st.markdown("**Szybka ocena przestrzeni cech**")
+        st.write(f"Liczba rekordów: **{len(df)}**")
+        st.write(f"Liczba cech numerycznych: **{len(num_cols)}**")
+
+        st.info(
+            "Użyj kolorowania, żeby zobaczyć wyraźniejsze segmenty. "
+            "W kolejnych krokach możemy nazwać i opisać klastry automatycznie."
+        )
+
+
+# ============================================================
+#  HERO: REGRESJA – rozkład celu + ocena
+# ============================================================
+def _hero_regression_overview(df: pd.DataFrame, target_col: str) -> None:
+    st.subheader("Rozkład wartości celu (y)", divider="gray")
+    st.markdown("<div style='margin-top:-0.40rem'></div>", unsafe_allow_html=True)
+
+    col_left, col_right = st.columns([4, 1.5])
+
+    s = pd.to_numeric(df[target_col], errors="coerce").dropna()
+
+    # -------- lewa kolumna – histogram -----------
+    with col_left:
+        if s.empty:
+            st.info("Brak danych liczbowych w kolumnie celu – nie można narysować rozkładu.")
+        else:
+            hist_df = pd.DataFrame({target_col: s})
+            chart = (
+                alt.Chart(hist_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X(
+                        f"{target_col}:Q",
+                        bin=alt.Bin(maxbins=40),
+                        title=target_col,
+                    ),
+                    y=alt.Y("count():Q", title="Liczba rekordów"),
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+    # -------- prawa kolumna – karta z oceną -----------
+    with col_right:
+        st.markdown("**Szybka ocena rozkładu celu**")
+
+        if s.empty:
+            st.info("Brak danych do oceny rozkładu.")
+            return
+
+        st.markdown(
+            f"**Mediana:** {s.median():.3g}  \n"
+            f"**Min / max:** {s.min():.3g} – {s.max():.3g}"
+        )
+
+        skew = s.skew()
+        if abs(skew) < 0.5:
+            st.success("✅ Rozkład jest w przybliżeniu symetryczny – to ułatwia modelowanie.")
+        elif skew > 0:
+            st.warning("⚠️ Rozkład jest mocno prawoskośny – rozważ transformację (np. log).")
+        else:
+            st.warning("⚠️ Rozkład jest lewoskośny – sprawdź, czy nie ma efektów obcięcia.")
 
 def main():
     st.title("Automat EDA — szybka diagnostyka danych (Etap 2)")
@@ -1991,6 +2782,27 @@ def main():
     )
 
 
+    # ───────────────────────── SIDEBAR: Praca na próbce danych (szybsza EDA) ─────────────────────────
+    with st.sidebar:
+        use_sample = st.checkbox(
+            "⚡ Pracuj na próbce danych (szybsza EDA)",
+            value=True,
+            help=(
+                "Przy bardzo dużych zbiorach EDA będzie działać na losowej próbie danych, "
+                "a pełny zbiór zostanie wykorzystany później do trenowania modelu."
+            ),
+            key="eda_use_sample",
+        )
+        sample_rows_eda = st.number_input(
+            "Rozmiar próbki do EDA",
+            min_value=5_000,    # minimalna sensowna próbka
+            max_value=200_000,  # górny limit, żeby nie „zabić” przeglądarki
+            step=5_000,
+            value=20_000,       # domyślnie: 20k, dobry kompromis
+            format="%d",
+            key="eda_sample_rows",
+        )
+
     # ───────────────────────── SIDEBAR: Lektor & TL;DR ─────────────────────────
     with st.sidebar.expander("🎙️ Lektor & TL;DR", expanded=False):
         fast_sidebar = st.checkbox("🧠 Generuj TL;DR (OpenAI)", value=True,
@@ -2007,7 +2819,6 @@ def main():
         st.checkbox("✅ Włącz lektora (TTS)", value=True, key="tts_enabled")
 
         provider = st.radio("Dostawca TTS", ["OpenAI", "ElevenLabs"], index=0)
-
 
         gender = st.radio("Głos", ["Kobieta", "Mężczyzna"], horizontal=True, index=0)
 
@@ -2087,35 +2898,149 @@ def main():
                     st.warning(f"⚠️ ElevenLabs voice_id niezweryfikowany: {msg}")
 
     # 0) Wczytanie danych
-    df, latest_info, err = _load_latest_dataset()
+
+    # Najpierw wczytujemy PEŁNY zbiór z Etapu 1
+    df_full, latest_info, err = _load_latest_dataset()
     if err:
-        st.error(err); st.stop()
+        st.error(err)
+        st.stop()
+
+    # Domyślnie EDA pracuje na pełnym zbiorze
+    df = df_full
+    is_sampled = False
+
+    # Jeżeli w sidebarze mamy przełącznik "Pracuj na próbce danych (szybsza EDA)"
+    # i parametr rozmiaru próbki, to spróbujmy użyć próbkowania
+    if "use_sample" in locals() and "sample_rows_eda" in locals():
+        try:
+            n_rows_full = df_full.shape[0]
+            if use_sample and n_rows_full > int(sample_rows_eda):
+                df = df_full.sample(
+                    n=int(sample_rows_eda),
+                    random_state=0,
+                ).reset_index(drop=True)
+                is_sampled = True
+        except Exception:
+            # w razie problemu z próbkowaniem wracamy do pełnego zbioru
+            df = df_full
+            is_sampled = False
 
     # ➜ na potrzeby Sekcji 2–6 dorzuć warianty liczbowe (np. Czas_sec)
     df = _augment_numeric_derivatives_for_ui(df)
 
-    # Reset widoczności sekcji 7, gdy zmienił się zbiór
-    csv_path = latest_info.get("csv_path", "?")
-    sig_now = _sec7_signature(csv_path, df)
+    # -------------------------------------------------------------
+    # CACHE core obliczeń per-dataset (żeby nie liczyć w kółko)
+    # -------------------------------------------------------------
+    csv_path = latest_info.get("csv_path", "")
+    sig_now = _sec7_signature(csv_path, df_full)
+
+    # 1) jeśli zmienił się dataset → reset jak dotąd + wyczyść cache
     if st.session_state.get("sec7_signature") != sig_now:
-        _reset_sec7_state()
+        reset_sec7_state()
         st.session_state["sec7_signature"] = sig_now
+
+        for k in [
+            # override'y
+            "task_override", "target_override", "cluster_override",
+            "task_override_radio", "target_override_select", "cluster_override_select",
+            # cache core
+            "_cached_df_aug", "_cached_roles",
+            "_cached_df_aug_sig", "_cached_roles_sig",
+            # cache sec1
+            "_cached_sec1_sig", "_cached_sec1",
+        ]:
+            st.session_state.pop(k, None)
+
+    # 2) policz df_aug i roles tylko raz dla tej sygnatury (+ tryb próbki)
+    sample_flag = bool(st.session_state.get("use_sample", False))
+    sample_n = int(st.session_state.get("sample_n", df.shape[0]))
+    core_sig = f"{sig_now}|sample={sample_flag}|n={sample_n}"
+
+    if st.session_state.get("_cached_df_aug_sig") != core_sig:
+        st.session_state["_cached_df_aug"] = _augment_numeric_derivatives_for_ui(df)
+        st.session_state["_cached_df_aug_sig"] = core_sig
+
+    if st.session_state.get("_cached_roles_sig") != core_sig:
+        st.session_state["_cached_roles"] = _infer_eda_roles(df, latest_info)
+        st.session_state["_cached_roles_sig"] = core_sig
+
+    df_aug = st.session_state["_cached_df_aug"]
+    roles  = st.session_state["_cached_roles"]
+
+    # ─────────────────────────────────────────────────────────────
+    # UŻYTKOWNIK MOŻE NADPISAĆ TASK / TARGET / CLUSTER (deterministycznie)
+    # ─────────────────────────────────────────────────────────────
+    override_task    = st.session_state.get("task_override")
+    override_target  = st.session_state.get("target_override")
+    override_cluster = st.session_state.get("cluster_override")
+
+    if override_task in ("regression", "classification", "time_series", "clustering"):
+        roles["task"] = override_task
+
+    if override_target is not None and override_target in df.columns:
+        roles["target"] = override_target
+
+    if override_cluster is not None and override_cluster in df.columns:
+        roles["cluster_col"] = override_cluster
+
+    st.session_state["eda_roles"] = roles
+
 
     # ───────────────────────── Sekcje 1–6 (wracają do main) ─────────────────────────
     run_dir    = latest_info.get("run_dir", "(brak)")
     source_name = latest_info.get("source_name", os.path.basename(csv_path) or "(brak nazwy źródła)")
-    n_rows_raw = latest_info.get("n_rows", df.shape[0])
-    n_cols_raw = latest_info.get("n_cols", df.shape[1])
+    n_rows_raw = latest_info.get("n_rows", df_full.shape[0])
+    n_cols_raw = latest_info.get("n_cols", df_full.shape[1])
     mask_pii   = latest_info.get("pii_masked", True)
     timestamp  = latest_info.get("timestamp", "(brak)")
 
-    global_missing_pct = _calc_global_missing_pct(df)
-    info_df, high_null_cols = _analyze_columns(df)
-    corr_chart, pairs_sorted, corr_drop_suggestions = _build_correlation_report(df, info_df, threshold=0.9)
-    pairs_df_full = _pairs_dataframe(pairs_sorted)
-    dups_info = _detect_duplicates(df)
+    # Informacja dla użytkownika o pracy na próbce
+    if "is_sampled" in locals() and is_sampled:
+        st.caption(
+            f"⚡ EDA pracuje teraz na losowej próbie **{df.shape[0]:,}** wierszy "
+            f"z pełnego zbioru **{n_rows_raw:,}**. "
+            "Pełny zbiór zostawiamy do trenowania modelu w kolejnym etapie."
+        )
+
+    # Dalej cała logika sekcji 1–6 działa już na df (próbka lub pełny zbiór)
+    stats_sig = f"{core_sig}|rows={df.shape[0]}|cols={tuple(df.columns)}"
+
+    if st.session_state.get("_cached_sec1_sig") != stats_sig:
+        global_missing_pct = _calc_global_missing_pct(df)
+        info_df, high_null_cols = _analyze_columns(df)
+
+        corr_chart, pairs_sorted, corr_drop_suggestions = _build_correlation_report(
+            df, info_df, threshold=0.9
+        )
+        pairs_df_full = _pairs_dataframe(pairs_sorted)
+
+        dups_info = _detect_duplicates(df)
+
+        st.session_state["_cached_sec1_sig"] = stats_sig
+        st.session_state["_cached_sec1"] = dict(
+            global_missing_pct=global_missing_pct,
+            info_df=info_df,
+            high_null_cols=high_null_cols,
+            corr_chart=corr_chart,
+            pairs_sorted=pairs_sorted,
+            corr_drop_suggestions=corr_drop_suggestions,
+            pairs_df_full=pairs_df_full,
+            dups_info=dups_info,
+        )
+    else:
+        _c = st.session_state["_cached_sec1"]
+        global_missing_pct     = _c["global_missing_pct"]
+        info_df                = _c["info_df"]
+        high_null_cols         = _c["high_null_cols"]
+        corr_chart             = _c["corr_chart"]
+        pairs_sorted           = _c["pairs_sorted"]
+        corr_drop_suggestions  = _c["corr_drop_suggestions"]
+        pairs_df_full          = _c["pairs_df_full"]
+        dups_info              = _c["dups_info"]
+
     duplicates_count = dups_info["duplicates_count"]
     duplicates_pct   = dups_info["duplicates_pct"]
+
 
     auto_drop_candidates = set(info_df.loc[info_df["drop_candidate"], "kolumna"].tolist())
     auto_drop_candidates.update(corr_drop_suggestions)
@@ -2144,6 +3069,7 @@ def main():
 
     # — 1A. Rząd metryk
     colA, colB, colC, colD, colE = st.columns(5)
+
     with colA:
         st.markdown(_metric_card_html(
             "Wiersze × Kolumny",
@@ -2183,23 +3109,185 @@ def main():
             fg=color_ready
         ), unsafe_allow_html=True)
 
-    # — 1B. Jeden baner pod metrykami (CTA, bez dodatkowych boxów nad/poniżej)
+    # — 1B. Baner jakości danych + box z typem zadania w jednej linii
     if readiness_score >= 85:
-        banner = _status_banner_html(
-            "ok",
-            "Dane wyglądają stabilnie. Przejdź do dalszych sekcji i zobacz jak **automatycznie przygotujemy** dane dla modelu predykcyjnego."
+        banner_level = "ok"
+        banner_text = (
+            "Dane wyglądają stabilnie. "
+            "Przejdź do dalszych sekcji i zobacz jak "
+            "**automatycznie przygotujemy** dane dla modelu predykcyjnego."
         )
     elif readiness_score >= 60:
-        banner = _status_banner_html(
-            "warn",
-            "Widzimy podwyższone braki/duplikaty/ryzykowne kolumny – **naprawimy to automatycznie** dla modelu predykcyjnego w sekcji **7. Przygotowanie danych**."
+        banner_level = "warn"
+        banner_text = (
+            "Widzimy podwyższone braki/duplikaty/ryzykowne kolumny.<br>"
+            "**Naprawimy to automatycznie** i przygotujemy dane dla modelu predykcyjnego "
+            "w sekcji **7. Przygotowanie danych**."
         )
     else:
-        banner = _status_banner_html(
-            "err",
-            "Dane nie wyglądają dobrze. **Nie martw się** – w sekcji **7. Przygotowanie danych** oczyścimy je automatycznie i przygotujemy bezpieczny zbiór dla modelu predykcyjnego."
+        banner_level = "err"
+        banner_text = (
+            "Dane nie wyglądają dobrze.<br>"
+            "**Nie martw się** – w sekcji **7. Przygotowanie danych** "
+            "krok po kroku oczyścimy je automatycznie i przygotujemy bezpieczny zbiór "
+            "dla modelu predykcyjnego."
         )
-    st.markdown(banner, unsafe_allow_html=True)
+
+    banner_html = _status_banner_html(banner_level, banner_text)
+
+    # box z typem zadania – niebieski, szerokość jak dwie ostatnie metryki
+    roles = st.session_state.get("eda_roles") or {}
+    task = (roles.get("task") or "regression").lower()
+
+    task_name_main = {
+        "regression": "Regresja",
+        "classification": "Klasyfikacja",
+        "time_series": "Szereg czasowy",
+        "clustering": "Klasteryzacja",
+    }.get(task, "Inny typ zadania")
+
+    task_name_sub = {
+        "regression": "Przewidywanie liczby ciągłej (np. cena, czas, popyt).",
+        "classification": "Przewidywanie klasy / etykiety (np. tak/nie, segment).",
+        "time_series": "Przewidywanie wartości w czasie (np. prognoza trendu).",
+        "clustering": "Odkrywanie naturalnych grup / segmentów w danych.",
+    }.get(task, "")
+
+    task_emoji = {
+        "regression": "📈",
+        "classification": "🏷️",
+        "time_series": "⏱️",
+        "clustering": "🧩",
+    }.get(task, "🤖")
+
+    task_box_html = f"""
+    <div style="
+        border:1px solid #bfdbfe;
+        background:#eff6ff;
+        border-radius:0.6rem;
+        padding:0.85rem 1.0rem;
+        margin-top:0.6rem;
+        line-height:1.45;
+        min-height:5.0rem;
+        display:flex;
+        align-items:center;
+        box-sizing:border-box;
+    ">
+      <div style="display:flex;align-items:center;gap:.55rem;">
+        <div style="font-size:1.0rem;line-height:1;">{task_emoji}</div>
+        <div style="display:flex;flex-direction:column;">
+          <span style="font-size:1.0rem;font-weight:600;color:#0b57d0;">
+            Zadanie: {task_name_main}
+          </span>
+          <span style="font-size:0.85rem;color:#1f2937;">
+            {task_name_sub}
+          </span>
+        </div>
+      </div>
+    </div>
+    """
+
+    # układ 3/5 + 2/5 – jak rząd metryk (3 karty + 2 karty)
+    col_msg, col_task = st.columns([3, 2])
+    with col_msg:
+        st.markdown(banner_html, unsafe_allow_html=True)
+    with col_task:
+        # --- główna ramka z wykrytym zadaniem ---
+        st.markdown(task_box_html, unsafe_allow_html=True)
+
+        # --- ramka-hint PODZIELONA: (1) wybór tasku + (2) wybór targetu ---
+        # wariant umiarkowany: pokazujemy tylko sensowne opcje
+        if task in ("regression", "classification") or roles.get("time_col") or roles.get("cluster_col"):
+
+            active_task = st.session_state.get("task_override") or task
+
+            # bazowe sygnały
+            time_col = roles.get("time_col")
+            has_time_col = bool(time_col)
+            ts_suspected = bool(roles.get("ts_suspected"))
+
+            # bazowe opcje
+            task_options = ["regression", "classification"]
+
+            # time_series pokazujemy:
+            # - gdy wykryto prawdziwą kolumnę czasu
+            # - LUB gdy meta/source sugerują TS (np. PyCaret time series bez time_col)
+            if has_time_col or ts_suspected:
+                task_options.append("time_series")
+
+            # jeśli heurystyka widzi klasteryzację → pozwól wybrać clustering
+            if task == "clustering" or roles.get("cluster_col"):
+                task_options.append("clustering")
+
+            # uniknij duplikatów, ustaw index
+            task_options = list(dict.fromkeys(task_options))
+            active_task_index = task_options.index(active_task) if active_task in task_options else 0
+
+            # aktywny target = override jeśli jest, inaczej auto-wykryty
+            active_target = st.session_state.get("target_override") or roles.get("target")
+            target_options = list(df.columns)
+            if active_target not in target_options and target_options:
+                active_target = target_options[0]
+
+            with st.container(border=True):
+                left, right = st.columns(2, gap="small")
+
+                # --- LEWA POŁOWA: task ---
+                with left:
+                    st.markdown(
+                        "<span style='color:#0b57d0;font-weight:600;font-size:0.9rem'>"
+                        "👶 Jeśli myślisz, że to inne <b>zadanie</b> – wybierz tutaj."
+                        "</span>",
+                        unsafe_allow_html=True
+                    )
+
+                    chosen_task = st.radio(
+                        label="",
+                        options=task_options,
+                        index=active_task_index,
+                        key="task_override_radio",
+                        horizontal=True,
+                        label_visibility="collapsed",
+                    )
+
+                # mikro-hint zależny od danych
+                if has_time_col and time_col:
+                    st.caption(
+                        f"🕒 Wykryto kolumnę czasu: **{time_col}** → możesz też użyć **time_series**."
+                    )
+                    st.caption("⏱️ Wybierz time_series, gdy chcesz prognozować po czasie.")
+                elif ts_suspected:
+                    st.caption("🕒 Źródło sugeruje szereg czasowy, ale nie widzę jawnej kolumny czasu.")
+                    st.caption("Możesz użyć **time_series** z pseudo-czasem (numer wiersza) lub wskazać oś czasu w sekcji 2.")
+
+                # --- PRAWA POŁOWA: target ---
+                with right:
+                    st.markdown(
+                        "<span style='color:#0b57d0;font-weight:600;font-size:0.9rem'>"
+                        "🎯 Jeśli chcesz przewidywać inną <b>kolumnę (target)</b> – wybierz ją tutaj."
+                        "</span>",
+                        unsafe_allow_html=True
+                    )
+
+                    chosen_target = st.selectbox(
+                        label="",
+                        options=target_options,
+                        index=target_options.index(active_target) if active_target in target_options else 0,
+                        key="target_override_select",
+                        label_visibility="collapsed",
+                    )
+
+            # --- jeśli user zmienił task → zapisz override + rerun ---
+            if chosen_task != active_task:
+                st.session_state["task_override"] = chosen_task
+                st.rerun()
+
+            # --- jeśli user zmienił target → zapisz override + rerun ---
+            if chosen_target != active_target:
+                st.session_state["target_override"] = chosen_target
+                st.rerun()
+
+
 
     # — 1C. Krótka stopka źródła (zostawiamy)
     st.caption(
@@ -2221,6 +3309,26 @@ def main():
     # 2) Podgląd danych
     st.header("2. Podgląd danych")
     st.caption("Szybki rzut oka na zawartość zbioru. To są dane już po anonimizacji PII (jeśli była włączona).")
+
+    roles = st.session_state.get("eda_roles") or {}
+    task = (roles.get("task") or "regression").lower()
+    target_col = roles.get("target")
+    time_col = roles.get("time_col")
+    cluster_col = roles.get("cluster_col")
+
+    # ---------- HERO: w zależności od typu zadania ----------
+    if task == "classification" and target_col and target_col in df.columns:
+        _hero_classification_overview(df, target_col)
+    elif task == "time_series":
+        _hero_time_series_overview(df, time_col, roles)
+    elif task == "clustering":
+        _hero_clustering_overview(df, cluster_col)
+    else:
+        # domyślnie regresja / inne z targetem liczbowym
+        if target_col and target_col in df.columns:
+            _hero_regression_overview(df, target_col)
+
+    # ---------- klasyczny podgląd head / tail pod spodem ----------
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Pierwsze wiersze (head)", divider="gray")
@@ -2228,6 +3336,7 @@ def main():
     with c2:
         st.subheader("Ostatnie wiersze (tail)", divider="gray")
         st.dataframe(df.tail(10), width="stretch", hide_index=True)
+
 
     # 3) Jakość kolumn
     st.header("3. Jakość kolumn")
@@ -2336,11 +3445,23 @@ def main():
     # 4) Analiza wybranej kolumny
     st.header("4. Analiza wybranej kolumny")
     st.caption("Zbadaj konkretną kolumnę: rozkład, odstające wartości, dominujące kategorie, pokrycie TOP segmentów.")
+
     available_cols = list(df.columns)
-    col_to_plot = st.selectbox("Wybierz kolumnę do analizy:", options=available_cols, index=0 if available_cols else None)
+    col_to_plot = st.selectbox(
+        "Wybierz kolumnę do analizy:",
+        options=available_cols,
+        index=0 if available_cols else None,
+    )
+
+    # Meta o zadaniu – przyda się do trybów klasyfikacja / klasteryzacja
+    roles = st.session_state.get("eda_roles") or {}
+    task = (roles.get("task") or "regression").lower()
+    target_col = roles.get("target")
+    cluster_col = roles.get("cluster_col")
 
     if col_to_plot:
-        s_col = df[col_to_plot]
+        s_col_raw = df[col_to_plot]
+        s_col = s_col_raw.copy()
 
         # jeśli nie jest numeryczna, spróbuj z naszych parserów specjalnych
         if not pd.api.types.is_numeric_dtype(s_col):
@@ -2348,265 +3469,1715 @@ def main():
             if pd.notna(try_coerced).mean() > 0.8:  # wystarczająco dużo parsuje się na liczbę
                 s_col = try_coerced
 
-        # po tej próbie decydujemy o ścieżce
+        # ───────────────────── PODSTAWOWA ANALIZA KOLUMNY (jak dotychczas) ─────────────────────
         if pd.api.types.is_numeric_dtype(s_col):
             st.caption("Czy to wygląda zdrowo?")
-            combo_chart, stats_table, comment_text, details = _numeric_distribution_details(s_col, col_to_plot)
+            combo_chart, stats_table, comment_text, details = _numeric_distribution_details(
+                s_col, col_to_plot
+            )
             cc1, cc2 = st.columns([2, 1])
             with cc1:
                 st.altair_chart(combo_chart, use_container_width=True)
             with cc2:
                 st.subheader("Metryki kolumny", divider="gray")
                 st.dataframe(stats_table, hide_index=True, use_container_width=True)
+
             outlier_ratio = details.get("outlier_ratio_pct", 0.0)
             if outlier_ratio > 5.0:
-                st.warning("Widzimy wartości odstające (czerwone). Zostaną oznaczone flagą `is_outlier_*`. Nie skasujemy ich bez pytania.")
+                st.warning(
+                    "Widzimy wartości odstające (czerwone punkty / słupki). "
+                    "Domyślnie nie usuwamy ich automatycznie – zostaną oznaczone flagą `is_outlier_*`. "
+                    "Nie skasujemy ich bez pytania."
+                )
             else:
                 st.success("Ta kolumna wygląda stabilnie — model dostanie czysty sygnał.")
+
             st.info(comment_text)
+
+            # ───────────────────── POZIOM 2 DLA NUMERYCZNYCH (REGRESJA) ─────────────────────
+            if (
+                task == "regression"
+                and target_col
+                and target_col in df.columns
+                and col_to_plot != target_col
+            ):
+                st.subheader("Jak ta cecha wpływa na target?", divider="gray")
+
+                df_num = pd.DataFrame(
+                    {
+                        "feature": pd.to_numeric(s_col, errors="coerce"),
+                        "target": pd.to_numeric(df[target_col], errors="coerce"),
+                    }
+                ).dropna()
+
+                if df_num.empty:
+                    st.info("Brak danych jednocześnie w wybranej kolumnie i w targetcie.")
+                else:
+                    # ─── próbkujemy dla wydajności ───
+                    MAX_PTS = 20000
+                    if len(df_num) > MAX_PTS:
+                        df_plot = df_num.sample(MAX_PTS, random_state=42)
+                        st.caption(f"Pokazuję próbkę {MAX_PTS:,} punktów (dla wydajności).")
+                    else:
+                        df_plot = df_num
+
+                    # ─── przypisowa legenda (subtelna) ───
+                    st.caption(
+                        "ℹ️ LOESS = wygładzona krzywa trendu (nieliniowa). "
+                        "Rolling mean (linia przerywana) = średnia krocząca po posortowanej cesze."
+                    )
+
+                    # ─── scatter + LOESS + rolling mean ───
+                    base = alt.Chart(df_plot).mark_point(
+                        filled=True, size=22, opacity=0.25
+                    ).encode(
+                        x=alt.X("feature:Q", title=col_to_plot),
+                        y=alt.Y("target:Q", title=target_col),
+                        tooltip=[
+                            alt.Tooltip("feature:Q", title=col_to_plot, format=".3g"),
+                            alt.Tooltip("target:Q", title=target_col, format=".3g"),
+                        ],
+                    )
+
+                    loess = alt.Chart(df_plot).transform_loess(
+                        "feature", "target", bandwidth=0.35
+                    ).mark_line(size=3).encode(
+                        x="feature:Q",
+                        y="target:Q",
+                    )
+
+                    rolling = alt.Chart(df_plot).transform_window(
+                        rolling_mean="mean(target)",
+                        sort=[alt.SortField("feature")],
+                        frame=[-200, 200],
+                    ).mark_line(size=2, strokeDash=[6, 4]).encode(
+                        x="feature:Q",
+                        y="rolling_mean:Q",
+                    )
+
+                    chart_scatter = (base + rolling + loess).properties(height=340)
+                    st.altair_chart(chart_scatter, use_container_width=True)
+
+                    # ─── korelacje ───
+                    spearman = float(df_num["feature"].corr(df_num["target"], method="spearman"))
+                    pearson = float(df_num["feature"].corr(df_num["target"], method="pearson"))
+
+                    # ─── krótki wniosek pod wykresem ───
+                    rho_abs = abs(spearman) if np.isfinite(spearman) else 0.0
+                    if rho_abs < 0.10:
+                        strength_txt = "brak wyraźnej zależności"
+                    elif rho_abs < 0.30:
+                        strength_txt = "słaba zależność"
+                    elif rho_abs < 0.50:
+                        strength_txt = "umiarkowana zależność"
+                    elif rho_abs < 0.70:
+                        strength_txt = "silna zależność"
+                    else:
+                        strength_txt = "bardzo silna zależność"
+
+                    if spearman > 0:
+                        dir_txt = "rosnąca"
+                    elif spearman < 0:
+                        dir_txt = "malejąca"
+                    else:
+                        dir_txt = "płaska"
+
+                    nonlin_hint = (
+                        np.isfinite(spearman) and np.isfinite(pearson)
+                        and (abs(spearman) > abs(pearson) + 0.15)
+                    )
+
+                    extra = " z lekką nieliniowością" if nonlin_hint else ""
+                    st.markdown(
+                        f"✅ **Wniosek:** relacja jest **{dir_txt}**, "
+                        f"({strength_txt}{extra})."
+                    )
+
+
+                    # ───────────────────── SUBTELNE KAFELKI + PANELE GRUP (v3) ─────────────────────
+                    st.markdown(
+                        """
+                        <style>
+                        .eda-group{
+                            border:1px solid #e6e8ef;
+                            background:#fbfcff;
+                            border-radius:14px;
+                            padding:10px 12px;
+                            margin-top:4px;   /* mniej pustki pod wykresem */
+                            margin-bottom:6px;
+                        }
+                        .eda-tile{
+                            border:1px solid #eef0f3;
+                            background:#f9fafb;
+                            border-radius:12px;
+                            padding:10px 12px;
+                            height:108px;
+                            display:flex;
+                            flex-direction:column;
+                            justify-content:space-between;
+                            box-sizing:border-box;
+                        }
+                        .eda-tile-wide{
+                            border:1px solid #e6e9ef;
+                            background:#ffffff;
+                            border-radius:12px;
+                            padding:10px 12px;
+                            height:108px;
+                            display:flex;
+                            flex-direction:column;
+                            justify-content:space-between;
+                            box-sizing:border-box;
+                            margin-top:8px;
+                            border-left:6px solid var(--vcol);
+                        }
+                        .eda-tile-title{
+                            font-size:0.88rem;
+                            font-weight:600;
+                            color:#374151;
+                        }
+                        .eda-tile-value{
+                            font-size:1.45rem;
+                            font-weight:800;
+                            color:#111827;
+                            line-height:1.0;
+                        }
+                        .eda-pill{
+                            display:inline-block;
+                            font-size:0.80rem;
+                            font-weight:700;
+                            padding:2px 8px;
+                            border-radius:999px;
+                            background:rgba(0,0,0,0.04);
+                            color:#111827;
+                            width:fit-content;
+                        }
+                        .eda-help{
+                            font-size:0.78rem;
+                            color:#6b7280;
+                            margin-top:4px;
+                            line-height:1.25;
+                        }
+                        </style>
+                        """,
+                        unsafe_allow_html=True
+                    )
+
+                    def _level_from_abs(x: float, thresholds):
+                        for ub, label, color in thresholds:
+                            if x < ub:
+                                return label, color
+                        return thresholds[-1][1], thresholds[-1][2]
+
+                    def _tile_html(title, value, label, color, help_txt=None, wide=False):
+                        help_html = f"<div class='eda-help'>{help_txt}</div>" if help_txt else ""
+                        if wide:
+                            return f"""
+                            <div class="eda-tile-wide" style="--vcol:{color}">
+                                <div class="eda-tile-title">{title}</div>
+                                <div class="eda-tile-value">{value}</div>
+                                <div class="eda-pill" style="color:{color}; background:{color}18;">{label}</div>
+                                {help_html}
+                            </div>
+                            """
+                        return f"""
+                        <div class="eda-tile">
+                            <div class="eda-tile-title">{title}</div>
+                            <div class="eda-tile-value">{value}</div>
+                            <div class="eda-pill" style="color:{color}; background:{color}18;">{label}</div>
+                            {help_html}
+                        </div>
+                        """
+
+                    CORR_THRESH = [
+                        (0.10, "bardzo słaba", "#b91c1c"),
+                        (0.30, "słaba",        "#b45309"),
+                        (0.50, "umiarkowana",  "#a16207"),
+                        (0.70, "silna",        "#15803d"),
+                        (10.0, "bardzo silna", "#166534"),
+                    ]
+
+                    # słownictwo zgodne z resztą appki
+                    SKEW_THRESH = [
+                        (0.50, "stabilna",       "#166534"),
+                        (1.00, "lekko skośna",   "#15803d"),
+                        (2.00, "skośna",         "#a16207"),
+                        (3.00, "mocno skośna",   "#b45309"),
+                        (10.0, "bardzo skośna",  "#b91c1c"),
+                    ]
+
+                    # 50/50 jak w ustaleniach
+                    colL, colR = st.columns(2)
+
+                    # ───────────────────── PANEL 1: Korelacje ─────────────────────
+                    with colL:
+                        st.subheader("Korelacje", divider="gray")
+
+                        sp_val = spearman if np.isfinite(spearman) else 0.0
+                        pr_val = pearson  if np.isfinite(pearson)  else 0.0
+
+                        sp_lbl, sp_col = _level_from_abs(abs(sp_val), CORR_THRESH)
+                        pr_lbl, pr_col = _level_from_abs(abs(pr_val), CORR_THRESH)
+
+                        rho_abs = abs(sp_val) if np.isfinite(spearman) else 0.0
+                        verdict_lbl, verdict_col = _level_from_abs(rho_abs, CORR_THRESH)
+
+                        cA, cB = st.columns(2)
+                        with cA:
+                            st.markdown(
+                                _tile_html(
+                                    "Spearman ρ (odporny)",
+                                    f"{sp_val:.3f}" if np.isfinite(spearman) else "n/a",
+                                    sp_lbl,
+                                    sp_col,
+                                    "Monotoniczny sygnał, odporny na outliery."
+                                ),
+                                unsafe_allow_html=True
+                            )
+                        with cB:
+                            st.markdown(
+                                _tile_html(
+                                    "Pearson r (liniowy)",
+                                    f"{pr_val:.3f}" if np.isfinite(pearson) else "n/a",
+                                    pr_lbl,
+                                    pr_col,
+                                    "Siła zależności liniowej."
+                                ),
+                                unsafe_allow_html=True
+                            )
+
+                        # WERDYKT szeroki pod spodem (nadrzędny)
+                        st.markdown(
+                            _tile_html(
+                                "Werdykt (|ρ|)",
+                                f"{rho_abs:.3f}",
+                                verdict_lbl,
+                                verdict_col,
+                                "Podsumowanie siły zależności (Spearman + Pearson).",
+                                wide=True
+                            ),
+                            unsafe_allow_html=True
+                        )
+
+                    # ───────────────────── PANEL 2: Diagnostyka nieliniowości ─────────────────────
+                    with colR:
+                        st.subheader("Diagnostyka nieliniowości i transformacje", divider="gray")
+
+                        skew_feat = float(df_num["feature"].skew())
+                        skew_tgt  = float(df_num["target"].skew())
+                        feat_pos = bool((df_num["feature"] > 0).all())
+                        tgt_pos  = bool((df_num["target"] > 0).all())
+
+                        nonlin_hint = False
+                        if np.isfinite(spearman) and np.isfinite(pearson):
+                            if abs(spearman) > abs(pearson) + 0.15:
+                                nonlin_hint = True
+
+                        skf_lbl, skf_col = _level_from_abs(abs(skew_feat), SKEW_THRESH)
+                        skt_lbl, skt_col = _level_from_abs(abs(skew_tgt),  SKEW_THRESH)
+
+                        dA, dB = st.columns(2)
+                        with dA:
+                            st.markdown(
+                                _tile_html("Skośność cechy", f"{skew_feat:.2f}", skf_lbl, skf_col),
+                                unsafe_allow_html=True
+                            )
+                        with dB:
+                            st.markdown(
+                                _tile_html("Skośność targetu", f"{skew_tgt:.2f}", skt_lbl, skt_col),
+                                unsafe_allow_html=True
+                            )
+
+                        recs = []
+                        if nonlin_hint:
+                            recs.append(
+                                "⚠️ **Sygnał nieliniowości:** Spearman wyraźnie > Pearson → zależność monotoniczna, ale nieliniowa."
+                            )
+
+                        if feat_pos and skew_feat > 1.0:
+                            recs.append("✅ **Rekomendacja:** rozważ `log1p(feature)` (silna prawoskośność i wartości dodatnie).")
+                        elif feat_pos and abs(skew_feat) > 0.8:
+                            recs.append("✅ **Rekomendacja:** rozważ **Box-Cox** (cecha dodatnia, umiarkowana/silna skośność).")
+                        elif (not feat_pos) and abs(skew_feat) > 0.8:
+                            recs.append("✅ **Rekomendacja:** rozważ **Yeo-Johnson** (działa też dla 0/ujemnych).")
+
+                        if tgt_pos and skew_tgt > 1.0:
+                            recs.append("ℹ️ Target prawoskośny → w modelu możesz rozważyć `log1p(target)`.")
+
+                        if recs:
+                            st.markdown("\n\n".join(recs))
+                        else:
+                            st.markdown("Brak wyraźnej potrzeby transformacji — sygnał wygląda stabilnie.")
+
+                        st.caption(
+                            "Transformacje pomagają modelom liniowym i stabilizują wariancję. "
+                            "Drzewa (CatBoost/LightGBM) często poradzą sobie bez nich, ale mogą zyskać na stabilności sygnału."
+                        )
+
+                    # ───────────────────── KONIEC PANELI ─────────────────────
+
+            # ───────────────── Dodatkowo: sezonowość i trend dla szeregu czasowego ─────────────────
+            roles = st.session_state.get("eda_roles") or {}
+            task_ts = (roles.get("task") or "").lower()
+            time_col = roles.get("time_col")
+
+            # pokazuj sekcję TS także gdy user wymusi time_series bez kolumny czasu
+            if task_ts == "time_series":
+                # jeśli inferred time_col jest poprawny, użyj go jako preferowanego,
+                # w przeciwnym razie zostaw None i oprzyj się o pseudo-czas
+                if not (time_col and time_col in df.columns):
+                    time_col = None
+
+                # 1 divider jak w sekcji 2 (bez st.divider)
+                st.subheader("Sezonowość i trend (dla szeregu czasowego)", divider="gray")
+                st.markdown("<div style='margin-top:-0.60rem'></div>", unsafe_allow_html=True)
+
+                st.caption(
+                    "Poniżej możesz zobaczyć, jak średnia lub suma wartości zmienia się w czasie "
+                    "dla wybranej agregacji (dzień / tydzień / miesiąc / rok / dzień tygodnia). "
+                    "Dodatkowo pokazujemy średnią kroczącą oraz linię trendu od momentu, "
+                    "w którym wykrywamy trwały trend. Skala trendu: od -3 (silny spadek) "
+                    "przez 0 (brak trendu) do +3 (silny wzrost)."
+                )
+
+                chart_col, info_col = st.columns([4, 1.5])
+
+                # ---------- wybór osi czasu + agregacji + miary ----------
+                def _datetime_candidates(df_: pd.DataFrame, preferred: str) -> list[str]:
+                    out = []
+                    if preferred and preferred in df_.columns:
+                        out.append(preferred)
+                    for c in df_.columns:
+                        if c != preferred and pd.api.types.is_datetime64_any_dtype(df_[c]):
+                            out.append(c)
+                    return out
+
+                x_cands = _datetime_candidates(df, time_col)
+                x_options = x_cands + ["Numer wiersza (pseudo-czas)"]
+                dow_map = {0: "Pon", 1: "Wt", 2: "Śr", 3: "Czw", 4: "Pt", 5: "Sob", 6: "Nd"}
+
+                with chart_col:
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        x_choice = st.selectbox(
+                            "Oś czasu (oś X)",
+                            x_options,
+                            index=0,
+                            key="ts_seasonality_x",
+                        )
+                    with c2:
+                        agg_choice = st.selectbox(
+                            "Agregacja czasu",
+                            ["Dzień", "Tydzień", "Miesiąc", "Rok", "Dzień tygodnia"],
+                            index=2,
+                            key="ts_seasonality_agg",
+                        )
+                    with c3:
+                        metric_choice = st.selectbox(
+                            "Miara wartości",
+                            ["Średnia", "Suma"],
+                            index=0,
+                            key="ts_seasonality_metric",
+                        )
+
+# ---------- agregacja danych ----------
+                agg_df = pd.DataFrame()
+                x_title = ""
+                y_title = ""
+
+                try:
+                    # 1) PSEUDO-CZAS (brak kolumny czasu)
+                    if x_choice == "Numer wiersza (pseudo-czas)":
+                        ts_df = df[[col_to_plot]].copy()
+
+                        # zawsze nadpisz pewnym indeksem int
+                        ts_df["__idx__"] = np.arange(len(ts_df), dtype=int)
+                        ts_df = ts_df.dropna(subset=[col_to_plot])
+
+                        if ts_df.empty:
+                            agg_df = pd.DataFrame()
+                        else:
+                            if agg_choice == "Dzień tygodnia":
+                                ts_df["season_key"] = (ts_df["__idx__"] % 7).astype(int)
+                                x_title = "Dzień tygodnia (pseudo-czas)"
+                            else:
+                                step_map = {"Dzień": 1, "Tydzień": 7, "Miesiąc": 30, "Rok": 365}
+                                step = int(step_map.get(agg_choice, 1))
+                                ts_df["season_key"] = (ts_df["__idx__"] // max(1, step)).astype(int)
+                                x_title = f"{agg_choice} (pseudo-czas)"
+
+                            if "season_key" in ts_df.columns:
+                                if metric_choice == "Suma":
+                                    agg_df = (
+                                        ts_df.groupby("season_key", dropna=True)[col_to_plot]
+                                        .sum()
+                                        .reset_index()
+                                    )
+                                    y_title = "Suma"
+                                else:
+                                    agg_df = (
+                                        ts_df.groupby("season_key", dropna=True)[col_to_plot]
+                                        .mean()
+                                        .reset_index()
+                                    )
+                                    y_title = "Średnia"
+
+                    # 2) PRAWDZIWY CZAS (kolumna datetime)
+                    else:
+                        ts_df = df[[x_choice, col_to_plot]].copy()
+
+                        # 1) oś czasu próbujemy wymusić na datetime
+                        ts_df[x_choice] = pd.to_datetime(ts_df[x_choice], errors="coerce")
+
+                        # 2) wartości muszą być liczbowe do agregacji (mean/sum/median)
+                        ts_df[col_to_plot] = pd.to_numeric(ts_df[col_to_plot], errors="coerce")
+
+                        # 3) czyścimy braki po konwersjach
+                        ts_df = ts_df.dropna(subset=[x_choice, col_to_plot])
+
+                        # jeśli po konwersjach nic nie zostało – ustaw pusty agg_df
+                        # (dalszy guard w PATCH 2 pokaże komunikat zamiast crasha)
+                        if ts_df.empty:
+                            agg_df = pd.DataFrame()
+                            x_enc = None
+
+                        if ts_df.empty:
+                            agg_df = pd.DataFrame()
+                        else:
+                            dt = ts_df[x_choice].dt
+
+                            if agg_choice == "Rok":
+                                ts_df["season_key"] = dt.year
+                                x_title = "Rok"
+                            elif agg_choice == "Kwartal":
+                                ts_df["season_key"] = dt.to_period("Q").astype(str)
+                                x_title = "Kwartal"
+                            elif agg_choice == "Miesiąc":
+                                ts_df["season_key"] = dt.to_period("M").astype(str)
+                                x_title = "Miesiąc"
+                            elif agg_choice == "Tydzień":
+                                ts_df["season_key"] = dt.isocalendar().week.astype(int)
+                                x_title = "Tydzień roku"
+                            elif agg_choice == "Dzień tygodnia":
+                                ts_df["season_key"] = dt.dayofweek.astype(int)
+                                x_title = "Dzień tygodnia"
+                            else:  # "Dzień"
+                                ts_df["season_key"] = dt.floor("D")
+                                x_title = "Data (dzień)"
+
+                            if "season_key" in ts_df.columns:
+                                if metric_choice == "Suma":
+                                    agg_df = (
+                                        ts_df.groupby("season_key", dropna=True)[col_to_plot]
+                                        .sum()
+                                        .reset_index()
+                                    )
+                                    y_title = "Suma"
+                                else:
+                                    agg_df = (
+                                        ts_df.groupby("season_key", dropna=True)[col_to_plot]
+                                        .mean()
+                                        .reset_index()
+                                    )
+                                    y_title = "Średnia"
+
+                    # normalizacja kolumny wynikowej -> `value`
+                    if not agg_df.empty:
+                        agg_df = agg_df.rename(columns={col_to_plot: "value"})
+                        agg_df = agg_df.dropna(subset=["season_key", "value"])
+                        agg_df = agg_df.sort_values("season_key")
+
+                except Exception as e:
+                    agg_df = pd.DataFrame()
+                    st.warning(
+                        f"Nie udało się policzyć sezonowości/trendu dla wybranych ustawień: {e}"
+                    )
+
+
+                if agg_df.empty:
+                    st.info("Brak danych do analizy po agregacji.")
+                else:
+                    # ── GUARD: czasem x_enc nie powstaje (np. niestandardowe dane / filtry)
+                    _x_title = locals().get("x_title", "Czas")
+                    if "x_enc" not in locals() or x_enc is None:
+                        x_enc = alt.X(
+                            "season_key:O",
+                            sort="ascending",
+                            axis=alt.Axis(title=_x_title, labelAngle=0),
+                        )
+
+                    # ── GUARD: w skrajnych przypadkach season_key może nie istnieć
+                    if "season_key" not in agg_df.columns:
+                        agg_df = agg_df.reset_index().rename(columns={"index": "season_key"})
+                    
+                    COLOR_RAW = "#2563eb"
+                    COLOR_MA = "#f59e0b"
+                    COLOR_TREND = "#10b981"
+
+                    n_points = len(agg_df)
+                    max_ma = max(2, min(60, n_points))
+                    default_ma = min(6, n_points)
+
+                    # --- układ suwak + checkboxy (zgodnie z Twoim layoutem) ---
+                    with chart_col:
+                        # suwak na szerokość 2 pól wyboru, checkboxy pod 3. polem
+                        row = st.columns([2.0, 1.0])
+
+                        with row[0]:
+                            ma_window = st.slider(
+                                "Okno średniej kroczącej",
+                                min_value=2, max_value=max_ma,
+                                value=default_ma, step=1,
+                                key="ts_ma_window",
+                            )
+
+                        with row[1]:
+                            # lekki spacer, żeby checkboxy były w linii z suwakiem
+                            st.markdown("<div style='height: 1.6rem'></div>", unsafe_allow_html=True)
+
+                            cb1, cb2, cb3 = st.columns(3, gap="small")
+                            with cb1:
+                                show_raw = st.checkbox("dane", True, key="ts_show_raw")
+                            with cb2:
+                                show_ma = st.checkbox("śr. krocząca", True, key="ts_show_ma")
+                            with cb3:
+                                show_trend = st.checkbox("trend", True, key="ts_show_trend")
+
+                    # zabezpieczenia (gdyby UI nie wyrenderowało się w danym rerunie)
+                    ma_window  = st.session_state.get("ts_ma_window", default_ma)
+                    show_raw   = st.session_state.get("ts_show_raw", True)
+                    show_ma    = st.session_state.get("ts_show_ma", True)
+                    show_trend = st.session_state.get("ts_show_trend", True)
+
+                    agg_df = agg_df.reset_index(drop=True)
+                    agg_df["ma_value"] = agg_df["value"].rolling(
+                        window=ma_window, min_periods=max(1, ma_window // 2)
+                    ).mean()
+
+                    # --- trend start (MAD + spójność) ---
+                    y_ma = agg_df["ma_value"].to_numpy(dtype=float)
+                    n = len(y_ma)
+                    trend_start_idx = 0
+                    if n >= max(5, ma_window):
+                        diffs = np.diff(y_ma)
+                        mad = np.nanmedian(np.abs(diffs - np.nanmedian(diffs)))
+                        thr = 1.5 * mad if np.isfinite(mad) else 0.0
+                        run = 0
+                        sign = 0
+                        for i_d, d in enumerate(diffs):
+                            if not np.isfinite(d) or abs(d) <= thr:
+                                run = 0; sign = 0; continue
+                            cur_sign = 1 if d > 0 else -1
+                            run = run + 1 if cur_sign == sign else 1
+                            sign = cur_sign
+                            if run >= max(3, ma_window // 2):
+                                trend_start_idx = max(0, i_d - run + 1)
+                                break
+
+                    seg = agg_df.iloc[trend_start_idx:].copy()
+                    x_seg = np.arange(len(seg), dtype=float)
+                    y_seg = seg["ma_value"].to_numpy(dtype=float)
+                    finite = np.isfinite(y_seg)
+
+                    if finite.sum() >= 2:
+                        try:
+                            slope = float(np.polyfit(x_seg[finite], y_seg[finite], 1)[0])
+                        except np.linalg.LinAlgError:
+                            slope = 0.0
+                    else:
+                        slope = 0.0
+
+                    seg["trend_value"] = slope * x_seg + float(
+                        np.nanmean(y_seg[finite]) if finite.any() else 0.0
+                    )
+                    agg_df["trend_value"] = np.nan
+                    agg_df.loc[trend_start_idx:, "trend_value"] = seg["trend_value"].to_numpy()
+
+                    # --- NORMALIZACJA PO PEŁNYM ZAKRESIE (spójna z kątem) ---
+                    full_range = float(np.nanmax(y_ma) - np.nanmin(y_ma)) if np.isfinite(y_ma).any() else 0.0
+                    denom = (full_range / max(n - 1, 1)) if full_range > 0 else 1.0
+                    norm = 0.0 if full_range == 0 else float(slope) / denom
+
+                    abs_norm = abs(norm)
+                    if abs_norm < 0.02:
+                        strength, level = "brak wyraźnego trendu", 0
+                    elif abs_norm < 0.07:
+                        strength, level = "lekki trend", 1
+                    elif abs_norm < 0.15:
+                        strength, level = "średni trend", 2
+                    else:
+                        strength, level = "silny trend", 3
+
+                    if norm > 0:
+                        direction, trend_arrow, signed_level = "wzrostowy", "↗", level
+                    elif norm < 0:
+                        direction, trend_arrow, signed_level = "spadkowy", "↘", -level
+                    else:
+                        direction, trend_arrow, signed_level = "płaski", "→", 0
+
+                    # Kąt w skali wykresu (surowy) + kąt spójny z normalizacją
+                    angle_deg_raw = float(np.degrees(np.arctan(slope)))
+                    angle_deg_norm = float(np.degrees(np.arctan(norm)))
+
+                    # --- zakres osi Y z headroomem (żeby linie nie kleiły się do sufitu) ---
+                    y_cols = ["value"]
+                    if "ma_value" in agg_df.columns:
+                        y_cols.append("ma_value")
+                    if "trend_value" in agg_df.columns:
+                        y_cols.append("trend_value")
+
+                    y_min = float(np.nanmin(agg_df[y_cols].to_numpy()))
+                    y_max = float(np.nanmax(agg_df[y_cols].to_numpy()))
+                    y_range = y_max - y_min
+
+                    # % zapasu na górze/dole: 0.08 = 8% (możesz zmienić np. na 0.12)
+                    pad = 0.8 * y_range if y_range > 0 else (0.05 * abs(y_max) if y_max != 0 else 1.0)
+                    y_scale = alt.Scale(domain=[y_min - pad, y_max + pad], nice=True, zero=True)
+
+                    base = alt.Chart(agg_df).encode(x=x_enc)
+
+                    layers = []
+                    if show_raw:
+                        layers.append(
+                            base.mark_line(strokeWidth=1.7, color=COLOR_RAW).encode(
+                                x=x_enc,  # <-- wymuszenie osi X na warstwie danych
+                                y=alt.Y("value:Q", title=y_title, scale=y_scale)
+                            )
+                        )
+
+                    if show_ma:
+                        layers.append(
+                            base.mark_line(strokeWidth=2.2, color=COLOR_MA, strokeDash=[5,3]).encode(
+                                x=x_enc,  # <-- wymuszenie osi X na warstwie MA
+                                y=alt.Y("ma_value:Q", title=y_title, scale=y_scale)
+                            )
+                        )
+
+                    if show_trend:
+                        # linia trendu
+                        layers.append(
+                            base.mark_line(strokeWidth=2.0, color=COLOR_TREND, strokeDash=[2,2]).encode(
+                                x=x_enc,  # <-- wymuszenie osi X na warstwie trendu
+                                y=alt.Y("trend_value:Q", title=y_title, scale=y_scale)
+                            )
+                        )
+
+
+                        # punkt startu trendu — ten sam X co reszta, ale BEZ osi,
+                        # żeby Altair nie dorysował drugiej osi na górze.
+                        if agg_choice == "Dzień tygodnia":
+                            x_point = alt.X(
+                                "season_label:N",
+                                sort=list(dow_map.values()),
+                                axis=alt.Axis(labels=False, ticks=False, title=None),
+                            )
+                        elif agg_choice == "Dzień":
+                            # datetime lub pseudo-czas — oba są bezpieczne na season_key
+                            x_point = alt.X(
+                                "season_key:T" if np.issubdtype(agg_df["season_key"].dtype, np.datetime64) else "season_key:Q",
+                                sort="ascending",
+                                axis=alt.Axis(labels=False, ticks=False, title=None),
+                            )
+                        else:
+                            x_point = alt.X(
+                                "season_key:Q",
+                                sort="ascending",
+                                axis=alt.Axis(labels=False, ticks=False, title=None),
+                            )
+
+                        layers.append(
+                            alt.Chart(agg_df.iloc[[trend_start_idx]])
+                            .mark_point(size=120, filled=True, color=COLOR_TREND, opacity=0.9)
+                            .encode(
+                                x=x_enc,
+                                y=alt.Y("trend_value:Q", title=y_title, scale=y_scale),
+                                tooltip=[
+                                    alt.Tooltip("season_label:N", title=x_title),
+                                    alt.Tooltip("trend_value:Q", format=".2f", title="Start trendu"),
+                                ],
+                            )
+                        )
+
+                    with chart_col:
+                        chart = (
+                            alt.layer(*layers)
+                            .properties(
+                                height=365,
+                                padding={"left": 5, "right": 5, "top": 0, "bottom": 20},
+                            )
+                            .configure_axis(titlePadding=10, labelPadding=6)
+                            .configure_view(stroke=None)
+                        )
+                        st.altair_chart(chart, use_container_width=True)
+
+                        # expander MAKSYMALNIE blisko wykresu
+                        # (zmniejszamy odstęp dodawany przez Streamlit POD wykresem Altair)
+                        st.markdown("""
+                        <style>
+                        /* Streamlit dodaje spory margin pod wykresem (vega-embed). 
+                        Ściągamy ten odstęp, żeby expander przykleił się do wykresu. */
+                        div[data-testid="stElementContainer"]:has(div.vega-embed) {
+                            margin-bottom: -1.8rem !important;
+                        }
+
+                        /* dodatkowo lekko podciągamy sam expander */
+                        div[data-testid="stExpander"] {
+                            margin-top: -0.2rem !important;
+                        }
+                        </style>
+                        """, unsafe_allow_html=True)
+
+                        with st.expander("Jak liczymy trend i co oznacza znormalizowane nachylenie?"):
+
+                            st.markdown(
+                                "- **Trend** to prosta dopasowana metodą najmniejszych kwadratów do punktów po agregacji.\n"
+                                "- **Początek trendu** wykrywamy automatycznie (MAD): szukamy pierwszego spójnego fragmentu nachylenia.\n"
+                                "- **Znormalizowane nachylenie** liczymy względem **pełnego zakresu serii po agregacji**, "
+                                "dzięki czemu jest spójne z kątem trendu.\n"
+                                "- **Skala 1–3 / 0 / -1–-3:**\n"
+                                "  - |norm| < 0.02 → **0 (brak trendu)**\n"
+                                "  - 0.02–0.07 → **±1 (lekki trend)**\n"
+                                "  - 0.07–0.15 → **±2 (średni trend)**\n"
+                                "  - ≥ 0.15 → **±3 (silny trend)**"
+                            )
+
+                        # ============================
+                        # SEZONOWOŚĆ – METRYKI PROFILU
+                        # ============================
+                        season_cycle_name = "brak sezonowości w tej skali"
+                        season_strength = "brak / śladowa"
+                        season_amp = 0.0
+                        season_rel_amp = 0.0
+                        season_reg = 0.0
+                        eta2 = 0.0  # udział wariancji wyjaśniony przez cykl (η²)
+
+                        # Które agregacje traktujemy jako cykl sezonowy?
+                        cyclical_map = {
+                            "Dzień tygodnia": ("cykl tygodniowy (7 dni)", 7),
+                            "Miesiąc": ("cykl roczny (12 miesięcy)", 12),
+                            "Tydzień roku (ISO)": ("cykl roczny-tygodniowy (52 tyg.)", 52),
+                        }
+
+                        if agg_choice in cyclical_map:
+                            season_cycle_name, season_period = cyclical_map[agg_choice]
+
+                            prof = agg_df[["season_key", "value"]].dropna()
+                            if not prof.empty:
+                                overall = float(prof["value"].mean())
+
+                                grp_mean = prof.groupby("season_key")["value"].mean()
+
+                                # amplituda sezonowa
+                                season_amp = float(grp_mean.max() - grp_mean.min())
+                                season_rel_amp = 0.0 if overall == 0 else float(season_amp / abs(overall))
+
+                                # η² (effect size ANOVA) – udział wariancji wyjaśniony przez cykl
+                                ss_total = float(((prof["value"] - overall) ** 2).sum())
+                                ss_between = float(((grp_mean - overall) ** 2).sum() * (len(prof) / max(grp_mean.shape[0], 1)))
+                                eta2 = 0.0 if ss_total == 0 else ss_between / ss_total
+
+                                # regularność profilu: 1 - (within/total)
+                                resid = prof["value"] - prof["season_key"].map(grp_mean)
+                                ss_within = float((resid ** 2).sum())
+                                season_reg = 0.0 if ss_total == 0 else max(0.0, 1.0 - ss_within / ss_total)
+
+                                # opis jakościowy siły sezonowości
+                                if eta2 < 0.02:
+                                    season_strength = "brak / śladowa"
+                                elif eta2 < 0.07:
+                                    season_strength = "lekka"
+                                elif eta2 < 0.15:
+                                    season_strength = "średnia"
+                                else:
+                                    season_strength = "silna"
+
+                    with info_col:
+                        st.subheader("Ocena zjawisk", divider="gray")
+                        st.markdown("**Ocena trendu:**")
+                        st.markdown(
+                            f"""
+                            • **Oś czasu:** {x_choice}<br>
+                            • **Agregacja:** {agg_choice.lower()}<br>
+                            • **Miara:** {metric_choice.lower()}<br>
+                            • **Trend:** {trend_arrow} {strength} {direction} (**{signed_level}/3**,
+                              znormalizowane nachylenie ≈ {norm:+.3f},
+                              start trendu od punktu {trend_start_idx + 1} z {n_points} — zaznaczony kropką).<br>
+                            • **Kąt nachylenia trendu:** {angle_deg_raw:+.1f}°
+                            (znormalizowany: {angle_deg_norm:+.1f}°)
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown("**Ocena sezonowości:**")
+                        st.markdown(
+                            f"""
+                            • **Cykl:** {season_cycle_name}<br>
+                            • **Siła sezonowości (η²):** {eta2:.2f} — {season_strength}
+                            (udział wariancji wyjaśniony przez cykl)<br>
+                            • **Amplituda cyklu:** {season_amp:.3g} 
+                            ({season_rel_amp*100:.1f}% średniej)<br>
+                            • **Regularność profilu:** {season_reg}
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                        # legenda sklejona i bez rozstrzału
+                        st.markdown("**Legenda:**")
+                        st.markdown(
+                            f"""
+                            <div style="margin-top:-0.9rem;font-size:0.95rem;line-height:1.15;">
+                              <div><span style="color:{COLOR_RAW};font-weight:700;display:inline-block;width:16px;">●</span>dane</div>
+                              <div><span style="color:{COLOR_MA};font-weight:700;display:inline-block;width:16px;">●</span>średnia krocząca</div>
+                              <div><span style="color:{COLOR_TREND};font-weight:700;display:inline-block;width:16px;">●</span>trend</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                st.markdown("")
+
         else:
-            # (oryginalna ścieżka kategoryczna)
-            unique_vals = sorted(list(pd.Series(s_col.astype(str)).replace("nan", np.nan).dropna().unique()))
+            # ============= BLOK DLA KOLUMN NIENUMERYCZNYCH (KATEGORIALNYCH) =============
+            st.caption("Rozkład kategorii (TOP kategorie + pokrycie)")
 
-            with st.expander("Filtruj kategorie (opcjonalnie)"):
-                selected = st.multiselect("Wybierz kategorie", options=unique_vals, default=unique_vals[:min(10, len(unique_vals))])
-            ser_for_plot = s_col[s_col.astype(str).isin(selected)] if selected else s_col
-            bar_chart_top, coverage_chart, freq_table, comment_text = _categorical_distribution_details(ser_for_plot, col_to_plot, top_n=20)
-            cc1, cc2 = st.columns([2, 1])
-            with cc1:
-                st.altair_chart(bar_chart_top, use_container_width=True)
-            with cc2:
-                st.altair_chart(coverage_chart, use_container_width=True)
-                with st.expander("Tabela TOP kategorii (dla analityków)"):
-                    st.dataframe(freq_table, hide_index=True, use_container_width=True)
-            st.info(comment_text)
+            try:
+                # _categorical_distribution_details zwraca:
+                # (chart_top, chart_coverage, table_top_df, comment_text)
+                cat_top_chart, cat_cov_chart, cat_top_df, cat_comment = _categorical_distribution_details(
+                    s_col_raw, col_to_plot
+                )
 
-        # ───────────────────── Porównanie rozkładu wg kategorii ─────────────────────
+                c1, c2 = st.columns([2, 1])
+                with c1:
+                    st.altair_chart(cat_top_chart, use_container_width=True)
+                    st.altair_chart(cat_cov_chart, use_container_width=True)
+                with c2:
+                    st.subheader("Metryki kategorii", divider="gray")
+                    st.dataframe(cat_top_df, hide_index=True, use_container_width=True)
 
-        # ── 4X) Cross-Filter (All × All × All) — stabilnie ─────────────────────────────
-        ui_lang = (st.session_state.get("ui_lang", "PL") or "PL").upper()
-        _ico = "🔎"
-        expander_label = (
-            f"{_ico} Analiza wielowymiarowa (3D) — filtr → grupa → miara"
-            if ui_lang == "PL"
-            else f"{_ico} Multidimensional analysis (3D) — filter → group → measure"
+                if cat_comment:
+                    st.info(cat_comment)
+
+                n_unique = int(s_col_raw.nunique(dropna=True))
+                if n_unique > 50:
+                    st.info(
+                        f"Kolumna ma dużo unikalnych kategorii ({n_unique}). "
+                        "Poniżej pokazujemy TOP 20. W modelu rozważ target encoding lub CatBoost."
+                    )
+
+            except Exception as e:
+                st.warning(
+                    f"Nie udało się policzyć rozkładu kategorii dla '{col_to_plot}'. "
+                    f"Szczegóły: {e}"
+                )
+
+            # ───────────────────── TRYB REGRESJI: wpływ cechy na target ─────────────────────
+            if (
+                task == "regression"
+                and target_col
+                and target_col in df.columns
+                and col_to_plot != target_col
+            ):
+                st.subheader("Jak ta cecha wpływa na target?", divider="gray")
+
+                df_reg = pd.DataFrame(
+                    {
+                        "feature_raw": s_col_raw.astype(str),
+                        "target": pd.to_numeric(df[target_col], errors="coerce"),
+                    }
+                ).dropna()
+
+                if df_reg.empty:
+                    st.info("Brak danych jednocześnie w wybranej kolumnie i w targetcie.")
+                else:
+                    # --- ograniczamy kardynalność do TOP 20 + '(pozostałe)' ---
+                    vc = df_reg["feature_raw"].value_counts(dropna=False)
+                    top_k = min(20, len(vc))
+                    keep_cats = vc.head(top_k).index.tolist()
+                    df_reg["feature"] = np.where(
+                        df_reg["feature_raw"].isin(keep_cats),
+                        df_reg["feature_raw"],
+                        "(pozostałe)",
+                    )
+
+                    overall_mean = float(df_reg["target"].mean())
+
+                    def _iqr(x: pd.Series) -> float:
+                        return float(x.quantile(0.75) - x.quantile(0.25))
+
+                    def _trim_mean(x: pd.Series, p: float = 0.05) -> float:
+                        x = x.sort_values()
+                        k = int(len(x) * p)
+                        if len(x) <= 2 * k:
+                            return float(x.mean())
+                        return float(x.iloc[k:-k].mean())
+
+                    grp = df_reg.groupby("feature")["target"]
+
+                    stats_df = grp.agg(
+                        n="count",
+                        mean="mean",
+                        median="median",
+                        std="std",
+                    ).reset_index()
+
+                    stats_df["iqr"] = grp.apply(_iqr).values
+                    stats_df["trim_mean5"] = grp.apply(_trim_mean).values
+                    stats_df["delta_%"] = np.where(
+                        overall_mean != 0,
+                        (stats_df["mean"] / overall_mean - 1.0) * 100.0,
+                        0.0,
+                    )
+
+                    stats_df = stats_df.sort_values("mean", ascending=False)
+
+                    # --- miary wpływu: η² (ANOVA-like) oraz ε² (Kruskal–Wallis, odporna) ---
+
+                    def _effect_label(v: float) -> str:
+                        if not np.isfinite(v):
+                            return "brak wpływu"
+                        if v < 0.01:
+                            return "praktycznie brak wpływu"
+                        elif v < 0.06:
+                            return "słaby wpływ"
+                        elif v < 0.14:
+                            return "umiarkowany wpływ"
+                        else:
+                            return "silny wpływ"
+
+                    # η²
+                    ss_total = float(((df_reg["target"] - overall_mean) ** 2).sum())
+                    ss_between = float(
+                        (stats_df["n"] * (stats_df["mean"] - overall_mean) ** 2).sum()
+                    )
+                    eta2 = 0.0 if ss_total == 0 else max(0.0, min(1.0, ss_between / ss_total))
+
+                    # ε² (Kruskal–Wallis)
+                    eps2 = np.nan
+                    try:
+                        from scipy.stats import kruskal
+                        groups = [g["target"].values for _, g in df_reg.groupby("feature")]
+                        k = len(groups)
+                        n_total = int(df_reg.shape[0])
+                        if k >= 2 and n_total > k and all(len(g) > 0 for g in groups):
+                            H, p_kw = kruskal(*groups)
+                            eps2 = float((H - k + 1) / (n_total - k))
+                            eps2 = max(0.0, min(1.0, eps2))
+                    except Exception:
+                        eps2 = np.nan
+
+                    # heurystyki wyboru miary (prosto + bezpiecznie)
+                    n_total = int(df_reg.shape[0])
+                    min_n_eff = max(20, int(0.01 * n_total))  # min 20 lub 1% zbioru
+                    small_groups = bool((stats_df["n"] < min_n_eff).any())
+
+                    # szybka ocena "nienormalności / outlierów" przez skośność targetu w grupach
+                    try:
+                        skew_by_group = df_reg.groupby("feature")["target"].skew().abs()
+                        non_normal = bool((skew_by_group > 1.5).any())
+                    except Exception:
+                        non_normal = False
+
+                    # wybór: jeśli grupy małe lub rozkłady "trudne" → preferuj ε²
+                    use_eps2 = (small_groups or non_normal or not np.isfinite(eta2)) and np.isfinite(eps2)
+
+                    score_used = eps2 if use_eps2 else eta2
+                    score_lbl = _effect_label(score_used)
+
+                    # krótkie uzasadnienie wyboru
+                    why_lines = []
+                    if use_eps2:
+                        if small_groups:
+                            why_lines.append("małe/graniczne liczebności grup")
+                        if non_normal:
+                            why_lines.append("skośne rozkłady/outliery w grupach")
+                        why_txt = "Używamy ε² (Kruskal), bo są " + ", ".join(why_lines) + "."
+                    else:
+                        why_txt = "Używamy η² (ANOVA-like), bo grupy są wystarczająco liczne i rozkłady stabilne."
+
+                    # zapamiętujemy do późniejszego renderingu
+                    effect_score_used = score_used
+                    effect_score_lbl = score_lbl
+                    effect_use_eps2 = use_eps2
+                    effect_why_txt = why_txt
+
+
+                    # --- wykres wpływu ---
+                    n_cats_plot = stats_df.shape[0]
+                    colL, colR = st.columns([2, 1])
+
+                    if n_cats_plot <= 12:
+                        order_cats = stats_df["feature"].tolist()
+                        chart_imp = (
+                            alt.Chart(df_reg)
+                            .mark_boxplot(extent=1.5)
+                            .encode(
+                                x=alt.X(
+                                    "feature:N",
+                                    sort=order_cats,
+                                    title=col_to_plot,
+                                    axis=alt.Axis(labelAngle=0),
+                                ),
+                                y=alt.Y("target:Q", title=target_col),
+                                tooltip=[
+                                    alt.Tooltip("feature:N", title="Kategoria"),
+                                    alt.Tooltip("target:Q", title=target_col, format=".3g"),
+                                ],
+                            )
+                            .properties(height=320)
+                        )
+                    else:
+                        stats_df["se"] = stats_df["std"] / np.sqrt(stats_df["n"].clip(lower=1))
+                        stats_df["ci95"] = 1.96 * stats_df["se"]
+                        stats_df["ci_low"] = stats_df["mean"] - stats_df["ci95"]
+                        stats_df["ci_high"] = stats_df["mean"] + stats_df["ci95"]
+
+                        base = alt.Chart(stats_df).encode(
+                            y=alt.Y("feature:N", sort="-x", title=col_to_plot),
+                            x=alt.X("mean:Q", title=f"Średni {target_col}"),
+                            tooltip=[
+                                alt.Tooltip("feature:N", title="Kategoria"),
+                                alt.Tooltip("n:Q", title="n", format=","),
+                                alt.Tooltip("mean:Q", title="Średnia", format=".3g"),
+                                alt.Tooltip("median:Q", title="Mediana", format=".3g"),
+                                alt.Tooltip("delta_%:Q", title="Δ vs global [%]", format=".1f"),
+                            ],
+                        )
+
+                        bars = base.mark_bar()
+                        err = base.mark_errorbar().encode(
+                            x="ci_low:Q",
+                            x2="ci_high:Q",
+                        )
+
+                        h = max(240, min(620, 22 * n_cats_plot + 80))
+                        chart_imp = alt.layer(bars, err).properties(height=h)
+
+                    with colL:
+                        st.altair_chart(chart_imp, use_container_width=True)
+
+                    with colR:
+                        st.subheader("Statystyki targetu w kategoriach", divider="gray")
+                        show_df = stats_df.rename(
+                            columns={
+                                "feature": "kategoria",
+                                "mean": "średnia",
+                                "median": "mediana",
+                                "std": "odch.std.",
+                                "trim_mean5": "trim_mean(5%)",
+                                "delta_%": "Δ vs global [%]",
+                            }
+                        )
+                        st.dataframe(
+                            show_df[
+                                ["kategoria", "n", "średnia", "mediana", "odch.std.", "iqr", "trim_mean(5%)", "Δ vs global [%]"]
+                            ],
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+                    # --- tekst pod wykresem w 2 kontenerach (UX / Gestalt) ---
+                    top_txt, bot_txt = "", ""
+                    try:
+                        top2 = show_df.head(2)
+                        bot2 = show_df.tail(2)
+                        top_txt = ", ".join(
+                            [f"{r.kategoria} (Δ {r['Δ vs global [%]']:+.1f}%)" for _, r in top2.iterrows()]
+                        )
+                        bot_txt = ", ".join(
+                            [f"{r.kategoria} (Δ {r['Δ vs global [%]']:+.1f}%)" for _, r in bot2.iterrows()]
+                        )
+                    except Exception:
+                        pass
+
+                    # --- tekst pod wykresem MA być w obrębie kolumny z wykresem (colL) ---
+                    with colL:
+                        left_c, right_c = st.columns([1.15, 1.0], gap="small")
+
+                        with left_c:
+                            if top_txt or bot_txt:
+                                st.markdown(
+                                    f"• Najwyższy target mają: **{top_txt}**.  \n"
+                                    f"• Najniższy target mają: **{bot_txt}**."
+                                )
+
+                        with right_c:
+                            # 1) główny werdykt wpływu (czarny tekst)
+                            if effect_use_eps2:
+                                main_line = (
+                                    f"**Wpływ cechy na target (ε², Kruskal–Wallis): "
+                                    f"`{effect_score_used:.3f}` → {effect_score_lbl}.**"
+                                )
+                                comp_line = f"Dla porównania η² (ANOVA-like): `{eta2:.3f}`." if np.isfinite(eta2) else ""
+                            else:
+                                main_line = (
+                                    f"**Wpływ cechy na target (η², ANOVA-like): "
+                                    f"`{effect_score_used:.3f}` → {effect_score_lbl}.**"
+                                )
+                                comp_line = f"Dla porównania ε² (Kruskal): `{eps2:.3f}`." if np.isfinite(eps2) else ""
+
+                            lines = [main_line]
+                            if effect_why_txt:
+                                lines.append(effect_why_txt)
+                            if comp_line:
+                                lines.append(comp_line)
+
+                            # D) skrócone microcopy
+                            lines.append("Im wyżej, tym stabilniejszy sygnał.")
+
+                            # E) równe odstępy jak po lewej: bez pustych linii
+                            st.markdown("\n".join(lines))
+
+                    # ───────────────────── POZIOM 2: typ cechy + rekomendowane kodowanie ─────────────────────
+                    with st.expander("Poziom 2: typ cechy nienumerycznej i rekomendowane kodowanie", expanded=False):
+
+                        # --- heurystyki typu cechy ---
+                        s_feat = s_col_raw.dropna().astype(str)
+                        n_feat = len(s_feat)
+                        n_unique = int(s_feat.nunique(dropna=True))
+                        uniq_ratio = (n_unique / n_feat) if n_feat > 0 else 0.0
+                        avg_len = float(s_feat.str.len().mean()) if n_feat > 0 else 0.0
+
+                        # ordinal tokens (PL+EN) – prosta lista, bez ryzyka false positive dla tekstu
+                        ORD_TOKENS = {
+                            # EN
+                            "low","medium","high","very high","very_low","very_high",
+                            "bad","fair","good","very good","excellent","poor",
+                            "small","medium","large","xl","xxl","xs","s","m","l",
+                            # PL
+                            "niski","średni","wysoki","bardzo wysoki","bardzo niski",
+                            "zły","średni","dobry","bardzo dobry","doskonały",
+                            "mały","średni","duży","bardzo duży",
+                        }
+
+                        # czy wygląda jak liczby zakodowane jako string?
+                        num_like = pd.to_numeric(s_feat, errors="coerce")
+                        frac_num_like = float(num_like.notna().mean()) if n_feat > 0 else 0.0
+
+                        # czy w wartościach są tokeny porządkujące?
+                        low_vals = set(v.strip().lower() for v in s_feat.unique()[:200])
+                        has_ordinal_tokens = any(any(tok in v for tok in ORD_TOKENS) for v in low_vals)
+
+                        if uniq_ratio > 0.6 and avg_len > 8:
+                            feat_kind = "tekstowa"
+                        elif frac_num_like >= 0.8:
+                            feat_kind = "ordinalna (liczbowa w stringu)"
+                        elif has_ordinal_tokens and n_unique <= 30:
+                            feat_kind = "ordinalna (nazwana)"
+                        else:
+                            feat_kind = "nominalna"
+
+                        st.markdown(f"**Wykryty typ cechy:** `{feat_kind}`")
+
+                        # --- stabilność kategorii ---
+                        min_n = max(20, int(0.01 * n_feat))  # min 20 lub 1% zbioru
+                        vc_full = s_feat.value_counts()
+                        weak_cats = vc_full[vc_full < min_n]
+
+                        if weak_cats.empty:
+                            st.success(
+                                f"✅ Kategorie są stabilne: każda ma ≥ {min_n} obserwacji."
+                            )
+                        else:
+                            st.warning(
+                                f"⚠️ {len(weak_cats)} kategorii ma małą liczebność (< {min_n}). "
+                                "Średnie targetu dla nich mogą być niestabilne."
+                            )
+                            st.caption("Najrzadsze kategorie:")
+                            st.dataframe(
+                                weak_cats.head(10).rename("liczebność").reset_index().rename(columns={"index":"kategoria"}),
+                                hide_index=True,
+                                use_container_width=True,
+                            )
+
+                        # --- rekomendacja kodowania ---
+                        rec_lines = []
+
+                        if feat_kind.startswith("tekstowa"):
+                            rec_lines += [
+                                "• **Tekstowa cecha**: rozważ TF-IDF / embeddings. ",
+                                "• Jeśli to naprawdę identyfikatory/unikaty, rozważ wyłączenie lub ekstrakcję prostych cech (długość, liczba słów).",
+                            ]
+
+                        elif feat_kind.startswith("ordinalna"):
+                            rec_lines += [
+                                "• **Ordinalna**: najlepiej zachować porządek → **ordinal encoding** (mapowanie na 0..k).",
+                                "• Drzewa (CatBoost/LightGBM) poradzą sobie też z kodowaniem kategorycznym, ale kolejność może nie być wtedy w pełni wykorzystana.",
+                            ]
+
+                        else:  # nominalna
+                            if n_unique <= 10:
+                                rec_lines += [
+                                    "• **Nominalna o małej kardynalności**: **one-hot encoding** będzie najbezpieczniejszy.",
+                                ]
+                            elif n_unique <= 50:
+                                rec_lines += [
+                                    "• **Nominalna średniej kardynalności**: one-hot dla modeli liniowych, ",
+                                    "  a dla drzew → **CatBoost encoding / target encoding**.",
+                                ]
+                            else:
+                                rec_lines += [
+                                    "• **Nominalna o wysokiej kardynalności**: preferuj **target encoding** lub **CatBoost encoding**.",
+                                    "• One-hot da ogromny wymiar i spadek jakości/wydajności.",
+                                ]
+
+                        leak_warn = (
+                            "⚠️ **Uwaga na leakage:** target encoding stosuj **tylko na train** "
+                            "(w CV/foldach), nigdy na pełnym zbiorze przed podziałem."
+                        )
+
+                        st.markdown("\n".join(rec_lines))
+                        st.info(leak_warn)
+
+
+        # ───────────────────── TRYB KLASYFIKACJI: rozkład cechy w klasach ─────────────────────
+        if (
+            task == "classification"
+            and target_col
+            and target_col in df.columns
+            and col_to_plot != target_col
+        ):
+            st.subheader("Jak ta cecha rozróżnia klasy?", divider="gray")
+
+            # Budujemy ramkę z cechą (po ewentualnym rzutowaniu) i klasą
+            df_cls = pd.DataFrame(
+                {
+                    "feature": s_col,
+                    "class": df[target_col],
+                }
+            ).dropna()
+
+            if df_cls.empty:
+                st.info("Brak danych jednocześnie w wybranej kolumnie i w targetcie.")
+            else:
+                # Limitujemy liczbę punktów do wizualizacji dla wydajności
+                max_points = 5000
+                if len(df_cls) > max_points:
+                    df_vis = df_cls.sample(max_points, random_state=0)
+                else:
+                    df_vis = df_cls
+
+                if pd.api.types.is_numeric_dtype(df_cls["feature"]):
+                    # Gęstość cechy osobno dla każdej klasy (KDE)
+                    chart_overlay = (
+                        alt.Chart(df_vis)
+                        .transform_density(
+                            "feature",
+                            as_=["feature", "density"],
+                            groupby=["class"],
+                        )
+                        .mark_area(opacity=0.45)
+                        .encode(
+                            x=alt.X("feature:Q", title=col_to_plot),
+                            y=alt.Y("density:Q", title="Gęstość"),
+                            color=alt.Color("class:N", title=target_col),
+                            tooltip=[
+                                alt.Tooltip("class:N", title="Klasa"),
+                            ],
+                        )
+                        .properties(height=260)
+                    )
+                    st.altair_chart(chart_overlay, use_container_width=True)
+
+                    means = df_cls.groupby("class")["feature"].mean()
+                    overall_std = float(df_cls["feature"].std() or 0.0)
+                    separation = 0.0
+                    if overall_std > 0 and math.isfinite(overall_std):
+                        separation = float((means.max() - means.min()) / overall_std)
+
+                    if separation >= 1.5:
+                        level_txt = "bardzo dobrze rozróżnia klasy"
+                    elif separation >= 0.8:
+                        level_txt = "całkiem dobrze rozróżnia klasy"
+                    elif separation >= 0.3:
+                        level_txt = "słabo rozróżnia klasy"
+                    else:
+                        level_txt = "praktycznie nie rozróżnia klas"
+
+                    st.caption(
+                        f"Wskaźnik separacji (zasięg średnich / σ): **{separation:.2f}** – "
+                        f"ta cecha {level_txt}."
+                    )
+                else:
+                    # Cechy kategoryczne – udział klas w każdej kategorii
+                    df_cat = df_cls.copy()
+                    df_cat["feature"] = df_cat["feature"].astype(str)
+
+                    freq = (
+                        df_cat.groupby(["feature", "class"])
+                        .size()
+                        .reset_index(name="count")
+                    )
+                    if freq.empty:
+                        st.info("Brak danych do analizy rozkładu klas w kategoriach.")
+                    else:
+                        freq["total_cat"] = freq.groupby("feature")["count"].transform("sum")
+                        freq["share"] = freq["count"] / freq["total_cat"] * 100.0
+                                            
+                        chart_cat = (
+                            alt.Chart(freq)
+                            .mark_bar()
+                            .encode(
+                                # ⬇⬇⬇ tu dodajemy axis=Alt.Axis(labelAngle=0) – poziome etykiety
+                                x=alt.X(
+                                    "feature:N",
+                                    title=col_to_plot,
+                                    axis=alt.Axis(labelAngle=0),
+                                ),
+                                y=alt.Y("share:Q", title="Udział klasy [%]"),
+                                color=alt.Color("class:N", title=target_col),
+                                tooltip=[
+                                    alt.Tooltip("feature:N", title="Kategoria"),
+                                    alt.Tooltip("class:N", title="Klasa"),
+                                    alt.Tooltip("share:Q", title="Udział [%]", format=".1f"),
+                                    alt.Tooltip("count:Q", title="Liczba rekordów", format=","),
+                                ],
+                            )
+                            .properties(height=555)
+                        )
+
+                        # Układ jak w Sekcji 2: wykres po lewej, panel z oceną po prawej
+                        col_cls_chart, col_cls_panel = st.columns([4, 1.6])
+
+                        with col_cls_chart:
+                            st.altair_chart(chart_cat, use_container_width=True)
+
+                        # Wskaźnik „czystości” kategorii – jak bardzo kategorie są jednorodne klasowo
+                        pivot = (
+                            df_cat.groupby(["feature", "class"])
+                            .size()
+                            .unstack(fill_value=0)
+                        )
+                        totals = pivot.sum(axis=1)
+                        probs = pivot.div(totals, axis=0)
+                        majority = probs.max(axis=1)
+                        purity = float((majority * totals).sum() / max(float(totals.sum()), 1.0))
+
+                        if purity >= 0.8:
+                            purity_txt = "bardzo dobrze rozróżnia klasy (większość kategorii jest jednorodna)"
+                        elif purity >= 0.65:
+                            purity_txt = "całkiem nieźle rozróżnia klasy"
+                        elif purity >= 0.55:
+                            purity_txt = "słabo rozróżnia klasy"
+                        else:
+                            purity_txt = "praktycznie nie rozróżnia klas"
+
+                        # --- dodatkowy score rozróżniania klas: 1 - ważona entropia (0..1) ---
+                        # Entropia per kategoria mierzy "mieszanie się" klas. Normalizujemy przez log(K),
+                        # gdzie K = liczba klas. Score = 1 - entropia ważona => im wyżej, tym lepiej rozróżnia.
+                        n_classes = probs.shape[1]
+                        eps = 1e-12  # stabilność numeryczna
+
+                        entropy_cat = -(probs * np.log(probs + eps)).sum(axis=1)  # entropia w kategoriach
+                        entropy_cat_norm = entropy_cat / np.log(max(n_classes, 2))  # normalizacja do 0..1
+
+                        weights = totals / max(float(totals.sum()), 1.0)  # udział kategorii w danych
+                        weighted_entropy = float((entropy_cat_norm * weights).sum())
+                        discr_score = float(1.0 - weighted_entropy)
+
+                        if discr_score >= 0.80:
+                            discr_txt = "bardzo wysokie — kategorie są zwykle jednoznacznie przypisane do jednej klasy"
+                        elif discr_score >= 0.65:
+                            discr_txt = "wysokie — większość kategorii ma wyraźnie dominującą klasę"
+                        elif discr_score >= 0.50:
+                            discr_txt = "umiarkowane — część kategorii miesza klasy, ale widać pewne różnice"
+                        else:
+                            discr_txt = "niskie — rozkłady klas w kategoriach są mocno wymieszane"
+
+                        with col_cls_panel:
+                            st.markdown(
+                                "<div style='font-size:1.5rem; font-weight:700; margin:0 0 0.35rem 0;'>"
+                                "Szybka ocena rozróżniania klas"
+                                "</div>",
+                                unsafe_allow_html=True,
+                            )
+
+
+                            # ========== 1) CZYSTOŚĆ KATEGORII ==========
+                            st.markdown(
+                                f"• **Czystość kategorii:** `{purity:.2f}`  \n"
+                                f"  {purity_txt.capitalize()}."
+                            )
+                            st.caption(
+                                "Czystość = ważona średnia udziału *najliczniejszej klasy* w każdej kategorii. "
+                                "Zakres 0–1: 0 oznacza pełne wymieszanie klas w kategoriach, "
+                                "1 oznacza, że niemal każda kategoria należy głównie do jednej klasy."
+                            )
+
+                            # ========== 2) SCORE ROZRÓŻNIANIA (ENTROPIA) ==========
+                            # U Ciebie ten score jest już policzony wyżej jako discr_score / discr_txt
+                            st.markdown(
+                                f"• **Score rozróżniania klas:** `{discr_score:.2f}`  \n"
+                                f"  {discr_txt.capitalize()}."
+                            )
+                            st.caption(
+                                "Score = 1 − (ważona, znormalizowana entropia rozkładów klas w kategoriach). "
+                                "Zakres 0–1: 0 oznacza pełne wymieszanie klas, 1 niemal idealną separację."
+                            )
+
+                            # ========== 3) WERDYKT ŁĄCZONY (POJEDYNCZA OCENA) ==========
+                            # Średnia obu miar + kara za silną niezgodność
+                            disagreement = abs(purity - discr_score)
+                            penalty = max(0.0, disagreement - 0.15) * 0.5   # kara dopiero gdy różnica > 0.15
+                            combined_score = max(0.0, min(1.0, 0.5 * (purity + discr_score) - penalty))
+
+                            if combined_score < 0.40:
+                                combined_txt = "praktycznie nie rozróżnia klas"
+                                combined_lvl = "niski"
+                            elif combined_score < 0.55:
+                                combined_txt = "słabo rozróżnia klasy"
+                                combined_lvl = "słaby"
+                            elif combined_score < 0.70:
+                                combined_txt = "umiarkowanie rozróżnia klasy"
+                                combined_lvl = "umiarkowany"
+                            elif combined_score < 0.85:
+                                combined_txt = "dobrze rozróżnia klasy"
+                                combined_lvl = "dobry"
+                            else:
+                                combined_txt = "bardzo dobrze rozróżnia klasy"
+                                combined_lvl = "bardzo dobry"
+
+                            st.markdown(
+                                f"• **Werdykt łączony:** `{combined_score:.2f}`  \n"
+                                f"  **{combined_txt.capitalize()}** (poziom: *{combined_lvl}*)."
+                            )
+
+                            if disagreement > 0.25:
+                                st.caption(
+                                    "Uwaga: miary czystości i entropii mocno się różnią. "
+                                    "Werdykt łączony uwzględnia tę niezgodność, ale warto zajrzeć w wykres."
+                                )
+
+
+    # ───────────────────── TRYB KLASTERYZACJI: profil wybranego klastra ─────────────────────
+    if task == "clustering" and cluster_col and cluster_col in df.columns:
+        st.subheader("Profil wybranego klastra", divider="gray")
+
+        cluster_series = df[cluster_col]
+        unique_clusters = (
+            pd.Series(cluster_series.dropna().unique())
+            .sort_values()
+            .tolist()
         )
 
-        # 1) Niewielki badge/CTA nad expanderem (w 100% stabilny)
-        st.markdown("""
-        <style>
-        .xfl-cta {
-        display:inline-block;
-        background:#fff4e5;
-        border:1px solid #ffb74d;
-        color:#5c3b00;
-        font-weight:700;
-        padding:.35rem .6rem;
-        border-radius:.6rem;
-        margin: .25rem 0 .25rem 0;
-        font-size:0.95rem;
-        }
-        .xfl-cta:hover { background:#ffedd5; }
-        </style>
-        <span class="xfl-cta">👇 Kliknij poniżej, aby otworzyć analizę 3D ⤵️</span>
-        """, unsafe_allow_html=True)
+        if not unique_clusters:
+            st.info("Brak zdefiniowanych klastrów w kolumnie klastra.")
+        else:
+            option_labels = [str(v) for v in unique_clusters]
+            sel_index = st.selectbox(
+                "Który klaster chcesz przeanalizować?",
+                options=list(range(len(option_labels))),
+                index=0,
+                format_func=lambda i: option_labels[i],
+                key="cluster_profile_id",
+            )
+            sel_value = unique_clusters[sel_index]
+            df_cluster = df[cluster_series == sel_value]
 
-        # 2) Sam expander — bez modyfikacji (stabilny)
-        with st.expander(expander_label, expanded=False):
-            all_cols = list(df.columns)
-            d_out, d_grp, d_val = _guess_outcome_group_value_cols(df)
+            st.caption(
+                f"Liczność klastra: **{len(df_cluster):,}** z **{len(df):,}** wszystkich rekordów."
+            )
 
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                outcome_col = st.selectbox(
-                    "Wynik / filtr (dowolna kolumna)", options=all_cols,
-                    index=(all_cols.index(d_out) if d_out in all_cols else 0),
-                    key="xfl_outcome"
-                )
-            with c2:
-                group_col = st.selectbox(
-                    "Grupa (dowolna kolumna kategoryczna / tekstowa)", options=all_cols,
-                    index=(all_cols.index(d_grp) if d_grp in all_cols else min(1, len(all_cols)-1)),
-                    key="xfl_group"
-                )
-            with c3:
-                value_col = st.selectbox(
-                    "Miara liczbowa (z automatycznym rzutowaniem na float)", options=all_cols,
-                    index=(all_cols.index(d_val) if d_val in all_cols else min(2, len(all_cols)-1)),
-                    key="xfl_value"
-                )
-
-            # ── Normalizacje typów ────────────────────────────────────────────────────
-            # grupa zawsze „tekstowo”
-            g_series = df[group_col].astype(str)
-
-            # miara: spróbuj zrzucić na numeric (użyj naszych parserów specjalnych -> fallback na to_numeric)
-            v_raw = df[value_col]
-            if not pd.api.types.is_numeric_dtype(v_raw):
-                v_try = _coerce_to_numeric_special(v_raw)
-                v_num = pd.to_numeric(v_try, errors="coerce")
+            num_cols_profile = [
+                c for c in df.select_dtypes(include="number").columns
+                if c != cluster_col
+            ]
+            if not num_cols_profile or len(df_cluster) == 0:
+                st.info("Brak kolumn liczbowych lub pusty klaster – nie można policzyć profilu.")
             else:
-                v_num = pd.to_numeric(v_raw, errors="coerce")
+                global_means = df[num_cols_profile].mean()
+                cluster_means = df_cluster[num_cols_profile].mean()
+                diff = cluster_means - global_means
 
-            # outcome: jako tekst do wyboru docelowej wartości (toleruje 0/1, True/False, 'yes' itd.)
-            o_series = df[outcome_col].astype(str)
-            o_values = sorted(pd.Series(o_series).dropna().unique().tolist())
-            # sensowny default: '1' jeśli istnieje; inaczej pierwsza wartość
-            default_outcome_val = "1" if "1" in o_values else (o_values[0] if o_values else "")
-            # nowy rząd o tych samych proporcjach co rząd powyżej (3 kolumny po 1/3)
-            cO1, cO2, cO3 = st.columns(3)
-            with cO1:
-                target_val = st.selectbox(
-                    f"Wartość wyniku (= filtr docelowy) dla {outcome_col}",
-                    options=o_values if len(o_values) > 0 else [""],
-                    index=(o_values.index(default_outcome_val) if default_outcome_val in o_values else 0)
+                profile_df = pd.DataFrame(
+                    {
+                        "feature": diff.index,
+                        "diff": diff.values,
+                        "mean_cluster": cluster_means.values,
+                        "mean_global": global_means.values,
+                    }
                 )
-            # wyrównanie wysokości wiersza (puste wypełniacze)
-            with cO2:
-                st.write("")
-            with cO3:
-                st.write("")
+                profile_df["abs_diff"] = profile_df["diff"].abs()
+                profile_df = profile_df.sort_values("abs_diff", ascending=False)
 
-            st.markdown("---")
+                top_n = min(12, len(profile_df))
+                top_df = profile_df.head(top_n)
 
+                # Uporządkuj oś Y tak, aby cechy były od największej ujemnej do największej dodatniej różnicy
+                order = top_df.sort_values("diff")["feature"].tolist()
 
-            # ── (A) Udział outcome==target w grupach (NA GÓRZE) ──────────────────────
-            st.subheader(f"A) Udział {outcome_col} = {target_val} w grupach", divider="gray")
-            tmp = pd.DataFrame({
-                group_col: g_series, 
-                "__hit__": (o_series == str(target_val)).astype(int)
-            }).dropna()
-            if tmp.empty:
-                st.info("Brak danych do policzenia udziałów. Zmień selekcję.")
-            else:
-                rate = tmp.groupby(group_col)["__hit__"].mean().reset_index(name="rate")
-                cat_order = rate[group_col].astype(str).tolist()
-
-                bar_rate = (
-                    alt.Chart(rate)
+                chart_profile = (
+                    alt.Chart(top_df)
                     .mark_bar()
                     .encode(
-                    x=alt.X("rate:Q", title="Udział", axis=alt.Axis(format=".0%")),
-                    y=alt.Y(f"{group_col}:N", sort="-x", title=group_col),
-                    color=alt.Color(f"{group_col}:N", legend=None, scale=_scale_for_categories(cat_order)),
-                    tooltip=[alt.Tooltip(f"{group_col}:N"), alt.Tooltip("rate:Q", format=".1%", title="Udział")]
+                        y=alt.Y("feature:N", sort=order, title="Cecha"),
+                        x=alt.X("diff:Q", title="Różnica średniej (klaster − globalnie)"),
+                        color=alt.condition(
+                            alt.datum.diff > 0,
+                            alt.value("#28a745"),
+                            alt.value("#dc3545"),
+                        ),
+                        tooltip=[
+                            alt.Tooltip("feature:N", title="Cecha"),
+                            alt.Tooltip("mean_cluster:Q", title="Średnia w klastrze", format=".3g"),
+                            alt.Tooltip("mean_global:Q", title="Średnia globalnie", format=".3g"),
+                            alt.Tooltip("diff:Q", title="Różnica", format=".3g"),
+                        ],
                     )
-                    .properties(height=280)
-                )
-                st.altair_chart(bar_rate, use_container_width=True)
-            st.markdown("---")
-
-
-            # ── (B) Rozkład miary w wybranym wycinku + violin/box ────────────────────
-            st.subheader("B) Rozkład miary w wycięciu (Outcome==target & wybór jednej grupy)", divider="gray")
-            cA1, cA2 = st.columns([4, 1])  # mniej miejsca na presety, więcej na wykresy
-
-            with cA2:
-                pick_groups = sorted(pd.Series(g_series).dropna().unique().tolist())
-                pick_group = st.selectbox(
-                    f"Wybierz wartość {group_col} do A)",
-                    options=pick_groups,
-                    index=(pick_groups.index("female") if "female" in pick_groups else 0)
+                    .properties(height=320)
                 )
 
-                # ZOSTAWIAMY przełącznik skali (w tym Overlay), usuwamy „Kształt 2”
-                dist_mode_A = st.radio("Skala rozkładu", ["Liczebność", "KDE", "Overlay"], index=0)
+                col_chart, col_panel = st.columns([4, 1.6])
+                with col_chart:
+                    st.altair_chart(chart_profile, use_container_width=True)
 
-                # nowa etykieta
-                bins_A = st.slider("Biny (histogram)", 5, 80, 30, 1, key="binsA")
-
-            maskA = (o_series == str(target_val)) & (g_series == str(pick_group))
-            dfA = pd.DataFrame({group_col: g_series[maskA], value_col: v_num[maskA]}).dropna()
-
-            with cA1:
-                if dfA.empty or dfA[value_col].dropna().empty:
-                    st.info("Brak danych po filtrze A). Zmień selekcję.")
-                else:
-                    # ── 1) BOX (u góry, poziomy) ────────────────────────────────────
-                    dfA2 = dfA.copy()
-                    dfA2["__lbl__"] = f"{pick_group} • {outcome_col}={target_val}"
-
-                    box_top = (
-                        alt.Chart(dfA2)
-                        .mark_boxplot(color=PALETTE_MAIN[0])
-                        .encode(
-                            x=alt.X(f"{value_col}:Q", title=value_col),
-                            y=alt.Y("__lbl__:N", title="")   # poziomy box
-                        )
-                        .properties(height=120)
-                    )
-                    st.altair_chart(box_top, use_container_width=True)
-
-                    # ── 2) Histogram / KDE / Overlay (na dole) ──────────────────────
-                    hist = (
-                        alt.Chart(dfA)
-                        .mark_bar(opacity=0.85, color=PALETTE_MAIN[0])
-                        .encode(
-                            x=alt.X(f"{value_col}:Q", bin=alt.Bin(maxbins=bins_A), title=value_col),
-                            y=alt.Y("count():Q", title="Liczebność"),
-                            tooltip=[alt.Tooltip("count():Q", title="liczebność")]
-                        )
-                        .properties(height=240)
+                # TOP 5 cech opisanych słownie – w panelu po prawej
+                top5 = top_df.head(5)
+                bullets = []
+                for _, row in top5.iterrows():
+                    sign = "wyższy" if row["diff"] > 0 else "niższy"
+                    bullets.append(
+                        f"- **{row['feature']}**: {sign} niż średnio (Δ ≈ {row['diff']:.3g})."
                     )
 
-                    kde = (
-                        alt.Chart(dfA)
-                        .transform_density(value_col, as_=[value_col, "density"])
-                        .mark_line(size=2, opacity=0.95, color=PALETTE_MAIN[1])
-                        .encode(
-                            x=alt.X(f"{value_col}:Q", title=value_col),
-                            y=alt.Y("density:Q", title="Gęstość")
-                        )
-                        .properties(height=240)
-                    )
+                with col_panel:
+                    if bullets:
+                        st.markdown("**Cechy najmocniej odróżniające ten klaster**")
+                        # zwykły tekst zamiast caption – większa, czarna czcionka
+                        st.markdown("\n".join(bullets))
 
-                    if dist_mode_A == "Liczebność":
-                        chart_bottom = hist
-                    elif dist_mode_A == "KDE":
-                        chart_bottom = kde
-                    else:  # Overlay
-                        chart_bottom = alt.layer(hist, kde).resolve_scale(y="independent")
 
-                    st.altair_chart(chart_bottom, use_container_width=True)
+        st.subheader("AI nazwy i opisy klastrów", divider="gray")
 
-            # ── (C) Rozkład miary wg grup (wszyscy) ───────────────────────────────────
-            st.subheader("C) Rozkład miary wg grup (wszyscy)", divider="gray")
+        state_key = f"cluster_ai_labels__{cluster_col}"
 
-            # lokalne presety (tu – nie na górze)
-            cLay, cSca = st.columns([1, 1])
-            with cLay:
-                layout = st.radio("Układ porównań", ["Osobne panele", "Overlay"], horizontal=True, index=0, key="secC_layout")
-            with cSca:
-                scale_choice = st.radio("Skala", ["Liczebność", "Udział w grupie", "KDE"], index=0, key="secC_scale")
-                if scale_choice == "Udział w grupie":
-                    st.caption("W trybie udziałów wykres jest zawsze rysowany jako 100% stacked (Overlay).")
+        # Krótkie wprowadzenie – własny HTML z mniejszym marginesem pod spodem
+        st.markdown(
+            """
+            <p style="
+                font-size: 0.875rem;
+                color: var(--text-color-secondary);
+                margin-bottom: 0rem;
+            ">
+            Najpierw podaj o kim lub o czym są te dane (liczba mnoga), 
+            a potem poproś AI o zaproponowanie nazw segmentów.
+            </p>
+            """,
+            unsafe_allow_html=True,
+        )
 
-            bins_B = st.slider("Biny (histogram)", 5, 80, 30, 1, key="binsB")
+        # Prosty CSS, żeby pole i przycisk miały zbliżoną wysokość
+        st.markdown(
+            """
+            <style>
+            div[data-testid="stTextInput"] input {
+                height: 40px;
+                padding-top: 6px;
+                padding-bottom: 6px;
+            }
+            div[data-testid="baseButton-secondary"] button,
+            div[data-testid="baseButton-primary"] button {
+                height: 40px;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
 
-            # 🧲 opcjonalne zastosowanie filtra wyniku również w C)
-            apply_outcome_in_C = st.checkbox("Zastosuj filtr wyniku (Outcome==target) także w C", value=True)
-            maskC = (o_series == str(target_val)) if apply_outcome_in_C else pd.Series(True, index=df.index)
+        # Krok 1 i Krok 2 w jednej linii, obie kontrolki w ~pierwszej połowie strony
+        col_k1, col_k2, _ = st.columns([1, 1, 2])
 
-            mode_key  = "facet" if layout == "Osobne panele" else "overlay"
-            scale_key = {"Liczebność": "count", "Udział w grupie": "share", "KDE": "kde"}[scale_choice]
-
-            # 👇 przekaż wycięte serie (reagują na filtr → grupa → miara)
-            chart_B, _ = _numeric_by_category_charts(
-                s_num=v_num[maskC],
-                s_cat=g_series[maskC],
-                col_num_name=value_col,
-                col_cat_name=group_col,
-                categories_keep=None,
-                maxbins=bins_B,
-                mode=mode_key,
-                scale=scale_key,
-                opacity=0.85,
+        with col_k1:
+            # Krok 1 + mała ikonka ? w kółku (styl jak help w Streamlit)
+            st.markdown(
+                '''
+                <div style="font-weight:600; margin-bottom:2px; display:flex; align-items:center; gap:4px;">
+                    <span>Krok 1:</span>
+                    <span title="Przykłady: klienci, produkty, pokemony, miasta…"
+                        style="
+                            cursor: help;
+                            display: inline-flex;
+                            align-items: center;
+                            justify-content: center;
+                            width: 16px;
+                            height: 16px;
+                            border-radius: 50%;
+                            border: 1px solid rgba(0,0,0,0.25);
+                            font-size: 10px;
+                            line-height: 1;
+                            color: rgba(0,0,0,0.6);
+                            background-color: rgba(0,0,0,0.02);
+                        ">
+                        ?
+                    </span>
+                </div>
+                ''',
+                unsafe_allow_html=True,
             )
-            st.altair_chart(chart_B, use_container_width=True)
 
-            nA = len(dfA)
-            if nA < 30:
-                st.warning(f"Mała próba w wycinku (n={nA}). Traktuj rozkład orientacyjnie.")
+            object_label = st.text_input(
+                "",
+                value=st.session_state.get("cluster_object_label_input", ""),
+                placeholder="Tu wpisz nazwę np. Klienci",
+                key="cluster_object_label_input",
+                label_visibility="collapsed",
+            )
+
+        with col_k2:
+            # Taki sam ciasny label dla przycisku
+            st.markdown(
+                '<div style="font-weight:600; margin-bottom:2px;">Krok 2:</div>',
+                unsafe_allow_html=True,
+            )
+            run_ai = st.button(
+                "🤖 Wygeneruj nazwy klastrów",
+                key="btn_ai_cluster_labels",
+                use_container_width=True,
+            )
+
+        # Wywołanie AI po kliknięciu
+        if run_ai:
+            with st.spinner("Analizuję klastry i generuję nazwy…"):
+                try:
+                    selected_label = (object_label or "obiekty").strip()
+                    labels = _describe_clusters_with_llm(
+                        df,
+                        cluster_col,
+                        object_label=selected_label,
+                    )
+                    if labels:
+                        st.session_state[state_key] = labels
+                        st.session_state["cluster_object_label"] = selected_label
+                    else:
+                        st.warning(
+                            "Nie udało się wygenerować nazw klastrów "
+                            "(brak odpowiedzi lub niepoprawny format JSON)."
+                        )
+                except Exception as e:
+                    st.exception(e)
+
+        # Odczyt aktualnych etykiet z sesji – JEDNA tabela
+        labels = st.session_state.get(state_key) or {}
+        if labels:
+            rows = []
+            for cid in sorted(labels.keys(), key=str):
+                info = labels.get(cid) or {}
+                rows.append(
+                    {
+                        "klaster": cid,
+                        "nazwa": info.get("name") or "",
+                        "skrót": info.get("short_label") or "",
+                        "opis": info.get("description") or "",
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(rows),
+                hide_index=True,
+                use_container_width=True,
+            )
+            st.caption(
+                "To są pomocnicze nazwy nadane przez AI – możesz je później "
+                "dostosować i wykorzystać w dashboardach lub prezentacjach."
+            )
 
     # 5) Korelacje i redundancje
     st.header("5. Korelacje i redundancje")
@@ -2643,70 +5214,80 @@ def main():
     with bottom_left:
         # JEDEN nagłówek (z dividerem) – bez duplikatu
         st.subheader("Pary o bardzo wysokiej korelacji (|r| ≥ 0.9)", divider="gray")
-        
-        # --- od tego miejsca treść LEWEGO dołu bez zmian logicznych ---
-        pairs_df_local = pairs_df_full.copy()
-        pairs_df_local["abs_r"] = pairs_df_local["corr"].abs()
-        high_corr_df = (
-            pairs_df_local.loc[pairs_df_local["abs_r"] >= 0.9]
-            .sort_values("abs_r", ascending=False)
-        )
 
-        ui_lang = (st.session_state.get("ui_lang", "PL") or "PL").upper()
-        if ui_lang == "PL":
-            col_map = {
-                "col1": "Kolumna 1",
-                "col2": "Kolumna 2",
-                "abs_r": "Wartość korelacji (|r|, Pearson)",
-                "suggest_drop": "Propozycja wyłączenia",
-            }
-            empty_msg = "Brak par z |r| ≥ 0.9. Super – nie duplikujemy informacji."
-            why_html = """
-    <div style="border:1px solid #fff3cd;background:#fffef4;border-radius:0.5rem;
-    padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0.75rem;">
-    <div style="font-weight:600;margin-bottom:0.4rem;">Dlaczego to ważne i co z tym zrobić?</div>
-    • Redundancja zaciemnia interpretację i może destabilizować model.<br>
-    • Zostaw jedną z mocno skorelowanych kolumn – zwykle tę z mniejszą liczbą braków lub bardziej zrozumiałą biznesowo.<br>
-    • Nasza sugestia jest konserwatywna (patrzymy m.in. na braki danych).
-    </div>
-    """
+        # --- BEZPIECZNY WARUNEK: gdy nie ma żadnych par / brak kolumny 'corr' ---
+        if pairs_df_full is None or pairs_df_full.empty or "corr" not in getattr(pairs_df_full, "columns", []):
+            # spójny komunikat z tym, co widzisz w prawym panelu
+            st.success("Brak par z istotną korelacją — kolumny nie dublują sygnału.")
         else:
-            col_map = {
-                "col1": "Column 1",
-                "col2": "Column 2",
-                "abs_r": "|r| (Pearson)",
-                "suggest_drop": "Suggested column to drop",
-            }
-            empty_msg = "No pairs with |r| ≥ 0.9. Great — no duplicated signal."
-            why_html = """
-    <div style="border:1px solid #fff3cd;background:#fffef4;border-radius:0.5rem;
-    padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0.75rem;">
-    <div style="font-weight:600;margin-bottom:0.4rem;">Why it matters & what to do</div>
-    • Redundancy hides interpretation and may destabilize the model.<br>
-    • Keep only one of the highly correlated columns — usually the one with fewer missings or clearer business meaning.<br>
-    • Our suggestion is conservative (we look at missingness, etc.).
-    </div>
-    """
-
-        if high_corr_df.empty:
-            st.caption(empty_msg)
-        else:
-            # limit wysokości tabeli (żółty box ma być zaraz pod nią)
-            PANE_LIMIT_PX = 700
-            WHYBOX_EST_PX = 120
-            TABLE_MAX_PX  = max(180, PANE_LIMIT_PX - WHYBOX_EST_PX)
-            ROW_H, HDR_H, PAD_H = 36, 38, 10
-            nrows = len(high_corr_df)
-            needed_px = min(TABLE_MAX_PX, HDR_H + nrows * ROW_H + PAD_H)
-
-            st.markdown('<div class="hc-scope hc-tight">', unsafe_allow_html=True)  # ⟵ KLUCZ: usuwa szczelinę
-
-            tbl = high_corr_df[["col1", "col2", "abs_r", "suggest_drop"]].rename(columns=col_map)
-            st.dataframe(
-                tbl.style.format({col_map["abs_r"]: "{:.4f}"}),
-                use_container_width=True, hide_index=True, height=needed_px
+            # --- dotychczasowa logika LEWEGO dołu (tabela par do wyłączenia) ---
+            pairs_df_local = pairs_df_full.copy()
+            pairs_df_local["abs_r"] = pairs_df_local["corr"].abs()
+            high_corr_df = (
+                pairs_df_local.loc[pairs_df_local["abs_r"] >= 0.9]
+                .sort_values("abs_r", ascending=False)
             )
-        st.markdown(why_html, unsafe_allow_html=True)
+
+            ui_lang = (st.session_state.get("ui_lang", "PL") or "PL").upper()
+            if ui_lang == "PL":
+                col_map = {
+                    "col1": "Kolumna 1",
+                    "col2": "Kolumna 2",
+                    "abs_r": "Wartość korelacji (|r|, Pearson)",
+                    "suggest_drop": "Propozycja wyłączenia",
+                }
+                empty_msg = "Brak par z |r| ≥ 0.9. Super – nie duplikujemy informacji."
+                why_html = """
+<div style="border:1px solid #fff3cd;background:#fffef4;border-radius:0.5rem;
+padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0.75rem;">
+  <div style="font-weight:600;margin-bottom:0.4rem;">Dlaczego to ważne i co z tym zrobić?</div>
+  • Redundancja zaciemnia interpretację i może destabilizować model.<br>
+  • Zostaw jedną z mocno skorelowanych kolumn – zwykle tę z mniejszą liczbą braków lub bardziej zrozumiałą biznesowo.<br>
+  • Nasza sugestia jest konserwatywna (patrzymy m.in. na braki danych).
+</div>
+"""
+            else:
+                col_map = {
+                    "col1": "Column 1",
+                    "col2": "Column 2",
+                    "abs_r": "|r| (Pearson)",
+                    "suggest_drop": "Suggested column to drop",
+                }
+                empty_msg = "No pairs with |r| ≥ 0.9. Great — no duplicated signal."
+                why_html = """
+<div style="border:1px solid #fff3cd;background:#fffef4;border-radius:0.5rem;
+padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0.75rem;">
+  <div style="font-weight:600;margin-bottom:0.4rem;">Why it matters & what to do</div>
+  • Redundancy hides interpretation and may destabilize the model.<br>
+  • Keep only one of the highly correlated columns — usually the one with fewer missings or clearer business meaning.<br>
+  • Our suggestion is conservative (we also look at missingness).
+</div>
+"""
+
+            if high_corr_df.empty:
+                st.caption(empty_msg)
+            else:
+                # limit wysokości tabeli (żółty box ma być zaraz pod nią)
+                PANE_LIMIT_PX = 700
+                WHYBOX_EST_PX = 120
+                TABLE_MAX_PX  = max(180, PANE_LIMIT_PX - WHYBOX_EST_PX)
+                ROW_H, HDR_H, PAD_H = 36, 38, 10
+                nrows = len(high_corr_df)
+                needed_px = min(TABLE_MAX_PX, HDR_H + nrows * ROW_H + PAD_H)
+
+                st.markdown(
+                    '<div class="hc-scope hc-tight">', unsafe_allow_html=True
+                )  # ⟵ usuwa szczelinę pod tabelą
+
+                tbl = high_corr_df[["col1", "col2", "abs_r", "suggest_drop"]].rename(columns=col_map)
+                st.dataframe(
+                    tbl.style.format({col_map["abs_r"]: "{:.4f}"}),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=needed_px,
+                )
+
+            st.markdown(why_html, unsafe_allow_html=True)
 
     with bottom_right:
         st.subheader("Którą kolumnę wyłączyć? — wynik i uzasadnienie", divider="gray")
@@ -3759,9 +6340,17 @@ def main():
         }
 
         with st.spinner("🛠️ Przygotowuję dane do trenowania…"):
-            df_ready, prep_report = _auto_prepare_for_training(df, info_df, decisions)
+            # ⬇⬇⬇ KLUCZOWA ZMIANA: używamy PEŁNEGO zbioru df_full, nie próbki df ⬇⬇⬇
+            df_ready, prep_report = _auto_prepare_for_training(df_full, info_df, decisions)
             ready_path, report_path = _persist_artifacts(df_ready, prep_report, latest_info)
-            hours_saved = _estimate_hours_saved(n_rows_raw, n_cols_raw, high_null_cols, duplicates_count, auto_drop_candidates, pairs_sorted)
+            hours_saved = _estimate_hours_saved(
+                n_rows_raw,
+                n_cols_raw,
+                high_null_cols,
+                duplicates_count,
+                auto_drop_candidates,
+                pairs_sorted,
+            )
             cost_saved  = _estimate_cost_saved_pln(hours_saved)
             # ➜ Handoff do etapu Data Chat (pakiet startowy)
             handoff_path = _save_datachat_handoff(
