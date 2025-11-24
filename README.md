@@ -57,24 +57,28 @@ Projekt działa jako zwykły skrypt Streamlit.
 W tej chwili **nie wymagamy osobnego wirtualnego środowiska**, ale zalecamy mieć zainstalowane wymagane biblioteki z `requirements.txt`.
 
 1. Sklonuj repozytorium:
-   ```bash
-   git clone https://github.com/Kris1401/AUTO_EDA-FOR.git
-   cd AUTO_EDA-FOR
+```bash
+git clone https://github.com/Kris1401/AUTO_EDA-FOR.git
+cd AUTO_EDA-FOR
+```
 
 2. Zainstaluj zależności:
-   ```bash
-   pip install -r requirements.txt
-   
+```bash
+pip install -r requirements.txt
+```
+
 Jeśli używasz conda i chcesz mieć powtarzalne środowisko, możesz też zrobić:
-    ```bash
-    conda env create -f environment.yml
-    conda activate auto-eda-for 
-    
-ale nie jest to wymagane do prostego uruchomienia aplikacji.
+```bash
+conda env create -f environment.yml
+conda activate auto-eda-for
+```
+
+Ale nie jest to wymagane do prostego uruchomienia aplikacji.
 
 3. Uruchom aplikację Streamlit:
-  ```bash
-   streamlit run app/app.py
-   
-4. Aplikacja otworzy się w przeglądarce (domyślnie http://localhost:8501).
-Przejdź do zakładki "Analiza Danych", wgraj plik i zobacz podgląd.
+```bash
+streamlit run app/app.py
+```
+
+4. Aplikacja otworzy się w przeglądarce (domyślnie http://localhost:8501)
+Przejdź do zakładki **„Analiza Danych”**, wgraj plik i zobacz podgląd.
