@@ -1,0 +1,13 @@
+[theme]
+base="light"
+
+[server]
+folderWatchBlacklist = ["__pycache__", ".git", ".venv", "venv", "env", "artifacts", "runs", "mlruns"]
+
+runOnSave = false
+
+fileWatcherType = "none"
+
+headless = true
+enableCORS = true
+

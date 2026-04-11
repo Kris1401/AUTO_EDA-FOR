@@ -11,18 +11,62 @@ from types import SimpleNamespace
 
 import streamlit as st
 import pandas as pd
+
+# ─────────────────────────────────────────────────────────────
+# Parquet-only storage helpers (Stage 1/2/3)
+# ─────────────────────────────────────────────────────────────
+def _df_to_parquet(df: pd.DataFrame, path: Path) -> None:
+    """Save DataFrame to Parquet (snappy)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        df.to_parquet(path, index=False, engine="pyarrow", compression="snappy")
+    except Exception:
+        # fallback: let pandas pick engine if available
+        df.to_parquet(path, index=False, compression="snappy")
+
+def _optimize_dtypes_for_storage(df: pd.DataFrame) -> pd.DataFrame:
+    """Lightweight dtype downcast to reduce size and speed IO."""
+    try:
+        import numpy as np
+        out = df.copy()
+        # numeric downcast
+        for c in out.select_dtypes(include=["int", "int64", "int32"]).columns:
+            out[c] = pd.to_numeric(out[c], downcast="integer")
+        for c in out.select_dtypes(include=["float", "float64", "float32"]).columns:
+            out[c] = pd.to_numeric(out[c], downcast="float")
+        # bool-ish objects
+        for c in out.select_dtypes(include=["object"]).columns:
+            s = out[c]
+            # convert low-cardinality object to category
+            try:
+                nun = s.nunique(dropna=True)
+                if nun > 0 and nun <= 200 and nun / max(len(s), 1) <= 0.2:
+                    out[c] = s.astype("category")
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return df
+
 from pandas.api.types import is_datetime64_any_dtype
 
 from core.i18n import t
 from core.config import load_config, resolve_artifacts_dir
 from core.pii import mask_dataframe
 from ingest import load_any, excel_sheet_names
+from core.top_nav import (
+    hide_default_multipage_nav,
+    render_flow_nav,
+    render_sidebar_links,
+)
+
 
 from streamlit.components.v1 import html as st_html
 
 # -------------------------------------------------
 # GLOBALNY STYL — spójny z Etapem 2 + uploader
 # -------------------------------------------------
+
 st.markdown(
     """
 <style>
@@ -570,17 +614,20 @@ def _load_demo_dataset(spec: dict, preview_limit: int | None = None):
 
     return df_preview, df_full, meta_preview, meta_full, approx_size_mb
 
+# --- NAWIGACJA ---
+hide_default_multipage_nav()
+render_flow_nav(current_id="01_Analiza_Danych")  # aktywny kafel Etapu 1
 
 # =================================================
 # GŁÓWNA LOGIKA STRONY
 # =================================================
 
-st.title("Analiza Danych — Wczytywanie (Etap 1)")
-st.caption(
+st.title("Analiza Danych — wczytywanie (Etap 1)")
+st.markdown(
     "Etap **1 z 4** – wczytujesz dane i robisz szybki sanity check, "
     "zanim przejdziesz do pełnej analizy i trenowania modelu."
 )
-
+st.subheader("", divider="gray")
 cfg, problems = load_config()
 MAX_MB, WARN_ROWS, SAMPLE_ROWS = cfg.max_file_mb, cfg.warn_rows, cfg.sample_rows
 
@@ -596,7 +643,7 @@ with st.sidebar:
         "Podgląd — maks. wierszy",
         1000,
         200_000,
-        5000,
+        1000,
         step=1000,
     )
     st.caption(
@@ -701,7 +748,7 @@ if not is_demo:
             box.button(
                 "✖ Skasuj ładowanie",
                 type="secondary",
-                use_container_width=True,
+                width='stretch',
                 on_click=_clear_upload,
                 key=f"clear_upload_{rev}",
             )
@@ -714,7 +761,6 @@ if not is_demo:
             "przełącz się na zakładkę **Dane demo**."
         )
         st.stop()
-
 
     # --- mamy plik: przygotowanie do wczytania podglądu ---
     file_bytes = uploaded.getvalue()
@@ -817,7 +863,7 @@ else:
 
     load_demo = st.button(
         "Załaduj dane demo",
-        type="secondary",
+        type="primary",
         help="Jeśli zmienisz zestaw demo, kliknij ponownie, aby przeładować dane.",
     )
 
@@ -919,7 +965,7 @@ if mode.startswith("Przewijalna"):
 
     st.dataframe(
         df_masked_preview,
-        use_container_width=True,
+        width='stretch',
         height=height,
         hide_index=True,
     )
@@ -1102,11 +1148,12 @@ if clicked:
         run_dir = out_dir / f"{safe_base}__{ts}"
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        csv_path = run_dir / f"{safe_base}__full_masked.csv"
+        parquet_path = run_dir / f"{safe_base}__full_masked.parquet"
         meta_path = run_dir / f"{safe_base}__meta.json"
 
-        status.write("3/3 – Zapis pełnego zbioru do CSV (może chwilę potrwać przy dużych plikach)…")
-        df_full_masked.to_csv(csv_path, index=False, encoding="utf-8")
+        status.write("3/3 – Zapis pełnego zbioru do PARQUET (snappy)…")
+        df_full_masked = _optimize_dtypes_for_storage(df_full_masked)
+        _df_to_parquet(df_full_masked, parquet_path)
 
         meta_dump = meta_full.__dict__ | {
             "pii_masked": bool(mask_pii),
@@ -1119,7 +1166,7 @@ if clicked:
         )
 
         st.session_state["latest_artifacts"] = {
-            "csv_path": str(csv_path),
+            "parquet_path": str(parquet_path),
             "meta_path": str(meta_path),
             "run_dir": str(run_dir),
             "n_rows": int(df_full_masked.shape[0]),
@@ -1139,11 +1186,15 @@ if clicked:
     # Po wyjściu z kontekstu st.status wyświetlamy końcowe podsumowanie
     st.success(
         "✅ Dane przygotowane do trenowania modelu.\n\n"
-        f"• Pełny zbiór (po maskowaniu PII): `{csv_path}`\n"
-        f"• Meta-informacje: `{meta_path}`\n"
-        f"• Rozmiar danych: {df_full_masked.shape[0]} wierszy × "
+        f"- Pełny zbiór (po maskowaniu PII): `{parquet_path}`  \n"
+        f"- Meta-informacje: `{meta_path}`  \n"
+        f"- Rozmiar danych: {df_full_masked.shape[0]} wierszy × "
         f"{df_full_masked.shape[1]} kolumn\n\n"
         "Możesz teraz przejść do zakładki **Trenowanie Modelu** — "
         "aplikacja automatycznie użyje tych danych (`latest_artifacts`)."
     )
+
+# --- Powtórzony potok na dole strony ---
+render_flow_nav(current_id="01_Analiza_Danych", key_prefix="flow_bottom")
+st.markdown("---")
 

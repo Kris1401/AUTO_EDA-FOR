@@ -6,14 +6,62 @@ import io
 import json
 import math
 import base64
+import time
+from contextlib import contextmanager
+import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Tuple, Dict, Any, List
 
 import numpy as np
 import pandas as pd
+
+# ─────────────────────────────────────────────────────────────
+# Parquet-only storage helpers (Stage 1/2/3)
+# ─────────────────────────────────────────────────────────────
+def _df_to_parquet(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        df.to_parquet(path, index=False, engine="pyarrow", compression="snappy")
+    except Exception:
+        df.to_parquet(path, index=False, compression="snappy")
+
+def _df_from_parquet(path: Path, max_rows: int | None = None) -> pd.DataFrame:
+    """Load Parquet. If max_rows is set, read only first N rows (fast preview)."""
+    try:
+        import pyarrow.parquet as pq
+        pf = pq.ParquetFile(path)
+        if not max_rows:
+            return pf.read().to_pandas()
+        out = []
+        remaining = int(max_rows)
+        for rg in range(pf.num_row_groups):
+            if remaining <= 0:
+                break
+            tbl = pf.read_row_group(rg)
+            df_rg = tbl.to_pandas()
+            if len(df_rg) > remaining:
+                df_rg = df_rg.iloc[:remaining].copy()
+            out.append(df_rg)
+            remaining -= len(df_rg)
+        if not out:
+            return pf.read_row_group(0).to_pandas().head(max_rows)
+        return pd.concat(out, ignore_index=True)
+    except Exception:
+        # fallback: pandas may still read full file
+        df = pd.read_parquet(path)
+        return df.head(max_rows) if max_rows else df
+
 import streamlit as st
+from core.ui_safe import altair_chart_stretch
 import altair as alt
-import math
+
+from core.top_nav import (
+    hide_default_multipage_nav,
+    render_flow_nav,
+    render_sidebar_links,
+)
+
 
 # --- wspólna paleta barw ---
 PALETTE_MAIN = [
@@ -21,29 +69,129 @@ PALETTE_MAIN = [
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
 ]
 
-# --- Stylizacja przycisków Streamlit (tylko secondary) ---
-st.markdown("""
-<style>
-/* 🎨 Styl TYLKO dla przycisków typu 'secondary'
-   (np. '🔎 Uruchom/odśwież weryfikację winsoryzacji') */
-
-/* obsługa obu wariantów data-testid z różnych wersji Streamlita */
-button[data-testid="baseButton-secondary"],
-button[data-testid="stBaseButton-secondary"] {
-  background: #fff4e5 !important;      /* blady pomarańcz, nawiązanie do koloru 'po' (#ff7f0e) */
-  color: #5c3b00 !important;           /* ciemny brąz – dobry kontrast */
-  border: 1px solid #ffb74d !important;
-  box-shadow: none !important;
-}
-
-button[data-testid="baseButton-secondary"]:hover,
-button[data-testid="stBaseButton-secondary"]:hover {
-  background: #ffedd5 !important;      /* lekko ciemniej na hover */
-}
-</style>
-""", unsafe_allow_html=True)
-
 FACET_CHART_WIDTH = 980  # szerokość jednego panelu w układzie facet
+
+# --- PERF logger (terminal) ---
+_PERF_LOGGER = logging.getLogger('eda_perf')
+if not _PERF_LOGGER.handlers:
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+def _perf(section: str) -> float:
+    """Return start time and log section entry to terminal."""
+    t0 = time.perf_counter()
+    _PERF_LOGGER.info(f'[PERF] enter: {section}')
+    return t0
+
+def _perf_end(section: str, t0: float) -> None:
+    dt = time.perf_counter() - t0
+    _PERF_LOGGER.info(f'[PERF] exit:  {section} ({dt:.2f}s)')
+
+def _df_preview_for_ui(obj, max_rows: int = 2000) -> pd.DataFrame:
+    """Prepare a lightweight, Arrow-safe preview DataFrame for Streamlit UI.
+
+    Accepts:
+      - pd.DataFrame
+      - pd.io.formats.style.Styler (we take `.data`)
+    Returns:
+      - pd.DataFrame (possibly truncated to `max_rows`)
+    """
+    # If a pandas Styler is passed (e.g., from df.style), unwrap to underlying DataFrame
+    try:
+        from pandas.io.formats.style import Styler
+        if isinstance(obj, Styler):
+            obj = obj.data
+    except Exception:
+        pass
+
+    if obj is None:
+        return pd.DataFrame()
+
+    # Styler -> underlying DataFrame
+    try:
+        from pandas.io.formats.style import Styler  # type: ignore
+        if isinstance(obj, Styler):
+            obj = obj.data
+    except Exception:
+        # Styler import path may vary; ignore and treat as generic
+        pass
+
+    if not isinstance(obj, pd.DataFrame):
+        # best-effort conversion
+        try:
+            obj = pd.DataFrame(obj)
+        except Exception:
+            return pd.DataFrame()
+
+    df2 = obj.copy()
+
+    # truncate early for UI safety
+    try:
+        if max_rows is not None and max_rows > 0 and len(df2) > max_rows:
+            df2 = df2.head(max_rows)
+    except Exception:
+        # if len fails for some exotic object, fallback to head
+        try:
+            df2 = df2.head(max_rows)
+        except Exception:
+            return pd.DataFrame()
+
+    return _df_coerce_for_arrow(df2)
+
+
+def _df_coerce_for_arrow(df: pd.DataFrame) -> pd.DataFrame:
+    """Force DataFrame into Arrow-serializable dtypes for Streamlit.
+
+    Key goal: avoid ArrowInvalid like mixed object column ('Invoice') being inferred as int.
+    This function is *display-only*; it should NOT be used for modeling computations.
+    """
+    if df is None or df.empty:
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+    df2 = df.copy()
+
+    for c in df2.columns:
+        s = df2[c]
+        # categories -> string
+        try:
+            if str(s.dtype) == "category":
+                df2[c] = s.astype(str)
+                continue
+        except Exception:
+            pass
+
+        # object / mixed -> string (prevents Arrow trying to cast to int)
+        try:
+            if s.dtype == "object":
+                df2[c] = s.astype(str)
+                continue
+        except Exception:
+            pass
+
+        # pandas nullable integer -> convert to float to keep NaNs Arrow-safe
+        try:
+            if str(s.dtype).startswith("Int"):
+                df2[c] = s.astype("float64")
+        except Exception:
+            pass
+
+    return df2
+
+
+def st_df_safe(obj, *, max_rows: int = 2000, **kwargs):
+    """Safe wrapper around st.dataframe that:
+    - accepts DataFrame or Styler
+    - truncates to max_rows
+    - coerces to Arrow-safe dtypes to prevent Streamlit serialization crashes
+    """
+    df2 = _df_preview_for_ui(obj, max_rows=max_rows)
+    return st.dataframe(df2, **kwargs)
+
+
+def st_table_safe(obj, *, max_rows: int = 2000, **kwargs):
+    """Safe wrapper around st.table with the same guarantees as st_df_safe."""
+    df2 = _df_preview_for_ui(obj, max_rows=max_rows)
+    return st.table(df2, **kwargs)
+
 
 def _scale_for_categories(cats: List[str]) -> alt.Scale:
     """Zwraca Scale z domeną = kolejność kategorii i rangą z naszej palety (powiela gdy potrzeba)."""
@@ -101,6 +249,881 @@ def get_lf_openai_client():
         return LFOpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
     except Exception:
         return None
+
+
+def _eda_internal_checkpoints_enabled() -> bool:
+    return True
+
+
+def _eda_debug_ui_enabled() -> bool:
+    return bool(st.session_state.get("eda_debug_enabled", False))
+
+
+def _eda_collect_checkpoints() -> bool:
+    return _eda_internal_checkpoints_enabled() or bool(st.session_state.get("eda_debug_collect", False))
+
+
+def _eda_show_debug_details() -> bool:
+    return bool(st.session_state.get("eda_debug_show_details", False))
+
+
+def _eda_reset_run_debug_state() -> None:
+    st.session_state["eda_debug_log_v1"] = []
+    st.session_state["eda_exec_units_v1"] = {}
+    st.session_state["eda_exec_summary_v1"] = {}
+
+
+def _eda_clear_debug_state() -> None:
+    for key in [
+        "eda_debug_log_v1",
+        "eda_exec_units_v1",
+        "eda_exec_summary_v1",
+        "eda_summary_debug_v1",
+        "eda_cluster_debug_v1",
+    ]:
+        st.session_state.pop(key, None)
+
+    for key in list(st.session_state.keys()):
+        if key.startswith("cluster_ai_labels__") and key.endswith("__debug"):
+            st.session_state.pop(key, None)
+
+
+def _eda_debug_sanitize(value: Any, depth: int = 0) -> Any:
+    if depth > 3:
+        return str(type(value).__name__)
+
+    if isinstance(value, pd.DataFrame):
+        return {
+            "type": "dataframe",
+            "rows": int(len(value)),
+            "cols": int(len(value.columns)),
+            "columns": [str(c) for c in list(value.columns[:8])],
+        }
+
+    if isinstance(value, pd.Series):
+        return {
+            "type": "series",
+            "len": int(len(value)),
+            "name": str(value.name),
+            "head": [_eda_debug_sanitize(v, depth + 1) for v in value.head(5).tolist()],
+        }
+
+    if isinstance(value, dict):
+        items = list(value.items())
+        out = {}
+        for k, v in items[:20]:
+            out[str(k)] = _eda_debug_sanitize(v, depth + 1)
+        if len(items) > 20:
+            out["_truncated_keys"] = len(items) - 20
+        return out
+
+    if isinstance(value, (list, tuple, set)):
+        seq = list(value)
+        return {
+            "type": "list",
+            "len": len(seq),
+            "head": [_eda_debug_sanitize(v, depth + 1) for v in seq[:8]],
+        }
+
+    if isinstance(value, (np.integer,)):
+        return int(value)
+
+    if isinstance(value, (np.floating, float)):
+        try:
+            if not np.isfinite(value):
+                return None
+        except Exception:
+            return None
+        return float(value)
+
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+
+    if value is None:
+        return None
+
+    return str(value)
+
+
+def _eda_record_checkpoint(where: str, **payload: Any) -> None:
+    if not _eda_collect_checkpoints():
+        return
+
+    row = {"where": where}
+    for key, value in payload.items():
+        row[str(key)] = _eda_debug_sanitize(value)
+
+    log = st.session_state.setdefault("eda_debug_log_v1", [])
+    log.append(row)
+    if len(log) > 400:
+        del log[:-400]
+
+
+def _eda_register_exec_result(block_id: str, src: str, **extra: Any) -> None:
+    units = st.session_state.setdefault("eda_exec_units_v1", {})
+    item = {"block_id": block_id, "src": src}
+    for key, value in extra.items():
+        item[str(key)] = value
+    units[block_id] = item
+
+    _eda_record_checkpoint("eda.exec.block", **item)
+
+    values = list(units.values())
+    blocks_count = len(values)
+    llm_count = sum(1 for row in values if str(row.get("src", "")).startswith("llm"))
+    det_count = max(0, blocks_count - llm_count)
+    llm_share_pct = float(llm_count / blocks_count) if blocks_count else 0.0
+
+    summary = {
+        "blocks_count": int(blocks_count),
+        "llm_count": int(llm_count),
+        "det_count": int(det_count),
+        "llm_share_pct": round(llm_share_pct, 3),
+    }
+    st.session_state["eda_exec_summary_v1"] = summary
+    _eda_record_checkpoint("eda.exec.summary", **summary)
+
+
+def _eda_parse_json_like(raw: str) -> dict:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        parts = text.split("```")
+        if len(parts) >= 3:
+            text = parts[1]
+        text = text.replace("json", "", 1).strip()
+
+    first = text.find("{")
+    last = text.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        text = text[first : last + 1]
+
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("JSON root must be an object")
+    return parsed
+
+
+def _eda_norm_text(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _eda_tldr_fallback_sections(
+    source_name: str,
+    readiness_score: int,
+    n_rows_raw: int,
+    n_cols_raw: int,
+    global_missing_pct: float,
+    duplicates_count: int,
+    duplicates_pct: float,
+    auto_drop_candidates: list[str],
+    pairs_sorted: list[dict[str, Any]],
+) -> dict[str, list[str]]:
+    strong_pairs = [p for p in pairs_sorted if abs(float(p.get("corr", 0.0))) >= 0.9]
+    example_pair = strong_pairs[0] if strong_pairs else None
+    example_pair_txt = (
+        f"{example_pair['col1']} -> {example_pair['col2']} (r={float(example_pair['corr']):.2f})"
+        if example_pair
+        else "brak par o bardzo wysokiej korelacji"
+    )
+    drops_preview = ", ".join(auto_drop_candidates[:4]) if auto_drop_candidates else "brak"
+
+    what = [
+        f"Zbior '{source_name}' zawiera {int(n_rows_raw):,} wierszy i {int(n_cols_raw):,} kolumn.",
+        f"Braki globalne wynosza ok. {float(global_missing_pct):.1f}%, a pelne duplikaty {int(duplicates_count):,} ({float(duplicates_pct):.1f}%).",
+        f"Heurystyka wskazuje {len(auto_drop_candidates)} kolumn do weryfikacji lub wykluczenia ({drops_preview}).",
+    ]
+    insights = [
+        f"Readiness score to {int(readiness_score)}/100, wiec zbior wymaga kontrolowanego przygotowania przed trenowaniem.",
+        f"Silnych par korelacji (|r|>=0.9) wykryto {len(strong_pairs)}; przyklad: {example_pair_txt}.",
+        "Najwieksze ryzyka na tym etapie to redundantne cechy, braki danych i potencjalne duplikaty rekordow.",
+    ]
+    next_steps = [
+        "Przejrzyj kandydatow do wykluczenia i potwierdz, czy kolumny techniczne lub identyfikatory nie powinny wejsc do modelu.",
+        "Po akceptacji przygotowania danych uruchom krok budowy zbioru treningowego i zweryfikuj raport po czyszczeniu.",
+        "Przed trenowaniem sprawdz jeszcze docelowa zmienna oraz ewentualne przecieki informacji.",
+    ]
+    return {"what": what, "insights": insights, "next_steps": next_steps}
+
+
+def _eda_tldr_one_sentence(
+    readiness_score: int,
+    global_missing_pct: float,
+    duplicates_count: int,
+    duplicates_pct: float,
+    auto_drop_candidates: list[str],
+    pairs_sorted: list[dict[str, Any]],
+) -> str:
+    strong_pairs = sum(1 for p in pairs_sorted if abs(float(p.get("corr", 0.0))) >= 0.9)
+    return (
+        f"Jakosc danych oceniamy na {int(readiness_score)}/100: braki globalne to ~{float(global_missing_pct):.1f}%, "
+        f"duplikaty {int(duplicates_count):,} ({float(duplicates_pct):.1f}%), a do weryfikacji pozostaje "
+        f"{len(auto_drop_candidates)} kolumn i {strong_pairs} silnych zaleznosci."
+    )
+
+
+def _eda_format_tldr_markdown(one_sentence: str, sections: dict[str, list[str]]) -> str:
+    ordered = [
+        ("Odpowiedź w jednym zdaniu", [one_sentence]),
+        ("Podsumowanie danych", sections.get("what", [])),
+        ("Insight z analizy", sections.get("insights", [])),
+        ("Co dalej", sections.get("next_steps", [])),
+    ]
+    parts: list[str] = []
+    for title, bullets in ordered:
+        clean = [_eda_norm_text(b) for b in bullets if _eda_norm_text(b)]
+        if not clean:
+            continue
+        parts.append(f"### {title}")
+        for bullet in clean:
+            parts.append(f"- {bullet}")
+        parts.append("")
+    return "\n".join(parts).strip()
+
+
+def _eda_generate_tldr_markdown(
+    source_name: str,
+    readiness_score: int,
+    duplicates_count: int,
+    duplicates_pct: float,
+    global_missing_pct: float,
+    auto_drop_candidates: list[str],
+    pairs_sorted: list[dict[str, Any]],
+    n_rows_raw: int,
+    n_cols_raw: int,
+    model: str,
+    trace: Any = None,
+) -> tuple[str, dict[str, Any]]:
+    render_key = str(
+        (
+            "v1",
+            source_name,
+            int(n_rows_raw),
+            int(n_cols_raw),
+            float(global_missing_pct),
+            int(duplicates_count),
+            float(duplicates_pct),
+            int(readiness_score),
+            tuple(auto_drop_candidates[:8]),
+            int(sum(1 for p in pairs_sorted if abs(float(p.get("corr", 0.0))) >= 0.9)),
+            model,
+        )
+    )
+
+    facts = {
+        "source_name": source_name,
+        "n_rows": int(n_rows_raw),
+        "n_cols": int(n_cols_raw),
+        "global_missing_pct": round(float(global_missing_pct), 2),
+        "duplicates_count": int(duplicates_count),
+        "duplicates_pct": round(float(duplicates_pct), 2),
+        "readiness_score": int(readiness_score),
+        "auto_drop_count": int(len(auto_drop_candidates)),
+        "auto_drop_candidates": auto_drop_candidates[:8],
+        "strong_corr_pairs_count": int(sum(1 for p in pairs_sorted if abs(float(p.get("corr", 0.0))) >= 0.9)),
+    }
+    example_pair = next((p for p in pairs_sorted if abs(float(p.get("corr", 0.0))) >= 0.9), None)
+    if example_pair:
+        facts["strong_corr_example"] = {
+            "col1": str(example_pair.get("col1", "")),
+            "col2": str(example_pair.get("col2", "")),
+            "corr": round(float(example_pair.get("corr", 0.0)), 3),
+        }
+
+    fallback_sections = _eda_tldr_fallback_sections(
+        source_name=source_name,
+        readiness_score=readiness_score,
+        n_rows_raw=n_rows_raw,
+        n_cols_raw=n_cols_raw,
+        global_missing_pct=global_missing_pct,
+        duplicates_count=duplicates_count,
+        duplicates_pct=duplicates_pct,
+        auto_drop_candidates=auto_drop_candidates,
+        pairs_sorted=pairs_sorted,
+    )
+    final_one_sentence = _eda_tldr_one_sentence(
+        readiness_score=readiness_score,
+        global_missing_pct=global_missing_pct,
+        duplicates_count=duplicates_count,
+        duplicates_pct=duplicates_pct,
+        auto_drop_candidates=auto_drop_candidates,
+        pairs_sorted=pairs_sorted,
+    )
+    fallback_markdown = _eda_format_tldr_markdown(final_one_sentence, fallback_sections)
+
+    prompt = (
+        "Jestes senior data strategist. Na podstawie faktow wejscowych przygotuj tylko jeden obiekt JSON.\n"
+        "Nie dodawaj zadnego komentarza poza JSON-em.\n"
+        "Zasady:\n"
+        "- pisz po polsku,\n"
+        "- badz konkretny i zarzadczo-praktyczny,\n"
+        "- sekcja 'one_sentence' NIE moze uzywac skewness ani innych metryk poza podanymi faktami,\n"
+        "- nie halucynuj przyczyn biznesowych,\n"
+        "- nie odnos sie do sezonowosci, jesli nie ma jej w faktach.\n"
+        "Format JSON:\n"
+        "{\n"
+        '  "one_sentence": "...",\n'
+        '  "what": ["...", "..."],\n'
+        '  "insights": ["...", "..."],\n'
+        '  "next_steps": ["...", "..."]\n'
+        "}\n"
+        "Kazda lista powinna miec 2-4 krotkie punkty.\n"
+        f"Fakty wejściowe:\n{json.dumps(facts, ensure_ascii=False, indent=2)}"
+    )
+
+    _eda_record_checkpoint("eda.summary.start", openai_model=model, render_key=render_key)
+    _eda_record_checkpoint("eda.summary.stats_payload", **facts)
+
+    debug = {
+        "render_key": render_key,
+        "model": model,
+        "raw_text": None,
+        "gate_ok": False,
+        "gate_reasons": [],
+        "used_fallback": False,
+        "error": None,
+        "postprocessed": False,
+        "final_one_sentence": final_one_sentence,
+    }
+
+    try:
+        lf_openai = get_lf_openai_client()
+        if lf_openai:
+            resp = lf_openai.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+        else:
+            client = _openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+
+        raw_text = (resp.choices[0].message.content or "").strip()
+        debug["raw_text"] = raw_text
+
+        parsed = _eda_parse_json_like(raw_text)
+        gate_reasons: list[str] = []
+        repaired = False
+        final_sections: dict[str, list[str]] = {}
+
+        for key in ("what", "insights", "next_steps"):
+            raw_items = parsed.get(key, [])
+            items = [_eda_norm_text(x) for x in (raw_items if isinstance(raw_items, list) else [])]
+            items = [x for x in items if len(x) >= 12]
+            if len(items) < 2:
+                gate_reasons.append(f"{key}: za malo poprawnych punktow")
+                repaired = True
+            merged = items[:3]
+            for fallback_item in fallback_sections[key]:
+                if len(merged) >= 3:
+                    break
+                if fallback_item not in merged:
+                    merged.append(fallback_item)
+            final_sections[key] = merged[:3]
+
+        if not isinstance(parsed.get("one_sentence"), str) or len(_eda_norm_text(parsed.get("one_sentence"))) < 20:
+            gate_reasons.append("one_sentence: brak sensownego leadu")
+            repaired = True
+
+        debug["gate_ok"] = len(gate_reasons) == 0
+        debug["gate_reasons"] = gate_reasons
+        debug["postprocessed"] = True
+
+        final_markdown = _eda_format_tldr_markdown(final_one_sentence, final_sections)
+        final_source = "llm_selected_repaired" if repaired else "llm_selected"
+        st.session_state["eda_summary_debug_v1"] = {**debug, "final_source": final_source}
+        _eda_record_checkpoint("eda.summary.final_source", src=final_source, used_fallback=False, gate_reasons=gate_reasons, one_sentence=final_one_sentence)
+        _eda_register_exec_result("summary_tldr", final_source, model=model)
+
+        if trace:
+            trace.update(status="success", output=final_markdown[:2000])
+        return final_markdown, st.session_state["eda_summary_debug_v1"]
+
+    except Exception as exc:
+        debug["error"] = str(exc)
+        debug["used_fallback"] = True
+        debug["gate_reasons"] = ["fallback: blad generacji lub parsowania"]
+        st.session_state["eda_summary_debug_v1"] = {**debug, "final_source": "fallback_deterministic_selected"}
+        _eda_record_checkpoint(
+            "eda.summary.final_source",
+            src="fallback_deterministic_selected",
+            used_fallback=True,
+            error=str(exc),
+            gate_reasons=debug["gate_reasons"],
+            one_sentence=final_one_sentence,
+        )
+        _eda_register_exec_result("summary_tldr", "fallback_deterministic_selected", model=model)
+        if trace:
+            trace.update(status="error", metadata={"error": str(exc)})
+        return fallback_markdown, st.session_state["eda_summary_debug_v1"]
+
+
+def _build_cluster_summaries(
+    df: pd.DataFrame,
+    cluster_col: str,
+    max_features: int = 8,
+    max_examples_per_cluster: int = 3,
+) -> dict[str, dict]:
+    if cluster_col not in df.columns:
+        return {}
+
+    work = df.copy()
+    work = work.dropna(subset=[cluster_col])
+    if work.empty:
+        return {}
+
+    max_rows = 5000
+    if len(work) > max_rows:
+        work = work.sample(max_rows, random_state=0)
+
+    work["_cluster_id"] = work[cluster_col].astype(str)
+
+    num_cols = [
+        c for c in work.select_dtypes(include="number").columns
+        if c not in (cluster_col, "_cluster_id")
+    ][:max_features]
+
+    cat_cols = [
+        c for c in work.select_dtypes(exclude="number").columns
+        if c not in (cluster_col, "_cluster_id")
+    ][:max_features]
+
+    global_means = work[num_cols].mean(numeric_only=True) if num_cols else pd.Series(dtype=float)
+    global_stds = work[num_cols].std(numeric_only=True) if num_cols else pd.Series(dtype=float)
+    cluster_summaries: dict[str, dict] = {}
+
+    for cid, grp in work.groupby("_cluster_id"):
+        size = int(len(grp))
+        share = float(size / len(work)) if len(work) > 0 else 0.0
+
+        summary: dict[str, Any] = {
+            "size": size,
+            "share": round(share, 4),
+            "numeric_features": {},
+            "categorical_features": {},
+            "examples": [],
+        }
+
+        for col in num_cols:
+            summary["numeric_features"][col] = {
+                "mean_cluster": float(grp[col].mean()),
+                "mean_global": float(global_means.get(col, np.nan)),
+                "std_global": float(global_stds.get(col, np.nan)),
+            }
+
+        for col in cat_cols:
+            vc = grp[col].astype(str).value_counts().head(3)
+            if vc.empty:
+                continue
+            total = int(vc.sum())
+            summary["categorical_features"][col] = [
+                {
+                    "value": str(v),
+                    "count": int(cnt),
+                    "share": float(cnt / total) if total > 0 else 0.0,
+                }
+                for v, cnt in vc.items()
+            ]
+
+        ex_cols = [cluster_col] + num_cols + cat_cols
+        ex_df = grp[ex_cols].head(max_examples_per_cluster)
+        summary["examples"] = ex_df.to_dict(orient="records")
+        cluster_summaries[str(cid)] = summary
+
+    return cluster_summaries
+
+
+def _eda_cluster_numeric_signals(summary: dict[str, Any], top_n: int = 2) -> list[dict[str, Any]]:
+    signals: list[dict[str, Any]] = []
+    for col, stats in (summary.get("numeric_features") or {}).items():
+        mean_cluster = float(stats.get("mean_cluster", np.nan))
+        mean_global = float(stats.get("mean_global", np.nan))
+        std_global = float(stats.get("std_global", np.nan))
+        if not np.isfinite(mean_cluster) or not np.isfinite(mean_global):
+            continue
+        delta = mean_cluster - mean_global
+        if np.isfinite(std_global) and std_global > 1e-9:
+            strength = abs(delta / std_global)
+        else:
+            strength = abs(delta)
+        direction = "wyzsza" if delta > 0 else "nizsza"
+        if strength >= 0.25:
+            signals.append(
+                {
+                    "col": str(col),
+                    "direction": direction,
+                    "strength": float(strength),
+                    "mean_cluster": mean_cluster,
+                    "mean_global": mean_global,
+                }
+            )
+    signals.sort(key=lambda x: x["strength"], reverse=True)
+    return signals[:top_n]
+
+
+def _eda_cluster_code_like_id(cid: str) -> bool:
+    cid = str(cid).strip()
+    if not cid:
+        return False
+    if cid.lower() in {"true", "false"}:
+        return True
+    if cid.isdigit():
+        return True
+    if len(cid) <= 3 and cid.upper() == cid:
+        return True
+    return False
+
+
+def _eda_force_factual_cluster_output(cluster_summaries: dict[str, dict], cluster_col: str) -> bool:
+    cids = [str(cid) for cid in cluster_summaries.keys()]
+    if not cids:
+        return False
+    if cluster_col == EDA_TEMP_CLUSTER_COL:
+        return True
+    if len(cids) > 20:
+        return True
+    code_like_share = sum(1 for cid in cids if _eda_cluster_code_like_id(cid)) / max(len(cids), 1)
+    return code_like_share >= 0.5
+
+
+def _deterministic_cluster_labels(cluster_summaries: dict[str, dict], object_label: str) -> dict[str, dict]:
+    label = (object_label or "obiekty").strip() or "obiekty"
+    out: dict[str, dict] = {}
+    for cid, summary in cluster_summaries.items():
+        cid_str = str(cid)
+        size = int(summary.get("size", 0))
+        share_pct = 100.0 * float(summary.get("share", 0.0))
+        numeric_signals = _eda_cluster_numeric_signals(summary, top_n=2)
+
+        dominant_cat = None
+        for col, items in (summary.get("categorical_features") or {}).items():
+            if items:
+                top = items[0]
+                dominant_cat = {
+                    "col": str(col),
+                    "value": str(top.get("value", "")),
+                    "share": 100.0 * float(top.get("share", 0.0)),
+                }
+                break
+
+        prefix = cid_str if cid_str.lower().startswith("roboczy segment") else f"Segment {cid_str}"
+        if numeric_signals:
+            main_signal = numeric_signals[0]
+            name = f"{prefix} — {main_signal['direction']} {main_signal['col']}"
+        elif dominant_cat:
+            name = f"{prefix} — dominuje {dominant_cat['col']}"
+        else:
+            name = prefix
+
+        name = name[:80].strip(" -")
+        short_label = prefix if len(prefix) <= 32 else prefix[:32]
+
+        desc_parts = [
+            f"Segment obejmuje ok. {size:,} rekordow ({share_pct:.1f}% analizowanej proby {label})."
+        ]
+        if numeric_signals:
+            metrics_txt = []
+            for signal in numeric_signals:
+                metrics_txt.append(
+                    f"{signal['direction']} srednia {signal['col']} "
+                    f"({signal['mean_cluster']:.3g} vs {signal['mean_global']:.3g})"
+                )
+            desc_parts.append("Na tle proby widac " + " oraz ".join(metrics_txt) + ".")
+        if dominant_cat:
+            desc_parts.append(
+                f"Wsrod cech kategorycznych dominuje {dominant_cat['col']}={dominant_cat['value']} "
+                f"({dominant_cat['share']:.0f}%)."
+            )
+
+        out[cid_str] = {
+            "name": name,
+            "short_label": short_label,
+            "description": " ".join(desc_parts),
+        }
+    return out
+
+
+def _eda_cluster_column_candidates(df: pd.DataFrame) -> list[str]:
+    if df is None or df.empty:
+        return []
+
+    nunique = df.nunique(dropna=True)
+    max_unique = min(100, max(12, int(np.sqrt(max(len(df), 1)) * 2)))
+    keyword_hits: list[str] = []
+    low_card_hits: list[str] = []
+
+    for col in df.columns:
+        series = df[col]
+        unique_n = int(nunique.get(col, 0))
+        if unique_n < 2:
+            continue
+        if pd.api.types.is_datetime64_any_dtype(series):
+            continue
+
+        logical = _infer_logical_type(series)
+        name_l = str(col).lower()
+        name_hit = any(tok in name_l for tok in [
+            "cluster", "segment", "segm", "klaster", "grupa", "group", "label", "class"
+        ])
+
+        if logical == "id_like" and not name_hit:
+            continue
+        if name_l.startswith("is_") and not name_hit:
+            continue
+
+        if name_hit:
+            keyword_hits.append(col)
+            continue
+
+        if unique_n <= max_unique and logical in {"categorical", "numeric"}:
+            low_card_hits.append(col)
+
+    ordered: list[str] = []
+    for col in keyword_hits + low_card_hits:
+        if col not in ordered:
+            ordered.append(col)
+    return ordered
+
+
+EDA_TEMP_CLUSTER_COL = "__eda_temp_cluster_auto"
+EDA_TEMP_CLUSTER_STATE_KEY = "eda_temp_cluster_state_v1"
+
+
+def _eda_temp_cluster_feature_candidates(df: pd.DataFrame, max_features: int = 6) -> list[str]:
+    if df is None or df.empty:
+        return []
+
+    ranked: list[tuple[float, str]] = []
+    for col in df.columns:
+        if col == EDA_TEMP_CLUSTER_COL:
+            continue
+
+        series = df[col]
+        if not pd.api.types.is_numeric_dtype(series):
+            continue
+        if pd.api.types.is_bool_dtype(series):
+            continue
+        if _infer_logical_type(series) != "numeric":
+            continue
+
+        name_l = str(col).lower()
+        if name_l.startswith("is_"):
+            continue
+
+        non_na = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if int(non_na.notna().sum()) < min(max(len(df) // 20, 25), len(df)):
+            continue
+
+        unique_n = int(non_na.nunique(dropna=True))
+        if unique_n < 4:
+            continue
+
+        q1 = float(non_na.quantile(0.25))
+        q3 = float(non_na.quantile(0.75))
+        iqr = q3 - q1
+        std = float(non_na.std(skipna=True))
+        score = float(max(abs(iqr), abs(std)))
+        if not np.isfinite(score) or score <= 0:
+            continue
+
+        ranked.append((score, col))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    ordered: list[str] = []
+    for _, col in ranked:
+        if col not in ordered:
+            ordered.append(col)
+    return ordered[:max_features]
+
+
+def _eda_prepare_temp_cluster_matrix(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+) -> tuple[np.ndarray, pd.Series, pd.Series]:
+    work = df[feature_cols].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    med = work.median(numeric_only=True)
+    work = work.fillna(med)
+
+    q1 = work.quantile(0.25, numeric_only=True)
+    q3 = work.quantile(0.75, numeric_only=True)
+    iqr = (q3 - q1).replace(0, np.nan)
+    std = work.std(numeric_only=True).replace(0, np.nan)
+    scale = iqr.fillna(std).fillna(1.0).replace(0, 1.0)
+
+    scaled = ((work - med) / scale).clip(-6, 6)
+    return scaled.to_numpy(dtype=float), med, scale
+
+
+def _eda_numpy_kmeans(
+    x: np.ndarray,
+    k: int,
+    random_state: int = 0,
+    max_iter: int = 30,
+) -> tuple[np.ndarray, np.ndarray]:
+    n_rows = int(x.shape[0])
+    if n_rows == 0:
+        raise ValueError("Brak rekordow do klasteryzacji.")
+
+    k = max(2, min(int(k), n_rows))
+    rng = np.random.default_rng(random_state)
+
+    first_idx = int(rng.integers(0, n_rows))
+    centers = [x[first_idx]]
+    dist_sq = np.sum((x - centers[0]) ** 2, axis=1)
+
+    for _ in range(1, k):
+        total = float(dist_sq.sum())
+        if not np.isfinite(total) or total <= 0:
+            idx = int(rng.integers(0, n_rows))
+        else:
+            probs = dist_sq / total
+            idx = int(rng.choice(n_rows, p=probs))
+        centers.append(x[idx])
+        dist_sq = np.minimum(dist_sq, np.sum((x - centers[-1]) ** 2, axis=1))
+
+    centers_arr = np.vstack(centers)
+    labels = np.zeros(n_rows, dtype=int)
+
+    for _ in range(max_iter):
+        d2 = np.sum((x[:, None, :] - centers_arr[None, :, :]) ** 2, axis=2)
+        new_labels = np.argmin(d2, axis=1).astype(int)
+
+        new_centers = []
+        for cid in range(k):
+            mask = new_labels == cid
+            if np.any(mask):
+                new_centers.append(x[mask].mean(axis=0))
+            else:
+                new_centers.append(x[int(rng.integers(0, n_rows))])
+        new_centers_arr = np.vstack(new_centers)
+
+        if np.array_equal(new_labels, labels) or np.allclose(new_centers_arr, centers_arr, atol=1e-4):
+            labels = new_labels
+            centers_arr = new_centers_arr
+            break
+
+        labels = new_labels
+        centers_arr = new_centers_arr
+
+    return labels, centers_arr
+
+
+def _eda_build_temp_clusters(
+    df: pd.DataFrame,
+    k: int = 4,
+    max_features: int = 6,
+    fit_sample_size: int = 5000,
+) -> dict[str, Any]:
+    feature_cols = _eda_temp_cluster_feature_candidates(df, max_features=max_features)
+    if len(feature_cols) < 2:
+        raise ValueError(
+            "Do utworzenia roboczych klastrow potrzebujemy przynajmniej 2 sensownych cech liczbowych."
+        )
+
+    x_all, _, _ = _eda_prepare_temp_cluster_matrix(df, feature_cols)
+    if x_all.shape[0] < 8:
+        raise ValueError("Za malo rekordow do zbudowania roboczych klastrow.")
+
+    rng = np.random.default_rng(0)
+    if len(x_all) > fit_sample_size:
+        fit_idx = np.sort(rng.choice(len(x_all), size=fit_sample_size, replace=False))
+        x_fit = x_all[fit_idx]
+    else:
+        fit_idx = np.arange(len(x_all))
+        x_fit = x_all
+
+    labels_fit, centers = _eda_numpy_kmeans(x_fit, k=k, random_state=0)
+
+    if len(x_all) != len(x_fit):
+        d2_all = np.sum((x_all[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+        labels_all = np.argmin(d2_all, axis=1).astype(int)
+    else:
+        labels_all = labels_fit
+
+    if len(np.unique(labels_all)) < 2:
+        score = x_all.mean(axis=1)
+        ranked = pd.Series(score).rank(method="first")
+        q = min(max(2, int(k)), int(ranked.nunique(dropna=True)))
+        if q < 2:
+            raise ValueError("Nie udalo sie utworzyc co najmniej 2 roznych klastrow roboczych.")
+        labels_all = pd.qcut(ranked, q=q, labels=False, duplicates="drop").astype(int).to_numpy()
+        centers = np.vstack([x_all[labels_all == cid].mean(axis=0) for cid in sorted(np.unique(labels_all))])
+
+    unique_labels = sorted(np.unique(labels_all).tolist())
+    centers_by_label = {
+        int(cid): centers[int(cid)] if int(cid) < len(centers) else x_all[labels_all == int(cid)].mean(axis=0)
+        for cid in unique_labels
+    }
+    order = sorted(unique_labels, key=lambda cid: float(np.nanmean(centers_by_label[cid])))
+    mapping = {old: idx + 1 for idx, old in enumerate(order)}
+    labels_pretty = [f"Roboczy segment {mapping[int(cid)]}" for cid in labels_all]
+
+    counts = pd.Series(labels_pretty).value_counts().sort_index()
+    return {
+        "col_name": EDA_TEMP_CLUSTER_COL,
+        "labels": labels_pretty,
+        "features_used": feature_cols,
+        "clusters_count": int(len(set(labels_pretty))),
+        "cluster_counts": {str(k): int(v) for k, v in counts.items()},
+        "fit_rows": int(len(x_fit)),
+        "n_rows": int(len(df)),
+    }
+
+
+def _eda_attach_temp_clusters_to_df(df: pd.DataFrame) -> pd.DataFrame:
+    state = st.session_state.get(EDA_TEMP_CLUSTER_STATE_KEY) or {}
+    if not state:
+        return df
+
+    df_key = _df_cache_fingerprint(df)
+    labels = state.get("labels")
+    col_name = str(state.get("col_name") or EDA_TEMP_CLUSTER_COL)
+
+    if state.get("df_key") != df_key:
+        return df
+    if not isinstance(labels, list) or len(labels) != len(df):
+        return df
+    if col_name in df.columns:
+        return df
+
+    out = df.copy()
+    out[col_name] = pd.Series(labels, index=out.index, dtype="object")
+    _eda_record_checkpoint(
+        "eda.cluster.temp.cache_hit",
+        cluster_col=col_name,
+        clusters_count=int(state.get("clusters_count", 0)),
+        features_used=state.get("features_used", []),
+    )
+    return out
+
+
+def _eda_create_temp_clusters_and_store(
+    df: pd.DataFrame,
+    k: int = 4,
+    max_features: int = 6,
+) -> dict[str, Any]:
+    df_key = _df_cache_fingerprint(df)
+    _eda_record_checkpoint("eda.cluster.temp.start", target_k=int(k), df_key=df_key)
+
+    result = _eda_build_temp_clusters(df, k=k, max_features=max_features)
+    state = {
+        "df_key": df_key,
+        **result,
+    }
+    st.session_state[EDA_TEMP_CLUSTER_STATE_KEY] = state
+    _eda_record_checkpoint(
+        "eda.cluster.temp.ready",
+        cluster_col=result["col_name"],
+        clusters_count=int(result["clusters_count"]),
+        features_used=result["features_used"],
+        fit_rows=int(result["fit_rows"]),
+    )
+    return state
 
 def _describe_clusters_with_llm(
     df: pd.DataFrame,
@@ -281,6 +1304,245 @@ def _describe_clusters_with_llm(
 
     return {}
 
+# Legacy implementation above is intentionally overridden below with
+# the gated/checkpointed version used for production evaluation.
+def _describe_clusters_with_llm(
+    df: pd.DataFrame,
+    cluster_col: str,
+    max_features: int = 8,
+    max_examples_per_cluster: int = 3,
+    model: str = "gpt-4o-mini",
+    object_label: str | None = None,
+) -> dict[str, dict]:
+    label = (object_label or "obiekty").strip()
+    if len(label) > 40:
+        label = "obiekty"
+
+    cluster_summaries = _build_cluster_summaries(
+        df,
+        cluster_col,
+        max_features=max_features,
+        max_examples_per_cluster=max_examples_per_cluster,
+    )
+    fallback_labels = _deterministic_cluster_labels(cluster_summaries, label)
+    render_key = str(("v1", cluster_col, label, len(cluster_summaries), model))
+
+    _eda_record_checkpoint(
+        "eda.cluster.start",
+        cluster_col=cluster_col,
+        object_label=label,
+        openai_model=model,
+        render_key=render_key,
+    )
+    _eda_record_checkpoint(
+        "eda.cluster.stats_payload",
+        cluster_col=cluster_col,
+        clusters_count=len(cluster_summaries),
+        stats_keys=list(cluster_summaries.keys()),
+    )
+
+    debug = {
+        "cluster_col": cluster_col,
+        "render_key": render_key,
+        "model": model,
+        "raw_text": None,
+        "gate_ok": False,
+        "gate_reasons": [],
+        "used_fallback": False,
+        "error": None,
+        "labels_count": len(cluster_summaries),
+    }
+
+    if not cluster_summaries:
+        debug.update(
+            {
+                "used_fallback": True,
+                "gate_reasons": ["cluster_col: brak danych do opisu klastrow"],
+                "final_source": "fallback_deterministic_selected",
+            }
+        )
+        st.session_state["eda_cluster_debug_v1"] = debug
+        _eda_record_checkpoint(
+            "eda.cluster.final_source",
+            src="fallback_deterministic_selected",
+            used_fallback=True,
+            gate_reasons=debug["gate_reasons"],
+        )
+        _eda_register_exec_result("cluster_labels", "fallback_deterministic_selected", model=model)
+        return fallback_labels
+
+    if not os.getenv("OPENAI_API_KEY"):
+        debug.update(
+            {
+                "used_fallback": True,
+                "gate_reasons": ["openai_api_key: brak klucza API"],
+                "final_source": "fallback_deterministic_selected",
+            }
+        )
+        st.session_state["eda_cluster_debug_v1"] = debug
+        _eda_record_checkpoint(
+            "eda.cluster.final_source",
+            src="fallback_deterministic_selected",
+            used_fallback=True,
+            gate_reasons=debug["gate_reasons"],
+        )
+        _eda_register_exec_result("cluster_labels", "fallback_deterministic_selected", model=model)
+        return fallback_labels
+
+    prompt = (
+        "Jestes doswiadczonym analitykiem danych.\n"
+        "Na podstawie krotkich statystyk klastrow przygotuj zwiezle, praktyczne nazwy i opisy segmentow.\n"
+        f"Opisuj segmenty takich {label}.\n\n"
+        "Dla kazdego klastra przygotuj:\n"
+        '  - "name": pelna, czytelna nazwa segmentu,\n'
+        '  - "short_label": bardzo krotka etykieta (2-4 slowa),\n'
+        '  - "description": 2-3 zdania opisu po polsku.\n\n'
+        "Zasady jakosci:\n"
+        "- Opisuj tylko to, co wynika bezposrednio z payloadu.\n"
+        "- Nie dopowiadaj motywacji, emocji, stylu zycia, geograficznych stereotypow ani przyczyn biznesowych,\n"
+        "  jesli nie sa jawnie obecne w danych.\n"
+        "- Nazwy i opisy kotwicz w wielkosci segmentu, dominujacych cechach kategorycznych\n"
+        "  i odchyleniach cech liczbowych wzgledem proby.\n"
+        "- Jesli cluster_id jest kodem, skrotem, liczba albo wartoscia techniczna, zachowaj go w nazwie\n"
+        "  i nie zamieniaj na nowa narracyjna etykiete.\n\n"
+        "Zwroc tylko jeden obiekt JSON o strukturze:\n"
+        "{\n"
+        '  "<cluster_id>": {"name": "...", "short_label": "...", "description": "..."}\n'
+        "}\n\n"
+        "Uzyj dokladnie tych samych kluczy cluster_id, ktore dostajesz w danych wejsciowych. "
+        "Nie zamieniaj ich na nowe numery ani skroty.\n\n"
+        "Nie dodawaj zadnych komentarzy poza JSON-em.\n\n"
+        "Oto dane klastrow:\n"
+    )
+    prompt += json.dumps(cluster_summaries, ensure_ascii=False, indent=2)
+
+    lf_client = get_lf_openai_client()
+
+    try:
+        if lf_client is not None:
+            resp = lf_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+        else:
+            client = _openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+
+        raw = (resp.choices[0].message.content or "").strip()
+        debug["raw_text"] = raw
+        parsed = _eda_parse_json_like(raw)
+
+        if isinstance(parsed, dict) and cluster_col == EDA_TEMP_CLUSTER_COL:
+            parsed_norm = dict(parsed)
+            for cid in fallback_labels.keys():
+                cid_str = str(cid)
+                cid_lower = cid_str.lower()
+                suffix = ""
+                if cid_lower.startswith("roboczy segment "):
+                    suffix = cid_str.split()[-1].strip()
+                candidate_keys = [suffix, f"segment {suffix}", f"roboczy segment {suffix}"] if suffix else []
+                if cid_str not in parsed_norm:
+                    for alt_key in candidate_keys:
+                        alt_val = parsed.get(alt_key)
+                        if isinstance(alt_val, dict):
+                            parsed_norm[cid_str] = alt_val
+                            break
+            parsed = parsed_norm
+
+        gate_reasons: list[str] = []
+        repaired = False
+        force_factual = _eda_force_factual_cluster_output(cluster_summaries, cluster_col)
+        factualized = False
+        final_labels: dict[str, dict] = {}
+
+        for cid, fallback in fallback_labels.items():
+            item = parsed.get(cid) if isinstance(parsed, dict) else None
+            if not isinstance(item, dict):
+                gate_reasons.append(f"{cid}: brak wpisu JSON")
+                final_labels[cid] = fallback
+                repaired = True
+                continue
+
+            name = _eda_norm_text(item.get("name"))
+            short_label = _eda_norm_text(item.get("short_label"))
+            description = _eda_norm_text(item.get("description"))
+            local_reasons = []
+
+            if len(name) < 3 or len(name) > 80:
+                local_reasons.append("name")
+            if len(short_label) < 3 or len(short_label.split()) > 4:
+                local_reasons.append("short_label")
+            if len(description) < 24 or len(description) > 320:
+                local_reasons.append("description")
+
+            if local_reasons:
+                gate_reasons.append(f"{cid}: niepoprawne pola ({', '.join(local_reasons)})")
+                final_labels[cid] = fallback
+                repaired = True
+                continue
+
+            out_name = name
+            out_short_label = short_label
+            out_description = fallback["description"]
+
+            if description != out_description:
+                factualized = True
+
+            if force_factual:
+                out_name = fallback["name"]
+                out_short_label = fallback["short_label"]
+                factualized = True
+
+            final_labels[cid] = {
+                "name": out_name,
+                "short_label": out_short_label,
+                "description": out_description,
+            }
+
+        debug["gate_ok"] = len(gate_reasons) == 0
+        debug["gate_reasons"] = gate_reasons
+        if factualized:
+            final_source = "llm_selected_repaired_factualized" if repaired else "llm_selected_factualized"
+        else:
+            final_source = "llm_selected_repaired" if repaired else "llm_selected"
+        debug["final_source"] = final_source
+        debug["factualized"] = factualized
+        debug["force_factual"] = force_factual
+        st.session_state["eda_cluster_debug_v1"] = debug
+        _eda_record_checkpoint(
+            "eda.cluster.final_source",
+            src=final_source,
+            used_fallback=False,
+            gate_reasons=gate_reasons,
+            labels_count=len(final_labels),
+            factualized=factualized,
+            force_factual=force_factual,
+        )
+        _eda_register_exec_result("cluster_labels", final_source, model=model, clusters=len(final_labels))
+        return final_labels
+
+    except Exception as exc:
+        debug["error"] = str(exc)
+        debug["used_fallback"] = True
+        debug["gate_reasons"] = ["fallback: blad generacji lub parsowania"]
+        debug["final_source"] = "fallback_deterministic_selected"
+        st.session_state["eda_cluster_debug_v1"] = debug
+        _eda_record_checkpoint(
+            "eda.cluster.final_source",
+            src="fallback_deterministic_selected",
+            used_fallback=True,
+            error=str(exc),
+            gate_reasons=debug["gate_reasons"],
+        )
+        _eda_register_exec_result("cluster_labels", "fallback_deterministic_selected", model=model, clusters=len(fallback_labels))
+        return fallback_labels
+
+
 # --- OpenAI TTS: listy wyboru ---
 # --- OpenAI: głosy podzielone wg płci (praktyczny podział) ---
 OPENAI_VOICES = {
@@ -332,7 +1594,7 @@ def _make_eda_summary_text(
 # =====================  UTILITIES  =======================
 
 def _load_latest_dataset() -> Tuple[pd.DataFrame | None, dict | None, str | None]:
-    """Wczytuje surowy zbiór z poprzedniego kroku."""
+    """Wczytuje zbiór z poprzedniego kroku (PARQUET only)."""
     latest_info = st.session_state.get("latest_artifacts")
     if latest_info is None:
         return None, None, (
@@ -340,17 +1602,29 @@ def _load_latest_dataset() -> Tuple[pd.DataFrame | None, dict | None, str | None
             "Przejdź do zakładki 'Analiza Danych' i kliknij "
             "'Przelicz teraz (pełny zbiór)'."
         )
-    csv_path = latest_info.get("csv_path")
-    if not csv_path or not os.path.exists(csv_path):
+
+    parquet_path = latest_info.get("parquet_path") or latest_info.get("csv_path")
+    if not parquet_path or not os.path.exists(parquet_path):
         return None, latest_info, (
-            f"Nie mogę znaleźć pliku z danymi: {csv_path!r}. "
+            f"Nie mogę znaleźć pliku z danymi: {parquet_path!r}. "
             "Najpierw przejdź do 'Analiza Danych' i kliknij "
             "'Przelicz teraz (pełny zbiór)'."
         )
+
+    path = Path(parquet_path)
     try:
-        df = pd.read_csv(csv_path)
+        size_mb = path.stat().st_size / (1024 * 1024)
+        # Smart preview for huge files to avoid hangs
+        preview_max = 500_000 if size_mb >= 500 else None
+        df = _df_from_parquet(path, max_rows=preview_max)
+        if preview_max:
+            st.caption(
+                f"⚡ PREVIEW MODE: wczytano pierwsze {len(df):,} wierszy "
+                f"z pliku ~{size_mb:,.0f} MB. Do analizy użyjemy próbki."
+            )
     except Exception as e:
-        return None, latest_info, f"Nie udało się wczytać CSV: {e}"
+        return None, latest_info, f"Nie udało się wczytać danych z PARQUET: {e}"
+
     return df, latest_info, None
 
 
@@ -809,6 +2083,131 @@ def _analyze_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     return info_df, high_null_cols
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage2 micro-profiler + lightweight cache utilities (v1)
+# NOTE: defined here (before correlation helpers) to avoid NameError.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _perf_start(label: str) -> float:
+    """Start timer for a Stage2 section."""
+    t0 = time.perf_counter()
+    try:
+        _PERF_LOGGER.info(f"[PERF] enter: {label}")
+    except Exception:
+        pass
+    return t0
+
+
+@contextmanager
+def perf_step(label: str):
+    """Context manager to micro-profile sub-steps."""
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        try:
+            dt = time.perf_counter() - t0
+            _PERF_LOGGER.info(f"[PERF] step:  {label} ({dt:.2f}s)")
+        except Exception:
+            pass
+
+
+def _df_cache_fingerprint(df: pd.DataFrame, sample_rows: int = 50) -> str:
+    """Fast(ish) fingerprint for caching expensive computations on the current DF sample."""
+    try:
+        cols = tuple(map(str, df.columns))
+        dtypes = tuple(map(str, df.dtypes.astype(str).values))
+        shape = tuple(df.shape)
+        head = df.head(sample_rows)
+        h = pd.util.hash_pandas_object(head, index=True).values
+        sample_hash = int(h.sum())
+        return f"{shape}|{hash(cols)}|{hash(dtypes)}|{sample_hash}"
+    except Exception:
+        try:
+            return f"{df.shape}|{hash(tuple(map(str, df.columns)))}|{hash(tuple(map(str, df.dtypes.astype(str).values)))}"
+        except Exception:
+            return "df"
+
+
+def stage2_cached(scope: str, key_parts: tuple, compute_fn):
+    """Very small in-session cache keyed by (scope, key_parts)."""
+    try:
+        cache = st.session_state.setdefault("_stage2_cache_v1", {})
+        k = (scope,) + tuple(key_parts)
+        if k in cache:
+            return cache[k]
+        val = compute_fn()
+        cache[k] = val
+        return val
+    except Exception:
+        return compute_fn()
+
+
+
+# ─────────────────────────────────────────────────────────────
+# Stage2 micro-profiler (collect timings -> UI table)
+
+STAGE2_PREP_TIMINGS_KEY = "stage2_prepare_timings_v1"
+
+from contextlib import contextmanager
+from time import perf_counter
+
+@contextmanager
+def perf_step_collect(step_name: str, bucket_key: str = STAGE2_PREP_TIMINGS_KEY):
+    start = perf_counter()
+    try:
+        yield
+    finally:
+        dt = perf_counter() - start
+        try:
+            st.session_state.setdefault(bucket_key, []).append({
+                "step": step_name,
+                "seconds": round(dt, 4),
+            })
+        except Exception:
+            # never fail the app because of profiler
+            pass
+        _PERF_LOGGER.info(f"[INFO] [PERF] step:  {step_name} ({dt:.2f}s)")
+
+
+
+@contextmanager
+def stage2_prepare_step(step_name: str):
+    """Alias for micro-profiler steps during 'Prepare data' pipeline."""
+    with perf_step_collect(step_name):
+        yield
+
+
+def stage2_prepare_timing_df():
+    """Return timings as a small DataFrame (never raises)."""
+    try:
+        import pandas as pd
+        rows = st.session_state.get(STAGE2_PREP_TIMINGS_KEY) or []
+        if not rows:
+            return pd.DataFrame(columns=["step", "seconds", "ms"])
+        df_t = pd.DataFrame(rows)
+        if "seconds" in df_t.columns:
+            df_t["ms"] = (df_t["seconds"] * 1000).round(0).astype(int)
+        return df_t
+    except Exception:
+        import pandas as pd
+        return pd.DataFrame(columns=["step", "seconds", "ms"])
+
+def render_stage2_prepare_timings():
+    rows = st.session_state.get(STAGE2_PREP_TIMINGS_KEY) or []
+    if not rows:
+        return
+    try:
+        import pandas as pd
+        df_t = pd.DataFrame(rows)
+        if not df_t.empty:
+            df_t["ms"] = (df_t["seconds"] * 1000).round(0).astype(int)
+            total = float(df_t["seconds"].sum())
+            st.caption(f"⏱️ Timingi ostatniego przygotowania: {total:.2f}s")
+            st_df_safe(df_t.sort_values("seconds", ascending=False), max_rows=50)
+    except Exception:
+        pass
 def _build_correlation_report(
     df: pd.DataFrame,
     info_df: pd.DataFrame,
@@ -820,15 +2219,21 @@ def _build_correlation_report(
     if len(numeric_cols) < 2:
         return None, [], []
 
-    corr_mat = df[numeric_cols].corr(method="pearson").fillna(0.0)
+    df_key = _df_cache_fingerprint(df)
+    corr_mat = stage2_cached("Stage2/7", (df_key, "corr_mat", tuple(numeric_cols)), lambda: df[numeric_cols].corr(method="pearson").fillna(0.0))
     if corr_mat.empty:
         return None, [], []
 
-    corr_melt = (
-        corr_mat.reset_index()
-        .melt("index", var_name="col2", value_name="corr")
-        .rename(columns={"index": "col1"})
-    )
+    with perf_step('Stage2/7.corr_melt'):
+        corr_melt = stage2_cached(
+            "Stage2/7",
+            (df_key, "corr_melt", tuple(numeric_cols)),
+            lambda: (
+                corr_mat.reset_index()
+                .melt("index", var_name="col2", value_name="corr")
+                .rename(columns={"index": "col1"})
+            ),
+        )
 
     heatmap = (
         alt.Chart(corr_melt)
@@ -1058,19 +2463,34 @@ def _numeric_distribution_details(s: pd.Series, col_name: str) -> Tuple[alt.VCon
         outlier_ratio = 0.0
     outliers_df = plot_df[plot_df["is_outlier"]]
 
+    # Widok osi X: nie kotwiczymy do 0, tylko do realnego zakresu danych.
+    # Dzięki temu kolumny liczbowe o dużej bazie (np. identyfikatory / numery dokumentów)
+    # nie "przyklejają się" do prawej strony wykresu.
+    span = max_v - min_v if np.isfinite(max_v) and np.isfinite(min_v) else 0.0
+    base_pad = max(span * 0.03, (iqr * 0.15 if np.isfinite(iqr) else 0.0), 1.0)
+    if np.isfinite(min_v) and min_v >= 0:
+        view_lo = max(0.0, min_v - min(base_pad, max(min_v * 0.10, 1.0)))
+    else:
+        view_lo = min_v - base_pad
+    view_hi = max_v + base_pad if np.isfinite(max_v) else max_v
+    if not (np.isfinite(view_lo) and np.isfinite(view_hi)) or view_hi <= view_lo:
+        view_lo, view_hi = min_v, max_v
+    x_scale = alt.Scale(domain=[float(view_lo), float(view_hi)], zero=False, nice=False)
+    x_axis = alt.Axis(labelOverlap=False, format=",.0f")
+
     # Wykresy: boxplot (z outlierami) + histogram
     box_base = (
         alt.Chart(plot_df)
         .mark_boxplot(color="#1f77b4", outliers={"color": "#dc3545"})
         .encode(
-            x=alt.X("value:Q", title=col_name),
+            x=alt.X("value:Q", title=col_name, scale=x_scale, axis=x_axis),
             y=alt.Y("label:N", title=""),
         )
     )
     outlier_layer = (
         alt.Chart(outliers_df)
         .mark_point(filled=True, size=50, color="#dc3545")
-        .encode(x=alt.X("value:Q", title=col_name), y=alt.Y("label:N", title=""))
+        .encode(x=alt.X("value:Q", title=col_name, scale=x_scale, axis=x_axis), y=alt.Y("label:N", title=""))
     )
     box_layer = (box_base + outlier_layer).properties(height=70)
 
@@ -1078,7 +2498,7 @@ def _numeric_distribution_details(s: pd.Series, col_name: str) -> Tuple[alt.VCon
         alt.Chart(plot_df)
         .mark_bar(color="#1f77b4")
         .encode(
-            x=alt.X("value:Q", bin=alt.Bin(maxbins=30), title=col_name),
+            x=alt.X("value:Q", bin=alt.Bin(maxbins=30), title=col_name, scale=x_scale, axis=x_axis),
             y=alt.Y("count():Q", title="Liczebność"),
             tooltip=[alt.Tooltip("count():Q", title="liczebność"), alt.Tooltip("value:Q", format=".2f")],
         )
@@ -1628,8 +3048,8 @@ def _save_summary_to_artifacts(text_markdown: str, latest_info: Dict[str, Any]) 
     """Zapisuje summary_ai.md obok artefaktów bieżącego runu i zwraca pełną ścieżkę."""
     run_dir = latest_info.get("run_dir")
     if not run_dir:
-        csv_path = latest_info.get("csv_path", ".")
-        run_dir = os.path.dirname(csv_path)
+        parquet_path = latest_info.get("parquet_path") or latest_info.get("csv_path") or "."
+        run_dir = os.path.dirname(parquet_path)
     os.makedirs(run_dir, exist_ok=True)
 
     path = os.path.join(run_dir, "summary_ai.md")
@@ -1647,26 +3067,42 @@ def _persist_artifacts(
     """Zapisuje gotowy zbiór + raport i aktualizuje session_state."""
     run_dir = latest_info.get("run_dir")
     if not run_dir:
-        csv_path = latest_info.get("csv_path", ".")
-        run_dir = os.path.dirname(csv_path)
+        parquet_path = latest_info.get("parquet_path") or latest_info.get("csv_path") or "."
+        run_dir = os.path.dirname(parquet_path)
     os.makedirs(run_dir, exist_ok=True)
 
-    ready_path = os.path.join(run_dir, "ready_for_training.csv")
+    ready_path = Path(run_dir) / "ready_for_training.parquet"
     report_path = os.path.join(run_dir, "prep_report.json")
 
-    df_ready.to_csv(ready_path, index=False, encoding="utf-8")
+    _df_to_parquet(df_ready, ready_path)
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(prep_report, f, ensure_ascii=False, indent=2)
 
     st.session_state["latest_artifacts"].update(
         {
-            "ready_csv_path": ready_path,
-            "prep_report_path": report_path,
+            # IMPORTANT: store as strings (safe for cache + JSON)
+            "ready_parquet_path": str(ready_path),
+            "stage2_ready_parquet_path": str(ready_path),
+            "prep_report_path": str(report_path),
             "n_rows_ready": prep_report["n_rows_final"],
             "n_cols_ready": prep_report["n_cols_final"],
             "status_ready": "ok",
+            "stage2_export_ts": datetime.utcnow().isoformat() + "Z",
+            "run_dir": str(Path(run_dir)),
+            "ingest_root": str(Path(run_dir).parent),
         }
     )
+
+    # Disk pointer for Stage 3 (works even after navigation / rerun)
+    try:
+        st.session_state["latest_handoff_path"] = _write_latest_handoff_pointer(
+            run_dir=Path(run_dir),
+            ready_parquet_path=ready_path,
+            prep_report_path=str(report_path),
+            datachat_handoff_path=st.session_state.get("datachat_handoff_path"),
+        )
+    except Exception:
+        pass
     st.session_state["prep_report"] = prep_report
     return ready_path, report_path
 
@@ -1733,6 +3169,7 @@ def _reset_sec7_state():
     st.session_state["latest_summary_text"] = ""
     st.session_state["prep_done_and_summarized"] = False
     st.session_state["play_tts_now"] = False
+    _eda_clear_debug_state()
 
     # 🔄 czyścimy cache wyników winsoryzacji (dla bezpieczeństwa przy zmianie zbioru)
     st.session_state.pop("winsor_cache", None)
@@ -1741,6 +3178,53 @@ def _reset_sec7_state():
 def reset_sec7_state():
     """Alias do _reset_sec7_state() – nie usuwać, bo używane w main()."""
     _reset_sec7_state()
+
+def _render_eda_debug_sidebar_exports(slots: dict[str, Any] | None) -> None:
+    if not slots:
+        return
+
+    exec_summary = st.session_state.get("eda_exec_summary_v1") or {}
+    summary_debug = st.session_state.get("eda_summary_debug_v1") or {}
+    cluster_debug = st.session_state.get("eda_cluster_debug_v1") or {}
+    full_log = st.session_state.get("eda_debug_log_v1") or []
+
+    exec_log = [row for row in full_log if str(row.get("where", "")).startswith("eda.exec.")]
+    summary_log = [row for row in full_log if str(row.get("where", "")).startswith("eda.summary.")]
+    cluster_log = [row for row in full_log if str(row.get("where", "")).startswith("eda.cluster.")]
+
+    with slots["plan95"].container():
+        st.caption("Automat EDA / Plan 9.5 - skopiuj ten JSON")
+        st.code(json.dumps(exec_summary, ensure_ascii=False), language="json")
+
+    with slots["exec"].container():
+        st.caption("Logi LLM / eda.exec.*")
+        st.code(json.dumps(exec_log, ensure_ascii=False), language="json")
+
+    with slots["summary"].container():
+        st.caption("Logi TL;DR / eda.summary.*")
+        st.code(json.dumps(summary_log, ensure_ascii=False), language="json")
+
+    with slots["cluster"].container():
+        st.caption("Logi cluster labels / eda.cluster.*")
+        st.code(json.dumps(cluster_log, ensure_ascii=False), language="json")
+
+    with slots["state"].container():
+        st.caption("LLM / gate debug")
+        st.code(
+            json.dumps(
+                {
+                    "summary_debug": summary_debug,
+                    "cluster_debug": cluster_debug,
+                },
+                ensure_ascii=False,
+            ),
+            language="json",
+        )
+
+    with slots["all"].container():
+        with st.expander("Pelne checkpointy Automat EDA (opcjonalnie)", expanded=False):
+            st.code(json.dumps(full_log, ensure_ascii=False), language="json")
+
 
 # ---------- UI helpers ----------
 
@@ -1818,7 +3302,7 @@ def _success_hero_box(hours_saved: float, cost_saved: float) -> str:
         bez ręcznego czyszczenia Excela i bez ryzyka pomyłki.
       </div>
       <div style="margin-top:0.75rem;">
-        Gotowy zbiór: <code>ready_for_training.csv</code> · Raport: <code>prep_report.json</code>.
+        Gotowy zbiór: <code>ready_for_training.parquet</code> · Raport: <code>prep_report.json</code>.
       </div>
     </div>
     """
@@ -2037,20 +3521,8 @@ def _run_tts_for_summary(
                     api_key=openai_key,
                 )
         else:
-            if not eleven_key:
-                err = "Brak ELEVENLABS_API_KEY w .env"
-            else:
-                ok, msg = _validate_eleven_voice_id(eleven_voice_id_selected or "", eleven_key)
-                if not ok:
-                    err = f"ElevenLabs voice_id niezweryfikowany: {msg}"
-                else:
-                    audio_bytes, err = _tts_eleven_cached(
-                        text_for_tts,
-                        voice_id=eleven_voice_id_selected,
-                        model=eleven_tts_model_selected,
-                        api_key=eleven_key,
-                    )
-
+            # ElevenLabs: wyłączone w Etapie 2 (pojawi się w Etapie 3 / Data Chat)
+            pass
         if audio_bytes:
             _autoplay_audio(audio_bytes, mime="audio/mpeg")
             st.session_state["tts_last_hash"] = cur_tts_hash
@@ -2170,157 +3642,140 @@ def _guess_outcome_group_value_cols(df: pd.DataFrame) -> tuple[str|None, str|Non
     value   = pick_by_name([c for c in num_cols if c not in {outcome, group}]) or (num_cols[0] if num_cols else None)
     return outcome, group, value
 
-def _save_datachat_handoff(
-    df_ready: pd.DataFrame,
-    latest_info: Dict[str, Any],
-    summary_text: str,
-    pairs_sorted: List[Dict[str, Any]],
-    prep_report_path: str,
+def _guess_cols_from_info_df(info_df: pd.DataFrame) -> Tuple[str | None, str | None, str | None]:
+    """Fast heuristics using precomputed per-column stats (no full-data scans)."""
+    try:
+        cols = info_df.copy()
+        cols["name_l"] = cols["kolumna"].astype(str).str.lower()
+        # Outcome (target) — prefer obvious labels
+        outcome = None
+        for pat in ["target", "y", "label", "churn", "outcome", "default", "fraud"]:
+            hit = cols.loc[cols["name_l"].str.contains(pat, na=False), "kolumna"]
+            if len(hit):
+                outcome = str(hit.iloc[0])
+                break
+
+        # Value — numeric with sales/value/amount/qty semantics
+        num = cols.loc[cols["logical_type"].isin(["num", "int", "float"]) | cols["dtype_raw"].astype(str).str.contains("int|float", case=False, na=False)]
+        value = None
+        for pat in ["value", "wart", "sales", "sprzed", "amount", "revenue", "price", "qty", "quantity", "wolumen"]:
+            hit = num.loc[num["name_l"].str.contains(pat, na=False), "kolumna"]
+            if len(hit):
+                value = str(hit.iloc[0]); break
+        if value is None and len(num):
+            value = str(num.iloc[0]["kolumna"])
+
+        # Group — categorical-like (low-ish cardinality)
+        cat = cols.loc[cols["logical_type"].isin(["cat", "date"]) == False]  # just to keep structure
+        # We treat object/category as group candidates
+        grp_cand = cols.loc[
+            cols["dtype_raw"].astype(str).str.contains("object|category", case=False, na=False)
+            & (cols["n_unique"].fillna(0).astype(float) >= 2)
+            & (cols["n_unique"].fillna(0).astype(float) <= 200)
+            & (cols["null_pct"].fillna(0).astype(float) <= 90)
+        ]
+        group = None
+        for pat in ["category", "kategoria", "country", "kraj", "segment", "brand", "produkt", "product", "customer", "klient"]:
+            hit = grp_cand.loc[grp_cand["name_l"].str.contains(pat, na=False), "kolumna"]
+            if len(hit):
+                group = str(hit.iloc[0]); break
+        if group is None and len(grp_cand):
+            group = str(grp_cand.iloc[0]["kolumna"])
+
+        return outcome, group, value
+    except Exception:
+        return None, None, None
+
+
+# ─────────────────────────────────────────────────────────────
+# Stage2 -> Stage3 handoff pointer (ingest/_latest_handoff.json)
+# ─────────────────────────────────────────────────────────────
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    """Atomic JSON write (avoid half-written files on rerun/crash)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(str(tmp), str(path))
+
+def _write_latest_handoff_pointer(
+    run_dir: Path,
+    ready_parquet_path: Path,
+    prep_report_path: str | None,
+    datachat_handoff_path: str | None,
 ) -> str:
-    """
-    Tworzy pakiet startowy dla etapu Data Chat i zapisuje go do JSON.
-    Zawiera: ścieżki, metadane, wybrane kolumny (outcome/group/value), wartość docelową,
-    oraz przykładową parę skorelowaną używaną w insightach.
-    """
-    # gdzie zapisać
-    run_dir = latest_info.get("run_dir") or os.path.dirname(latest_info.get("csv_path", ".")) or "."
-    os.makedirs(run_dir, exist_ok=True)
-    ready_csv_path = os.path.join(run_dir, "ready_for_training.csv")
-    handoff_path   = os.path.join(run_dir, "datachat_handoff.json")
-
-    # spróbuj domyślnie wytypować outcome/group/value z już przygotowanego zbioru
-    out_col, grp_col, val_col = _guess_outcome_group_value_cols(df_ready)
-
-    # bezpieczna wartość docelowa: '1' jeżeli jest w danych, inaczej tryb
-    import statistics
-    outcome_series = df_ready[out_col].astype(str) if out_col in df_ready.columns else pd.Series([], dtype=str)
-    unique_vals = sorted(outcome_series.dropna().unique().tolist())
-    if "1" in unique_vals:
-        target_val = "1"
-    else:
-        try:
-            target_val = str(statistics.mode(outcome_series.dropna().tolist())) if not outcome_series.empty else ""
-        except statistics.StatisticsError:
-            target_val = unique_vals[0] if unique_vals else ""
-
-    # przykład silnej korelacji używany w podsumowaniu
-    example_pair = next((p for p in pairs_sorted if abs(float(p.get("corr", 0))) >= 0.9), None)
-    example_pair = {
-        "col1": example_pair["col1"],
-        "col2": example_pair["col2"],
-        "r": float(example_pair["corr"])
-    } if example_pair else None
-
-    payload = {
+    """Write/overwrite ingest/_latest_handoff.json so Stage3 can always pick the newest Stage2 output."""
+    ingest_root = run_dir.parent
+    pointer_path = ingest_root / "_latest_handoff.json"
+    payload: Dict[str, Any] = {
         "version": 1,
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "ready_csv_path": ready_csv_path,
+        "run_dir": str(run_dir),
+        "ingest_root": str(ingest_root),
+        "ready_parquet_path": str(ready_parquet_path),
+        "prep_report_path": str(prep_report_path) if prep_report_path else None,
+        "datachat_handoff_path": str(datachat_handoff_path) if datachat_handoff_path else None,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+    }
+    try:
+        payload["ready_parquet_mtime"] = os.path.getmtime(str(ready_parquet_path))
+    except Exception:
+        payload["ready_parquet_mtime"] = None
+    _atomic_write_json(pointer_path, payload)
+    return str(pointer_path)
+
+
+def _save_datachat_handoff(
+    latest_info: dict,
+    summary_text: str,
+    pairs_sorted: List[Dict[str, Any]] | None,
+    prep_report_path: str | None,
+    info_df: pd.DataFrame | None = None,
+) -> str:
+    """Zapisuje minimalny handoff do Etapu 3 bez skanowania całego df_ready."""
+    parquet_src = latest_info.get("parquet_path") or latest_info.get("csv_path") or "."
+    run_dir = Path(os.path.dirname(parquet_src))
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    ready_parquet_path = run_dir / "ready_for_training.parquet"
+    handoff_path = run_dir / "datachat_handoff.json"
+
+    outcome_col = group_col = value_col = None
+    if info_df is not None and isinstance(info_df, pd.DataFrame) and not info_df.empty:
+        outcome_col, group_col, value_col = _guess_cols_from_info_df(info_df)
+
+    handoff = {
+        "version": 2,
+        "parquet_path_full": str(Path(parquet_src)),
+        "ready_parquet_path": str(ready_parquet_path),
+        "summary_text": summary_text,
+        "pairs_sorted": pairs_sorted or [],
         "prep_report_path": prep_report_path,
-        "n_rows": int(df_ready.shape[0]),
-        "n_cols": int(df_ready.shape[1]),
-        "columns": list(map(str, df_ready.columns)),
-        "selected": {
-            "outcome_col": out_col,
-            "group_col": grp_col,
-            "value_col": val_col,
-            "target_val": target_val,
+        "suggested_columns": {
+            "outcome_col": outcome_col,
+            "group_col": group_col,
+            "value_col": value_col,
         },
-        # Surowy tekst podsumowania — Data Chat może na jego podstawie dobrać pierwsze wykresy
-        "summary_text": (summary_text or "").strip(),
-        # Dodatkowe wskazówki do wstępnych wizualizacji
-        "hints": {
-            "example_high_corr_pair": example_pair,
-            "prefer_share_chart_for_groups": True,   # pierwszy wykres: udział outcome==target per grupa
-            "prefer_box_and_hist_for_value": True,   # drugi: box + histogram/KDE dla value
-        },
+        "created_at": datetime.utcnow().isoformat() + "Z",
     }
 
     with open(handoff_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+        json.dump(handoff, f, ensure_ascii=False, indent=2)
 
-    # dostęp z innych zakładek
-    st.session_state["datachat_handoff"] = payload
-    st.session_state["datachat_handoff_path"] = handoff_path
-    return handoff_path
+    st.session_state["datachat_handoff_path"] = str(handoff_path)
 
-# ============================================================
-#  HERO: KLASYFIKACJA – rozkład klas + ocena równowagi
-# ============================================================
-def _hero_classification_overview(
-    df: pd.DataFrame,
-    target: str | None,
-) -> None:
-    st.subheader("Rozkład klas (target)", divider="gray")
-    # minimalnie zmniejszamy odstęp pod tytułem
-    st.markdown("<div style='margin-top:-0.40rem'></div>", unsafe_allow_html=True)
-
-    if not target or target not in df.columns:
-        st.info(
-            "Najpierw wybierz kolumnę **celu (target)** w sekcji 1 / 2, "
-            "żeby zobaczyć rozkład klas."
+    # Update ingest/_latest_handoff.json as well (freshness-based handoff for Stage 3)
+    try:
+        st.session_state["latest_handoff_path"] = _write_latest_handoff_pointer(
+            run_dir=run_dir,
+            ready_parquet_path=ready_parquet_path,
+            prep_report_path=prep_report_path,
+            datachat_handoff_path=str(handoff_path),
         )
-        return
+    except Exception:
+        pass
 
-    s = df[target].copy()
-    s = s.fillna("(brak)")
+    return str(handoff_path)
 
-    counts = (
-        s.value_counts(dropna=False)
-        .rename_axis("class")
-        .reset_index(name="count")
-    )
-    total = int(counts["count"].sum()) or 1
-    counts["share"] = counts["count"] / total * 100.0
-
-    # największa klasa
-    idx_max = counts["count"].idxmax()
-    main_class = counts.loc[idx_max, "class"]
-    main_share = float(counts.loc[idx_max, "share"])
-
-    col_chart, col_panel = st.columns([4, 1.4])
-
-    # ----------------- LEWA STRONA – WYKRES -----------------
-    with col_chart:
-        chart = (
-            alt.Chart(counts)
-            .mark_bar()
-            .encode(
-                x=alt.X("class:N", title=target, axis=alt.Axis(labelAngle=0),), # poziome etykiety na osi X
-                y=alt.Y("count:Q", title="Liczba rekordów"),
-                tooltip=[
-                    alt.Tooltip("class:N", title="Klasa"),
-                    alt.Tooltip("count:Q", title="Liczba rekordów", format=","),
-                    alt.Tooltip("share:Q", title="Udział [%]", format=".1f"),
-                ],
-            )
-            .properties(height=380)
-        )
-        st.altair_chart(chart, use_container_width=True)
-
-    # ----------------- PRAWA STRONA – PANEL OCENY -----------------
-    with col_panel:
-        st.markdown("**Szybka ocena równowagi klas**")
-        st.write("Największa klasa:", f"`{main_class}`")
-        st.write("Udział:", f"{main_share:.1f}%")
-
-        if main_share >= 80:
-            st.warning(
-                "⚠ Dane są **silnie niezbalansowane** – model będzie wymagał "
-                "specjalnego traktowania (wagi klas, zaawansowany re-sampling)."
-            )
-        elif main_share >= 60:
-            st.info(
-                "⚠ Klasy są dość nierówne – rozważ wagi klas lub prostszy re-sampling."
-            )
-        else:
-            st.success(
-                "✅ Rozkład klas wygląda wstępnie akceptowalnie."
-            )
-
-
-# ============================================================
-#  HERO: SZEREG CZASOWY – podgląd serii + ocena
-# ============================================================
 def _hero_time_series_overview(
     df: pd.DataFrame,
     time_col: str | None,
@@ -2526,7 +3981,7 @@ def _hero_time_series_overview(
             .configure_axis(titlePadding=10, labelPadding=6)
             .configure_view(stroke=None)
         )
-        st.altair_chart(chart, use_container_width=True)
+        altair_chart_stretch(st, chart, width='stretch')
 
 
     # -------- prawa kolumna – karta z oceną + badge trendu -----------
@@ -2549,7 +4004,7 @@ def _hero_time_series_overview(
         if n_raw >= 100:
             st.success("✅ Seria ma wystarczająco dużo punktów do podstawowej analizy.")
         else:
-            st.warning("⚠ Seria ma mało punktów – wnioski mogą być niestabilne.")
+            st.warning("⚠️ Seria ma mało punktów – wnioski mogą być niestabilne.")
 
         if trend_text:
             st.markdown(
@@ -2582,6 +4037,64 @@ def _hero_time_series_overview(
 # ============================================================
 #  HERO: KLASTERYZACJA – przestrzeń cech
 # ============================================================
+
+
+def _hero_classification_overview(df: pd.DataFrame, y_col: str) -> None:
+    """Lightweight classification target sanity-check (fast, safe)."""
+    st.markdown("### Cel (klasyfikacja) — szybki sanity check")
+    if not y_col or y_col not in df.columns:
+        st.info("Wybierz kolumnę celu, aby zobaczyć rozkład klas.")
+        return
+
+    s = df[y_col]
+    n = int(len(s))
+    vc = s.value_counts(dropna=False)
+    nunique = int(vc.shape[0])
+    top_share = float(vc.iloc[0] / max(n, 1)) if n else 0.0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Liczba obserwacji", f"{n:,}".replace(",", " "))
+    c2.metric("Liczba klas", f"{nunique:,}".replace(",", " "))
+    c3.metric("Największa klasa", f"{top_share*100:.1f}%")
+
+    if nunique <= 1:
+        st.error("Kolumna celu ma tylko jedną klasę — nie da się trenować klasyfikacji.")
+        return
+
+    if top_share >= 0.9:
+        st.warning("Silna nierównowaga klas (≥90% w jednej klasie). Rozważ ważenie klas / resampling / inną metrykę.")
+    elif top_share >= 0.7:
+        st.info("Umiarkowana nierównowaga klas (≥70% w jednej klasie) — zweryfikuj metryki i strategię walidacji.")
+
+    # Show top classes (keep it light)
+    top_k = 20
+    vc_top = vc.head(top_k).reset_index()
+    vc_top.columns = [y_col, "count"]
+    vc_top[y_col] = vc_top[y_col].astype(str).replace({"nan": "(brak)"})
+
+    try:
+        import altair as alt
+        chart = (
+            alt.Chart(vc_top)
+            .mark_bar()
+            .encode(
+                x=alt.X("count:Q", title="Liczba"),
+                y=alt.Y(f"{y_col}:N", sort="-x", title="Klasa"),
+                tooltip=[alt.Tooltip(f"{y_col}:N", title="Klasa"), alt.Tooltip("count:Q", title="Liczba")],
+            )
+            .properties(height=420)
+        )
+        # Streamlit version compatibility: width='stretch' (new) vs use_container_width (old)
+        # Streamlit multipage: avoid importing via "app.*" ("app" isn't a package at runtime)
+        from core.ui_safe import altair_chart_stretch
+        altair_chart_stretch(st, chart)
+    except Exception:
+        # Streamlit multipage: avoid importing via "app.*" ("app" isn't a package at runtime)
+        from core.ui_safe import dataframe_stretch
+        dataframe_stretch(st, vc_top)
+
+    if nunique > top_k:
+        st.caption(f"Pokazano Top {top_k} klas z {nunique}.")
 def _hero_clustering_overview(df: pd.DataFrame, cluster_col: str | None) -> None:
     st.subheader("Przestrzeń cech do klasteryzacji", divider="gray")
     st.markdown("<div style='margin-top:-0.40rem'></div>", unsafe_allow_html=True)
@@ -2681,7 +4194,7 @@ def _hero_clustering_overview(df: pd.DataFrame, cluster_col: str | None) -> None
             .properties(height=320)
         )
 
-        st.altair_chart(chart, use_container_width=True)
+        altair_chart_stretch(st, chart, width='stretch')
 
     # -------- PRAWA: szybka ocena -----------------------
     with col_right:
@@ -2725,7 +4238,7 @@ def _hero_regression_overview(df: pd.DataFrame, target_col: str) -> None:
                 )
                 .properties(height=320)
             )
-            st.altair_chart(chart, use_container_width=True)
+            altair_chart_stretch(st, chart, width='stretch')
 
     # -------- prawa kolumna – karta z oceną -----------
     with col_right:
@@ -2749,13 +4262,17 @@ def _hero_regression_overview(df: pd.DataFrame, target_col: str) -> None:
             st.warning("⚠️ Rozkład jest lewoskośny – sprawdź, czy nie ma efektów obcięcia.")
 
 def main():
-    st.title("Automat EDA — szybka diagnostyka danych (Etap 2)")
+    # --- NAWIGACJA ---
+    hide_default_multipage_nav()
+    render_flow_nav(current_id="02_Automat_EDA")  # aktywny kafel Etapu 2
 
+    st.title("Automat EDA — szybka diagnostyka danych (Etap 2)")
     # Langfuse: identyfikator sesji użytkownika
     if "wf_session_id" not in st.session_state:
         st.session_state["wf_session_id"] = str(uuid4())
 
     lf = get_langfuse()
+    _eda_reset_run_debug_state()
 
     # --- FLASH MESSAGE po rerunie ---
     _flash = st.session_state.pop("_flash_msg", None)
@@ -2767,20 +4284,19 @@ def main():
             level = _flash.get("type", "info")  # "success" | "warning" | "error" | "info"
             getattr(st, level)(_flash.get("text", ""))
 
-
     st.markdown(
         """
-        Ten moduł automatycznie podsumowuje dane z kroku
+        Etap **2 z 4** - automatycznie podsumowuje dane z kroku
         **„Przelicz na całości i zapisz artefakty”** (zakładka **Analiza Danych**).
 
         **Co dostajesz:**\n
         • diagnozę jakości danych zanim zaczniesz trenować model,  
         • automatyczne czyszczenie (usunięcie śmieci, uzupełnienie braków, rozbicie dat, flagi outlierów),  
-        • gotowy zestaw ready_for_training.csv,  
+        • gotowy zestaw ready_for_training.parquet,  
         • możliwość przejścia do **Trenowanie Modelu** praktycznie bez ręcznej roboty.
         """
     )
-
+    st.subheader("", divider="gray")
 
     # ───────────────────────── SIDEBAR: Praca na próbce danych (szybsza EDA) ─────────────────────────
     with st.sidebar:
@@ -2818,8 +4334,8 @@ def main():
         st.markdown("---")
         st.checkbox("✅ Włącz lektora (TTS)", value=True, key="tts_enabled")
 
-        provider = st.radio("Dostawca TTS", ["OpenAI", "ElevenLabs"], index=0)
-
+        # Dostawca TTS: w Etapie 2 blokujemy wybór (zostawiamy OpenAI).
+        provider = 'OpenAI'
         gender = st.radio("Głos", ["Kobieta", "Mężczyzna"], horizontal=True, index=0)
 
         # Gdy użytkownik zmieni dostawcę lub głos – skasuj hash, by wymusić ponowny odczyt
@@ -2836,66 +4352,11 @@ def main():
                 default_voice = voice_pool[0]
             openai_voice_selected = st.selectbox("OpenAI voice", options=voice_pool,
                                                  index=voice_pool.index(default_voice))
-            if len(OPENAI_TTS_MODELS) > 1:
-                openai_tts_model_selected = st.selectbox("OpenAI TTS model", options=OPENAI_TTS_MODELS, index=0)
-            else:
-                openai_tts_model_selected = OPENAI_TTS_MODELS[0]
-                st.caption(f"OpenAI TTS model: **{openai_tts_model_selected}**")
-        else:
-            VOICE_FEMALE_ID = os.getenv("VOICE_FEMALE_ID", "").strip()
-            VOICE_MALE_ID   = os.getenv("VOICE_MALE_ID", "").strip()
-            api_key_el      = os.getenv("ELEVENLABS_API_KEY", "").strip()
-            voices = _eleven_list_voices_cached(api_key_el)
-            voice_map, female_keys, male_keys = {}, [], []
-            if voices:
-                for v in voices:
-                    vid = v.get("voice_id") or ""
-                    name = v.get("name") or "voice"
-                    lab = v.get("labels", {}) or {}
-                    g = (lab.get("gender") or "").lower()
-                    label = f"{name} · {vid[:6]}"
-                    voice_map[label] = vid
-                    (female_keys if g == "female" else male_keys if g == "male" else []).append(label)
-            if voice_map:
-                options = (female_keys or list(voice_map.keys())) if gender == "Kobieta" else (male_keys or list(voice_map.keys()))
-                default_vid = VOICE_FEMALE_ID if gender == "Kobieta" else VOICE_MALE_ID
-                try:
-                    default_label = next(k for k, v in voice_map.items() if v == default_vid)
-                except StopIteration:
-                    default_label = options[0]
-                idx = options.index(default_label) if default_label in options else 0
-                selected_label = st.selectbox("ElevenLabs voice", options=options, index=idx)
-                eleven_voice_id_selected = voice_map[selected_label]
-            else:
-                eleven_voice_id_selected = st.text_input(
-                    "ElevenLabs voice_id",
-                    value=(VOICE_FEMALE_ID if gender == "Kobieta" else VOICE_MALE_ID),
-                    help="Wklej voice_id z panelu ElevenLabs"
-                )
-                valid_voice, msg = _validate_eleven_voice_id(eleven_voice_id_selected, api_key_el)
-                if valid_voice:
-                    st.caption("✅ Głos zweryfikowany na Twoim koncie ElevenLabs.")
-                else:
-                    st.warning(f"⚠️ ElevenLabs voice_id niezweryfikowany: {msg}")
-            
-            models = _eleven_list_models_cached(api_key_el)
-            if models:
-                model_map = { (m.get("name") or m.get("model_id")): m.get("model_id") for m in models }
-                names = list(model_map.keys())
-                pref  = os.getenv("ELEVEN_TTS_MODEL", "eleven_multilingual_v2")
-                idx   = names.index(pref) if pref in names else 0
-                chosen = st.selectbox("ElevenLabs TTS model", options=names, index=idx)
-                eleven_tts_model_selected = model_map[chosen]
-            else:
-                eleven_tts_model_selected = st.text_input(
-                    "ElevenLabs TTS model",
-                    value=os.getenv("ELEVEN_TTS_MODEL", "eleven_multilingual_v2")
-                )
-                valid_voice, msg = _validate_eleven_voice_id(eleven_voice_id_selected, api_key_el)
-                if valid_voice:
-                    st.caption("✅ Głos zweryfikowany na Twoim koncie ElevenLabs.")
-                else:
-                    st.warning(f"⚠️ ElevenLabs voice_id niezweryfikowany: {msg}")
+
+    st.session_state["eda_debug_enabled"] = False
+    st.session_state["eda_debug_show_details"] = False
+    st.session_state["eda_debug_collect"] = False
+    eda_debug_slots = None
 
     # 0) Wczytanie danych
 
@@ -2927,6 +4388,7 @@ def main():
 
     # ➜ na potrzeby Sekcji 2–6 dorzuć warianty liczbowe (np. Czas_sec)
     df = _augment_numeric_derivatives_for_ui(df)
+    df = _eda_attach_temp_clusters_to_df(df)
 
     # -------------------------------------------------------------
     # CACHE core obliczeń per-dataset (żeby nie liczyć w kółko)
@@ -2943,11 +4405,13 @@ def main():
             # override'y
             "task_override", "target_override", "cluster_override",
             "task_override_radio", "target_override_select", "cluster_override_select",
+            "eda_cluster_col_override", "eda_cluster_col_override_manual",
             # cache core
             "_cached_df_aug", "_cached_roles",
             "_cached_df_aug_sig", "_cached_roles_sig",
             # cache sec1
             "_cached_sec1_sig", "_cached_sec1",
+            EDA_TEMP_CLUSTER_STATE_KEY,
         ]:
             st.session_state.pop(k, None)
 
@@ -3006,15 +4470,16 @@ def main():
     stats_sig = f"{core_sig}|rows={df.shape[0]}|cols={tuple(df.columns)}"
 
     if st.session_state.get("_cached_sec1_sig") != stats_sig:
-        global_missing_pct = _calc_global_missing_pct(df)
-        info_df, high_null_cols = _analyze_columns(df)
+        df_key = _df_cache_fingerprint(df)
+        global_missing_pct = stage2_cached('Stage2/global_missing_pct', (df_key,), lambda: _calc_global_missing_pct(df))
+        info_df, high_null_cols = stage2_cached('Stage2/analyze_columns', (df_key,), lambda: _analyze_columns(df))
 
         corr_chart, pairs_sorted, corr_drop_suggestions = _build_correlation_report(
             df, info_df, threshold=0.9
         )
         pairs_df_full = _pairs_dataframe(pairs_sorted)
 
-        dups_info = _detect_duplicates(df)
+        dups_info = stage2_cached('Stage2/duplicates', (df_key,), lambda: _detect_duplicates(df))
 
         st.session_state["_cached_sec1_sig"] = stats_sig
         st.session_state["_cached_sec1"] = dict(
@@ -3056,11 +4521,11 @@ def main():
 
     quality_flags = []
     if len(high_null_cols) > 0:
-        quality_flags.append("⚠ Występują kolumny z dużą liczbą braków (>30%).")
+        quality_flags.append("⚠️ Występują kolumny z dużą liczbą braków (>30%).")
     if duplicates_count > 0:
-        quality_flags.append(f"⚠ Znaleziono {duplicates_count} potencjalnych duplikatów ({duplicates_pct}%).")
+        quality_flags.append(f"⚠️ Znaleziono {duplicates_count} potencjalnych duplikatów ({duplicates_pct}%).")
     if len(auto_drop_candidates) > 0:
-        quality_flags.append("⚠ Część kolumn wygląda na zbędne / prawie puste / duplikujące sygnał.")
+        quality_flags.append("⚠️ Część kolumn wygląda na zbędne / prawie puste / duplikujące sygnał.")
     if not quality_flags:
         quality_flags.append("✅ Dane wyglądają stabilnie. Możesz praktycznie od razu przejść do trenowania modelu.")
 
@@ -3242,7 +4707,7 @@ def main():
                     )
 
                     chosen_task = st.radio(
-                        label="",
+                        label="Wybór",
                         options=task_options,
                         index=active_task_index,
                         key="task_override_radio",
@@ -3270,7 +4735,7 @@ def main():
                     )
 
                     chosen_target = st.selectbox(
-                        label="",
+                        label="Wybór",
                         options=target_options,
                         index=target_options.index(active_target) if active_target in target_options else 0,
                         key="target_override_select",
@@ -3315,6 +4780,15 @@ def main():
     target_col = roles.get("target")
     time_col = roles.get("time_col")
     cluster_col = roles.get("cluster_col")
+    if task == "clustering":
+        cluster_col_candidates = _eda_cluster_column_candidates(df)
+        cluster_override = st.session_state.get("eda_cluster_col_override")
+        if cluster_override in cluster_col_candidates:
+            cluster_col = cluster_override
+        elif cluster_col not in cluster_col_candidates and cluster_col_candidates:
+            cluster_col = cluster_col_candidates[0]
+        roles["cluster_col"] = cluster_col
+        st.session_state["eda_roles"] = roles
 
     # ---------- HERO: w zależności od typu zadania ----------
     if task == "classification" and target_col and target_col in df.columns:
@@ -3332,10 +4806,10 @@ def main():
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Pierwsze wiersze (head)", divider="gray")
-        st.dataframe(df.head(10), width="stretch", hide_index=True)
+        st_df_safe(_df_preview_for_ui(df, max_rows=10), width="stretch", hide_index=True)
     with c2:
         st.subheader("Ostatnie wiersze (tail)", divider="gray")
-        st.dataframe(df.tail(10), width="stretch", hide_index=True)
+        st_df_safe(_df_preview_for_ui(df.tail(10), max_rows=10), width="stretch", hide_index=True)
 
 
     # 3) Jakość kolumn
@@ -3387,7 +4861,7 @@ def main():
         df_show_sorted = df_show.sort_values("kolumna")
         df_vis = df_show_sorted.rename(columns=header_map)
 
-        st.dataframe(
+        st_df_safe(
             df_vis.style.format({header_map["null_pct"]: "{:.1f}"}),
             width="stretch",
             hide_index=True,
@@ -3413,7 +4887,7 @@ def main():
             )
             .properties(height=320, title="Braki danych w kolumnach (% braków)")
         )
-        st.altair_chart(bar_missing, use_container_width=True)
+        altair_chart_stretch(st, bar_missing, width='stretch')
 
         legend_html = """
         <div style="margin-top:.5rem;">
@@ -3443,6 +4917,7 @@ def main():
             "Zajmiemy się nimi automatycznie w kroku 7, żeby model nie uczył się śmieci.")
 
     # 4) Analiza wybranej kolumny
+    t4 = _perf('Stage2/4')
     st.header("4. Analiza wybranej kolumny")
     st.caption("Zbadaj konkretną kolumnę: rozkład, odstające wartości, dominujące kategorie, pokrycie TOP segmentów.")
 
@@ -3463,6 +4938,26 @@ def main():
         s_col_raw = df[col_to_plot]
         s_col = s_col_raw.copy()
 
+        _non_null_cnt = int(s_col_raw.notna().sum())
+        _nunique_sel = int(s_col_raw.nunique(dropna=True)) if _non_null_cnt else 0
+        _uniq_ratio_sel = (_nunique_sel / max(_non_null_cnt, 1)) if _non_null_cnt else 0.0
+        _is_integer_like_numeric = False
+        if pd.api.types.is_numeric_dtype(s_col_raw):
+            try:
+                _sample_num = pd.to_numeric(s_col_raw, errors="coerce").dropna().head(5000)
+                if not _sample_num.empty:
+                    _is_integer_like_numeric = float((_sample_num - _sample_num.round()).abs().max()) < 1e-9
+            except Exception:
+                _is_integer_like_numeric = False
+        _id_like_numeric = bool(pd.api.types.is_numeric_dtype(s_col_raw) and _is_integer_like_numeric and _uniq_ratio_sel > 0.9)
+
+        if (col_to_plot in auto_drop_candidates) or _id_like_numeric:
+            st.warning(
+                f"Kolumna **{col_to_plot}** wygląda jak identyfikator lub pole techniczne. "
+                "Wykres jest poprawny, ale jego wartość diagnostyczna dla modelu bywa ograniczona. "
+                "Takie kolumny zwykle traktujemy jako kandydatów do usunięcia albo wyłączenia z trenowania."
+            )
+
         # jeśli nie jest numeryczna, spróbuj z naszych parserów specjalnych
         if not pd.api.types.is_numeric_dtype(s_col):
             try_coerced = _coerce_to_numeric_special(s_col)
@@ -3477,10 +4972,10 @@ def main():
             )
             cc1, cc2 = st.columns([2, 1])
             with cc1:
-                st.altair_chart(combo_chart, use_container_width=True)
+                altair_chart_stretch(st, combo_chart, width='stretch')
             with cc2:
                 st.subheader("Metryki kolumny", divider="gray")
-                st.dataframe(stats_table, hide_index=True, use_container_width=True)
+                st_df_safe(stats_table, hide_index=True, width='stretch')
 
             outlier_ratio = details.get("outlier_ratio_pct", 0.0)
             if outlier_ratio > 5.0:
@@ -3556,7 +5051,7 @@ def main():
                     )
 
                     chart_scatter = (base + rolling + loess).properties(height=340)
-                    st.altair_chart(chart_scatter, use_container_width=True)
+                    altair_chart_stretch(st, chart_scatter, width='stretch')
 
                     # ─── korelacje ───
                     spearman = float(df_num["feature"].corr(df_num["target"], method="spearman"))
@@ -4207,7 +5702,7 @@ def main():
                             .configure_axis(titlePadding=10, labelPadding=6)
                             .configure_view(stroke=None)
                         )
-                        st.altair_chart(chart, use_container_width=True)
+                        altair_chart_stretch(st, chart, width='stretch')
 
                         # expander MAKSYMALNIE blisko wykresu
                         # (zmniejszamy odstęp dodawany przez Streamlit POD wykresem Altair)
@@ -4347,11 +5842,11 @@ def main():
 
                 c1, c2 = st.columns([2, 1])
                 with c1:
-                    st.altair_chart(cat_top_chart, use_container_width=True)
-                    st.altair_chart(cat_cov_chart, use_container_width=True)
+                    altair_chart_stretch(st, cat_top_chart, width='stretch')
+                    altair_chart_stretch(st, cat_cov_chart, width='stretch')
                 with c2:
                     st.subheader("Metryki kategorii", divider="gray")
-                    st.dataframe(cat_top_df, hide_index=True, use_container_width=True)
+                    st_df_safe(cat_top_df, hide_index=True, width='stretch')
 
                 if cat_comment:
                     st.info(cat_comment)
@@ -4538,7 +6033,7 @@ def main():
                                 alt.Tooltip("n:Q", title="n", format=","),
                                 alt.Tooltip("mean:Q", title="Średnia", format=".3g"),
                                 alt.Tooltip("median:Q", title="Mediana", format=".3g"),
-                                alt.Tooltip("delta_%:Q", title="Δ vs global [%]", format=".1f"),
+                                alt.Tooltip("delta_%:Q", title="Î” vs global [%]", format=".1f"),
                             ],
                         )
 
@@ -4552,7 +6047,7 @@ def main():
                         chart_imp = alt.layer(bars, err).properties(height=h)
 
                     with colL:
-                        st.altair_chart(chart_imp, use_container_width=True)
+                        altair_chart_stretch(st, chart_imp, width='stretch')
 
                     with colR:
                         st.subheader("Statystyki targetu w kategoriach", divider="gray")
@@ -4563,15 +6058,15 @@ def main():
                                 "median": "mediana",
                                 "std": "odch.std.",
                                 "trim_mean5": "trim_mean(5%)",
-                                "delta_%": "Δ vs global [%]",
+                                "delta_%": "Î” vs global [%]",
                             }
                         )
-                        st.dataframe(
+                        st_df_safe(
                             show_df[
-                                ["kategoria", "n", "średnia", "mediana", "odch.std.", "iqr", "trim_mean(5%)", "Δ vs global [%]"]
+                                ["kategoria", "n", "średnia", "mediana", "odch.std.", "iqr", "trim_mean(5%)", "Î” vs global [%]"]
                             ],
                             hide_index=True,
-                            use_container_width=True,
+                            width='stretch',
                         )
 
                     # --- tekst pod wykresem w 2 kontenerach (UX / Gestalt) ---
@@ -4580,10 +6075,10 @@ def main():
                         top2 = show_df.head(2)
                         bot2 = show_df.tail(2)
                         top_txt = ", ".join(
-                            [f"{r.kategoria} (Δ {r['Δ vs global [%]']:+.1f}%)" for _, r in top2.iterrows()]
+                            [f"{r.kategoria} (Î” {r['Î” vs global [%]']:+.1f}%)" for _, r in top2.iterrows()]
                         )
                         bot_txt = ", ".join(
-                            [f"{r.kategoria} (Δ {r['Δ vs global [%]']:+.1f}%)" for _, r in bot2.iterrows()]
+                            [f"{r.kategoria} (Î” {r['Î” vs global [%]']:+.1f}%)" for _, r in bot2.iterrows()]
                         )
                     except Exception:
                         pass
@@ -4682,10 +6177,10 @@ def main():
                                 "Średnie targetu dla nich mogą być niestabilne."
                             )
                             st.caption("Najrzadsze kategorie:")
-                            st.dataframe(
+                            st_df_safe(
                                 weak_cats.head(10).rename("liczebność").reset_index().rename(columns={"index":"kategoria"}),
                                 hide_index=True,
-                                use_container_width=True,
+                                width='stretch',
                             )
 
                         # --- rekomendacja kodowania ---
@@ -4775,7 +6270,7 @@ def main():
                         )
                         .properties(height=260)
                     )
-                    st.altair_chart(chart_overlay, use_container_width=True)
+                    altair_chart_stretch(st, chart_overlay, width='stretch')
 
                     means = df_cls.groupby("class")["feature"].mean()
                     overall_std = float(df_cls["feature"].std() or 0.0)
@@ -4838,7 +6333,7 @@ def main():
                         col_cls_chart, col_cls_panel = st.columns([4, 1.6])
 
                         with col_cls_chart:
-                            st.altair_chart(chart_cat, use_container_width=True)
+                            altair_chart_stretch(st, chart_cat, width='stretch')
 
                         # Wskaźnik „czystości” kategorii – jak bardzo kategorie są jednorodne klasowo
                         pivot = (
@@ -4948,6 +6443,109 @@ def main():
 
 
     # ───────────────────── TRYB KLASTERYZACJI: profil wybranego klastra ─────────────────────
+    if task == "clustering":
+        active_df_key = _df_cache_fingerprint(df)
+        temp_cluster_state = st.session_state.get(EDA_TEMP_CLUSTER_STATE_KEY) or {}
+        temp_cluster_active = (
+            temp_cluster_state.get("df_key") == active_df_key
+            and str(temp_cluster_state.get("col_name") or "") in df.columns
+        )
+
+        cluster_col_candidates = _eda_cluster_column_candidates(df)
+        if cluster_col and cluster_col in df.columns and cluster_col not in cluster_col_candidates:
+            cluster_col_candidates = [cluster_col] + cluster_col_candidates
+
+        if cluster_col_candidates:
+            if cluster_col in cluster_col_candidates:
+                _cluster_idx = cluster_col_candidates.index(cluster_col)
+            else:
+                _cluster_idx = 0
+            cluster_col = st.selectbox(
+                "Kolumna z etykieta klastra / segmentu:",
+                options=cluster_col_candidates,
+                index=_cluster_idx,
+                key="eda_cluster_col_override",
+                help="Wybierz kolumne, ktora identyfikuje klaster lub segment, aby pokazac profil klastra i wygenerowac nazwy AI.",
+            )
+            roles["cluster_col"] = cluster_col
+            st.session_state["eda_roles"] = roles
+        else:
+            manual_cluster_candidates = [
+                c for c in df.columns
+                if not pd.api.types.is_datetime64_any_dtype(df[c])
+                and _infer_logical_type(df[c]) != "id_like"
+                and not str(c).lower().startswith("is_")
+            ]
+            manual_options = ["(wybierz recznie)"] + manual_cluster_candidates
+            selected_manual_cluster = st.selectbox(
+                "Kolumna z etykieta klastra / segmentu:",
+                options=manual_options,
+                index=0,
+                key="eda_cluster_col_override_manual",
+                help="Nie znalezlismy oczywistej kolumny klastra. Wybierz recznie kolumne, ktora identyfikuje segment.",
+            )
+
+            if selected_manual_cluster != "(wybierz recznie)":
+                cluster_col = selected_manual_cluster
+                roles["cluster_col"] = cluster_col
+                st.session_state["eda_roles"] = roles
+                st.warning(
+                    "Kolumna klastra nie zostala rozpoznana automatycznie. Uzywamy wyboru recznego."
+                )
+            else:
+                _eda_record_checkpoint(
+                    "eda.cluster.unavailable",
+                    reason="no_cluster_column_candidates",
+                )
+                st.info(
+                    "Nie znalezlismy w danych oczywistej kolumny wygladajacej na etykiete klastra lub segmentu. "
+                    "Mozesz wskazac taka kolumne recznie albo utworzyc robocze klastry automatycznie."
+                )
+
+                st.markdown("**Opcja awaryjna: robocze klastry automatyczne**")
+                st.caption(
+                    "Gdy w danych nie ma gotowej etykiety segmentu, zbudujemy tymczasowe klastry z najsensowniejszych cech liczbowych."
+                )
+                temp_k = st.slider(
+                    "Liczba roboczych klastrow",
+                    min_value=2,
+                    max_value=6,
+                    value=int(st.session_state.get("eda_temp_cluster_k", 4)),
+                    key="eda_temp_cluster_k",
+                )
+                temp_run = st.button(
+                    "🧪 Utworz robocze klastry automatycznie",
+                    key="btn_auto_temp_clusters",
+                    width="stretch",
+                    type="primary",
+                )
+                if temp_run:
+                    try:
+                        state = _eda_create_temp_clusters_and_store(df, k=int(temp_k), max_features=6)
+                        cluster_col = str(state.get("col_name") or EDA_TEMP_CLUSTER_COL)
+                        roles["cluster_col"] = cluster_col
+                        st.session_state["eda_roles"] = roles
+                        st.session_state["eda_cluster_col_override"] = cluster_col
+                        st.session_state.pop("eda_cluster_col_override_manual", None)
+                        st.success(
+                            f"Utworzylismy {int(state.get('clusters_count', 0))} robocze klastry "
+                            f"na podstawie cech: {', '.join(state.get('features_used', [])[:4])}."
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        _eda_record_checkpoint("eda.cluster.temp.error", error=str(exc))
+                        st.warning(f"Nie udalo sie utworzyc roboczych klastrow: {exc}")
+
+        if temp_cluster_active and cluster_col == str(temp_cluster_state.get("col_name")):
+            features_used = list(temp_cluster_state.get("features_used") or [])
+            preview = ", ".join(features_used[:4])
+            if len(features_used) > 4:
+                preview += ", ..."
+            st.info(
+                f"Uzywamy roboczych klastrow automatycznych ({int(temp_cluster_state.get('clusters_count', 0))} segmenty). "
+                f"Do ich zbudowania wykorzystano: {preview}."
+            )
+
     if task == "clustering" and cluster_col and cluster_col in df.columns:
         st.subheader("Profil wybranego klastra", divider="gray")
 
@@ -5027,7 +6625,7 @@ def main():
 
                 col_chart, col_panel = st.columns([4, 1.6])
                 with col_chart:
-                    st.altair_chart(chart_profile, use_container_width=True)
+                    altair_chart_stretch(st, chart_profile, width='stretch')
 
                 # TOP 5 cech opisanych słownie – w panelu po prawej
                 top5 = top_df.head(5)
@@ -5035,7 +6633,7 @@ def main():
                 for _, row in top5.iterrows():
                     sign = "wyższy" if row["diff"] > 0 else "niższy"
                     bullets.append(
-                        f"- **{row['feature']}**: {sign} niż średnio (Δ ≈ {row['diff']:.3g})."
+                        f"- **{row['feature']}**: {sign} niż średnio (Î” ≈ {row['diff']:.3g})."
                     )
 
                 with col_panel:
@@ -5086,7 +6684,7 @@ def main():
         col_k1, col_k2, _ = st.columns([1, 1, 2])
 
         with col_k1:
-            # Krok 1 + mała ikonka ? w kółku (styl jak help w Streamlit)
+            # Krok 1 + mała ikonka info w kółku (styl jak help w Streamlit)
             st.markdown(
                 '''
                 <div style="font-weight:600; margin-bottom:2px; display:flex; align-items:center; gap:4px;">
@@ -5106,7 +6704,7 @@ def main():
                             color: rgba(0,0,0,0.6);
                             background-color: rgba(0,0,0,0.02);
                         ">
-                        ?
+                        i
                     </span>
                 </div>
                 ''',
@@ -5114,7 +6712,7 @@ def main():
             )
 
             object_label = st.text_input(
-                "",
+                "Nazwa obiektow",
                 value=st.session_state.get("cluster_object_label_input", ""),
                 placeholder="Tu wpisz nazwę np. Klienci",
                 key="cluster_object_label_input",
@@ -5130,7 +6728,14 @@ def main():
             run_ai = st.button(
                 "🤖 Wygeneruj nazwy klastrów",
                 key="btn_ai_cluster_labels",
-                use_container_width=True,
+                width='stretch',
+                type="primary",
+            )
+        if not run_ai and not st.session_state.get(state_key):
+            _eda_record_checkpoint(
+                "eda.cluster.skipped",
+                cluster_col=cluster_col,
+                reason="button_not_clicked",
             )
 
         # Wywołanie AI po kliknięciu
@@ -5146,6 +6751,7 @@ def main():
                     if labels:
                         st.session_state[state_key] = labels
                         st.session_state["cluster_object_label"] = selected_label
+                        st.session_state[f"{state_key}__debug"] = st.session_state.get("eda_cluster_debug_v1") or {}
                     else:
                         st.warning(
                             "Nie udało się wygenerować nazw klastrów "
@@ -5157,6 +6763,22 @@ def main():
         # Odczyt aktualnych etykiet z sesji – JEDNA tabela
         labels = st.session_state.get(state_key) or {}
         if labels:
+            cluster_debug = st.session_state.get(f"{state_key}__debug") or st.session_state.get("eda_cluster_debug_v1") or {}
+            if cluster_debug:
+                st.session_state["eda_cluster_debug_v1"] = cluster_debug
+                _eda_record_checkpoint(
+                    "eda.cluster.cache_hit",
+                    render_key=cluster_debug.get("render_key"),
+                    final_source=cluster_debug.get("final_source"),
+                )
+                _eda_register_exec_result(
+                    "cluster_labels",
+                    str(cluster_debug.get("final_source") or "fallback_deterministic_selected"),
+                    model=cluster_debug.get("model"),
+                    clusters=len(labels),
+                )
+                if cluster_debug.get("used_fallback"):
+                    st.warning("AI nie spelnilo wymagan gate dla nazw klastrow; pokazuje wersje naprawiona lub deterministyczna.")
             rows = []
             for cid in sorted(labels.keys(), key=str):
                 info = labels.get(cid) or {}
@@ -5169,10 +6791,10 @@ def main():
                     }
                 )
 
-            st.dataframe(
+            st_df_safe(
                 pd.DataFrame(rows),
                 hide_index=True,
-                use_container_width=True,
+                width='stretch',
             )
             st.caption(
                 "To są pomocnicze nazwy nadane przez AI – możesz je później "
@@ -5180,6 +6802,9 @@ def main():
             )
 
     # 5) Korelacje i redundancje
+    t5 = _perf('Stage2/5')
+    _perf_end('Stage2/4', t4)
+
     st.header("5. Korelacje i redundancje")
     st.caption("Heatmapa ogólna, podgląd pary i rekomendacja eliminacji redundantnej kolumny.")
 
@@ -5187,7 +6812,7 @@ def main():
     with top_left:
         st.subheader("Mapa korelacji (numeryczne ↔ numeryczne)", divider="gray")
         if corr_chart is not None:
-            st.altair_chart(corr_chart, use_container_width=True)
+            altair_chart_stretch(st, corr_chart, width='stretch')
             st.caption("Każdy kwadrat to siła związku. Czerwone / ciemnoniebieskie pola = bardzo mocny związek.")
         else:
             st.info("Za mało kolumn numerycznych, żeby policzyć korelacje.")
@@ -5203,7 +6828,7 @@ def main():
 
             sel_row = pairs_df_full.iloc[picked_idx]
             pair_chart = _scatter_with_trend(df, sel_row["col1"], sel_row["col2"], height=220)
-            st.altair_chart(pair_chart, use_container_width=True)
+            altair_chart_stretch(st, pair_chart, width='stretch')
             st.markdown(f"**Co to znaczy?**  \n• **{sel_row['col1']}** i **{sel_row['col2']}** są mocno powiązane (r={sel_row['corr']:.2f}).  \n"
                         f"• Najbezpieczniej wyłączyć: **{sel_row['suggest_drop']}** (więcej braków / wtórna).")
         else:
@@ -5280,9 +6905,9 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                 )  # ⟵ usuwa szczelinę pod tabelą
 
                 tbl = high_corr_df[["col1", "col2", "abs_r", "suggest_drop"]].rename(columns=col_map)
-                st.dataframe(
+                st_df_safe(
                     tbl.style.format({col_map["abs_r"]: "{:.4f}"}),
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                     height=needed_px,
                 )
@@ -5344,16 +6969,16 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
             )
 
             totals_layer = alt.layer(totals_bars, totals_labels).properties(padding={"right": 46})
-            st.altair_chart(totals_layer, use_container_width=True)
+            altair_chart_stretch(st, totals_layer, width='stretch')
 
-            # „Chip” Δ tuż pod wykresem, po prawej stronie
+            # „Chip” Î” tuż pod wykresem, po prawej stronie
             delta = abs(total1 - total2)
             worse = totals_df.sort_values("łączny_score", ascending=False).iloc[0]["kolumna"]
             cL, cR = st.columns([1, 1.0])
             with cR:
                 st.markdown(
                     f"<div style='display:inline-block;padding:.28rem .6rem;border-radius:.6rem;"
-                    f"background:#e8f2ff;color:#0b57d0;font-weight:600;float:right;'>Δ = {delta:.3f} · gorsza: {worse}</div>",
+                    f"background:#e8f2ff;color:#0b57d0;font-weight:600;float:right;'>Î” = {delta:.3f} · gorsza: {worse}</div>",
                     unsafe_allow_html=True
                 )
             st.write("")  # drobny odstęp pod chipem
@@ -5387,7 +7012,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                 max_k = max(1, len(factor_order_all))
                 # domyślnie pokazuj wszystkie 7 (lub ile jest)
                 default_k = max_k
-                top_k = st.slider("Pokaż Top-K czynników (wg różnicy) — posortowano wg |Δ|",
+                top_k = st.slider("Pokaż Top-K czynników (wg różnicy) — posortowano wg |Î”|",
                                 min_value=1, max_value=max_k, value=default_k)
             with col_right:
                 show_pct = st.checkbox("Pokaż czynniki w %", value=False, help="Normalizacja per czynnik")
@@ -5419,38 +7044,44 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                 plot_df["wartość"] = plot_df["kontrybucja"]
                 y_title, y_fmt = "Kontrybucja czynnika do łącznego score’u", ".3f"
 
-            # sam wykres
+            # sam wykres – bez xOffset (Twoja wersja Altaira go nie obsługuje)
             grouped_bars = (
                 alt.Chart(plot_df)
                 .mark_bar(size=30)
                 .encode(
-                    x=alt.X("czynnik:N", title=None,
-                            axis=alt.Axis(labelAngle=0, labelLimit=320, labelOverlap=False)),
-                    xOffset=alt.XOffset("kolumna:N"),
+                    x=alt.X(
+                        "czynnik:N",
+                        title=None,
+                        axis=alt.Axis(labelAngle=0, labelLimit=320, labelOverlap=False),
+                    ),
                     y=alt.Y("wartość:Q", title=y_title, axis=alt.Axis(format=y_fmt)),
-                    color=alt.Color("kolumna:N", legend=None,
-                                    scale=alt.Scale(domain=[c1, c2], range=["#1f77b4", "#ff7f0e"])),
+                    color=alt.Color(
+                        "kolumna:N",
+                        legend=None,
+                        scale=alt.Scale(domain=[c1, c2], range=["#1f77b4", "#ff7f0e"]),
+                    ),
                     tooltip=[
                         alt.Tooltip("czynnik:N", title="czynnik"),
                         alt.Tooltip("kolumna:N", title="kolumna"),
                         alt.Tooltip("wartość:Q", title="wartość", format=y_fmt),
                     ],
                 )
-                .properties(height=360)   # + więcej wysokości
+                .properties(height=360)
             )
 
-            # etykiety na szczytach: bez bolda, większa czcionka, czarne
+            # etykiety na szczytach: bez bolda, większa czcionka, czarne – też bez xOffset
             grouped_labels = (
                 alt.Chart(plot_df)
                 .mark_text(dy=-6, fontSize=13, color="black")
                 .encode(
                     x=alt.X("czynnik:N", sort=factor_keep, title=None),
-                    xOffset=alt.XOffset("kolumna:N"),
                     y=alt.Y("wartość:Q"),
                     detail="kolumna:N",
                     text=alt.Text("wartość:Q", format=y_fmt),
                 )
             )
+
+
 
             layers = [grouped_bars, grouped_labels]
             if show_pct:
@@ -5467,7 +7098,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                 .configure_scale(bandPaddingInner=0.25, bandPaddingOuter=0.2)  # trochę „powietrza” w osi X
                 .properties(padding={"left": 0, "right": 0, "top": 12, "bottom": 26})
             )
-            st.altair_chart(final_chart, use_container_width=True)
+            altair_chart_stretch(st, final_chart, width='stretch')
 
             # 4) Werdykt
             suggest_row = totals_df.sort_values("łączny_score", ascending=False).iloc[0]
@@ -5496,6 +7127,9 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
             st.caption("Brak par do analizy.")
 
     # 6) Anomalie globalne
+    t6 = _perf('Stage2/6')
+    _perf_end('Stage2/5', t5)
+
     st.header("6. Anomalie globalne: duplikaty i odstające wartości")
 
     # --- Przygotuj treść banerów, ale na razie nic nie wyświetlaj ---
@@ -5516,7 +7150,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if numeric_cols:
         st.subheader("Podgląd wartości odstających — wybierz kolumnę numeryczną:", divider="gray")
-        col_for_anomaly = st.selectbox("", options=numeric_cols, index=0)
+        col_for_anomaly = st.selectbox("Kolumna do analizy anomalii", options=numeric_cols, index=0, label_visibility="collapsed")
         temp_series = pd.to_numeric(df[col_for_anomaly], errors="coerce")
         temp_df = pd.DataFrame({"idx": np.arange(len(temp_series)), "value": temp_series}).dropna()
 
@@ -5600,7 +7234,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
             )
             colL, colM, colR = st.columns([0.3, 10, 3.0])
             with colM:
-                st.altair_chart(combined, use_container_width=False)
+                altair_chart_stretch(st, combined, width='content')
 
     # --- Po wykresach: najpierw informacja o duplikatach, potem info o outlierach ---
     if _dup_banner_kind == "ok":
@@ -5611,6 +7245,9 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
     st.info(_outliers_info_text)
 
     # 7) Przygotowanie danych do trenowania (z tabami TL;DR)
+    t7 = _perf('Stage2/7')
+    _perf_end('Stage2/6', t6)
+
     st.header("7. Przygotowanie danych do trenowania")
 
     # Delikatne zbicie odstępów tylko dla tej sekcji (bez hacków na DOM)
@@ -5706,16 +7343,8 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
 
                     st.session_state["latest_summary_text"] = summary_text
 
-                    # --- TTS w tym samym spinnerze ---
-                    if st.session_state.get("tts_enabled", True):
-                        _run_tts_for_summary(
-                            summary_text,
-                            provider,
-                            openai_tts_model_selected,
-                            openai_voice_selected,
-                            eleven_tts_model_selected,
-                            eleven_voice_id_selected,
-                        )
+                    # Audio odpalamy dopiero po finalnym gate/repair niżej,
+                    # żeby lektor czytał dokładnie ten tekst, który widzi użytkownik.
 
                     if trace:
                         trace.update(status="success", output=summary_text[:2000])
@@ -5739,6 +7368,52 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
         else:
             summary_text = st.session_state["latest_summary_text"]
 
+        current_summary_debug = st.session_state.get("eda_summary_debug_v1") or {}
+        if not current_summary_debug:
+            trace = lf.trace(
+                name="eda_tldr_gate",
+                user_id=st.session_state.get("wf_session_id", "anon"),
+                input="stage2_tldr_gate",
+                metadata={
+                    "source_name": source_name,
+                    "csv_path": csv_path,
+                    "n_rows": n_rows_raw,
+                    "n_cols": n_cols_raw,
+                    "model": openai_tldr_model,
+                    "module": "02_Automat_EDA",
+                    "mode": "post_gate_overlay",
+                },
+            ) if lf else None
+
+            summary_text, current_summary_debug = _eda_generate_tldr_markdown(
+                source_name=source_name,
+                readiness_score=readiness_score,
+                duplicates_count=duplicates_count,
+                duplicates_pct=duplicates_pct,
+                global_missing_pct=global_missing_pct,
+                auto_drop_candidates=auto_drop_candidates,
+                pairs_sorted=pairs_sorted,
+                n_rows_raw=n_rows_raw,
+                n_cols_raw=n_cols_raw,
+                model=openai_tldr_model,
+                trace=trace,
+            )
+            st.session_state["latest_summary_text"] = summary_text
+        else:
+            _eda_record_checkpoint(
+                "eda.summary.cache_hit",
+                render_key=current_summary_debug.get("render_key"),
+                final_source=current_summary_debug.get("final_source"),
+            )
+            _eda_register_exec_result(
+                "summary_tldr",
+                str(current_summary_debug.get("final_source") or "fallback_deterministic_selected"),
+                model=current_summary_debug.get("model"),
+            )
+
+        if current_summary_debug.get("used_fallback"):
+            st.warning("AI nie spelnilo wymagan gate dla TL;DR; pokazuje wersje deterministyczna.")
+
         # ── TL;DR: podgląd i edycja ─────────────────────────────────────────────
         st.subheader("Podsumowanie (AI)", divider="gray")
         tab_view, tab_edit = st.tabs(["📄 Podsumowanie", "✍️ Edytuj tekst i zapisz"])
@@ -5758,6 +7433,19 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                 )
                 if st.button("💾 Zapisz podsumowanie do artefaktów", type="primary"):
                     st.session_state["latest_summary_text"] = edited
+                    st.session_state["eda_summary_debug_v1"] = {
+                        "render_key": "manual_override",
+                        "model": None,
+                        "raw_text": None,
+                        "gate_ok": True,
+                        "gate_reasons": [],
+                        "used_fallback": False,
+                        "error": None,
+                        "postprocessed": False,
+                        "final_one_sentence": "",
+                        "final_source": "manual_override",
+                    }
+                    _eda_record_checkpoint("eda.summary.manual_override", final_source="manual_override")
                     saved_path = _save_summary_to_artifacts(edited, latest_info)
                     st.toast(f"Zapisano: {saved_path}", icon="✅")
                     st.rerun()
@@ -5816,517 +7504,519 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
             "🧱 uzupełnimy braki  \n"
             "🏷️ dodamy flagi `is_outlier_*` / winsoryzacja (opcjonalnie)  \n"
             "🧹 usuniemy duplikaty  \n"
-            "💾 zapiszemy `ready_for_training.csv` + `prep_report.json`  \n"
+            "💾 zapiszemy `ready_for_training.parquet` + `prep_report.json`  \n"
             "⚙️ zaktualizujemy artefakty"
         )
         
-        with st.form("eda_cleaning_form"):
-            st.write("### Ustawienia szybkiego czyszczenia")
-            remove_duplicates_user = st.checkbox("Usuń zduplikowane rekordy (zalecane)", value=True)
-            basic_col_drop_default = sorted(
-                set(auto_drop_candidates) | set(st.session_state.get("sec7_preselected_drop", set()))
-            )
-
-            # --- STATE: winsor verification ---
-            if "winsor_verify_ready" not in st.session_state:
-                st.session_state.winsor_verify_ready = False
-            if "winsor_verify_params" not in st.session_state:
-                st.session_state.winsor_verify_params = {}
-
-            # 🔓 Czy expander ma startować rozwinięty?
-            if "sec7_adv_expanded" not in st.session_state:
-                st.session_state.sec7_adv_expanded = False  # na wejściu do sekcji jest zamknięty
-
-            st.write("### Zaawansowane ustawienia (opcjonalnie)")
-            with st.expander(
-                "Pokaż / ukryj ustawienia zaawansowane",
-                expanded=st.session_state.get("sec7_adv_expanded", False),
-            ):
-
-                drop_cols_user = st.multiselect(
-                    "Kolumny do usunięcia:",
-                    options=list(df.columns),
-                    default=basic_col_drop_default,
+        with st.form("eda_cleaning_form", border=False):
+            with st.container(border=True):
+                st.write("### Ustawienia szybkiego czyszczenia")
+                remove_duplicates_user = st.checkbox("Usuń zduplikowane rekordy (zalecane)", value=True)
+                basic_col_drop_default = sorted(
+                    set(auto_drop_candidates) | set(st.session_state.get("sec7_preselected_drop", set()))
                 )
-                numeric_cols_for_winsor = df.select_dtypes(include=[np.number]).columns.tolist()
-                winsorize_cols_user = st.multiselect(
-                    "Kolumny do przycięcia (winsoryzacja):",
-                    options=numeric_cols_for_winsor,
-                    default=[],
-                    key="adv_wins_cols",           # <<— TEN KEY jest ważny
-                    help="Podaj kolumny, które chcesz przyciąć (winsoryzacja).",
-                )
-
-                # ✅ JEDYNY przycisk weryfikacji winsoryzacji – widoczny od razu
-                go = st.form_submit_button(
-                    "🔎 Uruchom / odśwież weryfikację winsoryzacji",
-                    type="secondary",                # szary (bezpieczny); chcesz „blade czerwone”? patrz sekcja 3 (opcjonalny CSS)
-                    use_container_width=False,
-                    key="wins_verify_btn",
-                    help="Policz metryki i pokaż wizualizacje ‘przed vs po’ dla wybranej kolumny."
-                )
-                # jeśli użytkownik kliknął przycisk – od tej pory expander ma być zawsze rozwinięty
-                if go:
-                    st.session_state.sec7_adv_expanded = True
-
-                # === WERYFIKACJA WINSORYZACJI — KONTYNUACJA SEKCJI „Ustawienia szybkiego czyszczenia” ===
-                DF = locals().get("df_clean", locals().get("df", None))
-                if DF is None:
-                    st.warning("Nie znaleziono ramki danych DF (df / df_clean). Upewnij się, że zmienna z danymi istnieje.")
-                else:
-                    # pierwszy wybrany element z multiselecta „adv_wins_cols”
-                    # próbujemy kilku możliwych nazw key, żeby nie polegać na jednej konkretnej
-                    _possible_keys = [
-                        "adv_wins_cols",          # moja propozycja
-                        "wins_cols_to_clip",      # częsty wariant
-                        "wins_cols",              # inny wariant
-                        "winsorize_cols",         # inny wariant
-                        "wins_cols_preview"       # bywa i tak
-                    ]
-                    _selected_list = []
-                    for _k in _possible_keys:
-                        if _k in st.session_state and st.session_state[_k]:
-                            _selected_list = st.session_state[_k]
-                            break
-
-                    _selected = None
-                    if isinstance(_selected_list, (list, tuple)) and len(_selected_list) > 0:
-                        _selected = _selected_list[0]
-                    elif isinstance(_selected_list, str) and _selected_list:
-                        _selected = _selected_list
-
-                    # ——— Helpers (jedna, zwięzła wersja) ———
-                    def _to_num(s: pd.Series) -> pd.Series:
-                        return pd.to_numeric(s, errors="coerce")
-
-                    def compute_iqr_fences(s: pd.Series, k: float = 1.5):
-                        s = _to_num(s).dropna()
-                        if s.empty:
-                            return np.nan, np.nan, s
-                        q1, q3 = s.quantile(0.25), s.quantile(0.75)
-                        iqr = q3 - q1
-                        return float(q1 - k * iqr), float(q3 + k * iqr), s
-
-                    def winsorize_series(s: pd.Series, lower: float, upper: float) -> pd.Series:
-                        return _to_num(s).clip(lower=lower, upper=upper)
-
-                    def mini_stats(s: pd.Series) -> dict:
-                        s = _to_num(s).dropna()
-                        if s.empty:
-                            return {"liczebność (n)": 0, "min": np.nan, "Q1": np.nan, "mediana": np.nan,
-                                    "Q3": np.nan, "max": np.nan, "średnia": np.nan, "odch.std.": np.nan, "IQR": np.nan}
-                        d = s.describe(percentiles=[.25, .5, .75])
-                        return {
-                            "liczebność (n)": int(s.size),
-                            "min": float(d["min"]),
-                            "Q1": float(d["25%"]),
-                            "mediana": float(d["50%"]),
-                            "Q3": float(d["75%"]),
-                            "max": float(d["max"]),
-                            "średnia": float(d["mean"]),
-                            "odch.std.": float(d["std"]),
-                            "IQR": float(d["75%"] - d["25%"]),
-                        }
-
-                    # ——— UI: POKAZUJEMY dopiero, gdy wybrano kolumnę ———
-                    if _selected:
-                        # Sterowanie bez żadnych KPI nad nim
-                        c1, c2 = st.columns([1, 1])
-                        with c1:
-                            viz_mode = st.radio(
-                                "Tryb wizualizacji",
-                                ["Histogram", "ECDF"],
-                                index=0,
-                                horizontal=True,
-                                key="wins_viz_mode_qc",
-                                help="ECDF = Empiryczna Dystrybuanta Skumulowana. Oś Y w [0,1]; dobrze pokazuje ‘ściśnięcie’ ogonów."
-                            )
-                        with c2:
-                            k_iqr = st.slider(
-                                "K (Tukey/IQR)", 1.0, 3.0,
-                                float(st.session_state.get("wins_k_iqr_qc", 1.5)),
-                                0.1, key="wins_k_iqr_qc",
-                                help="K=1.5 (klasyczny Tukey). Większe K = łagodniejsze cięcie. Użyj większego K przy ciężkoogonowych rozkładach."
-                            )
-
-                        # Cała logika i rysunki – TYLKO po kliknięciu (nie ma "luźnych" KPI nad sterowaniem)
-                        if go:
-                            col = _selected
-
-                            # 1) brak kolumny -> tylko komunikat
-                            if not col:
-                                st.warning("Najpierw wybierz kolumnę do winsoryzacji.")
-                            else:
-                                # 2) inicjalizacja cache'a, jeśli jeszcze go nie ma
-                                if "winsor_cache" not in st.session_state:
-                                    st.session_state["winsor_cache"] = {}
-
-                                cache = st.session_state["winsor_cache"]
-
-                                # 3) klucz cache: (nazwa kolumny, K zaokrąglone do 3 miejsc)
-                                k_key = round(float(k_iqr), 3)
-                                cache_key = (col, k_key)
-
-                                # 4) jeśli mamy w cache – używamy, inaczej liczymy i zapisujemy
-                                if cache_key in cache:
-                                    data = cache[cache_key]
-                                    lower = data["lower"]
-                                    upper = data["upper"]
-                                    before = data["before"]
-                                    after = data["after"]
-                                else:
-                                    lower, upper, before = compute_iqr_fences(DF[col], k=k_iqr)
-                                    after = winsorize_series(DF[col], lower, upper)
-
-                                    cache[cache_key] = {
-                                        "lower": lower,
-                                        "upper": upper,
-                                        "before": before,
-                                        "after":  after,
-                                    }
-
-                                # 5) unikalna baza kluczy – zależy od kolumny i K (Tukey/IQR)
-                                chart_key_base = f"wins_{col}_{float(k_iqr):.2f}"
-
-                                # 6) liczebność = liczba NIE-NaN (spójnie z mini_stats / tabelą)
-                                before_num = before                    # 'before' ma już dropna()
-                                n_before = int(before_num.size)
-
-                                after_num = _to_num(after).dropna()
-                                n_after  = int(after_num.size)
-
-                                # 7) outliery PRZED – poniżej L lub powyżej U
-                                below = int((before_num < lower).sum())
-                                above = int((before_num > upper).sum())
-                                out_before = below + above
-
-                                # 8) outliery PO – teoretycznie powinny być ≈ 0, ale liczmy „na wszelki wypadek”
-                                out_after = int(((after_num < lower) | (after_num > upper)).sum())
-
-                                pct_below = 100.0 * below / n_before if n_before else 0.0
-                                pct_above = 100.0 * above / n_before if n_before else 0.0
-                                pct_total = pct_below + pct_above
-
-                                # 9) KPI w „kartach” (cyferki na górze)
-                                kcol = st.columns(6)
-                                with kcol[0]:
-                                    st.markdown(
-                                        f"<div style='border:1px solid #ddd;border-radius:6px;padding:8px'>"
-                                        f"<div style='font-size:12px;color:#666'>n przed &rarr; po</div>"
-                                        f"<div style='font-size:18px;font-weight:600'>{n_before:,} &rarr; {n_after:,}</div>"
-                                        f"<div style='font-size:11px;color:#888'>liczba obserwacji</div></div>",
-                                        unsafe_allow_html=True,
-                                    )
-                                with kcol[1]:
-                                    st.markdown(
-                                        f"<div style='border:1px solid #ddd;border-radius:6px;padding:8px'>"
-                                        f"<div style='font-size:12px;color:#666'>n odstające przed &rarr; po</div>"
-                                        f"<div style='font-size:18px;font-weight:600'>{out_before:,} &rarr; {out_after:,}</div>"
-                                        f"<div style='font-size:11px;color:#888'>liczba wartości odstających ogółem</div></div>",
-                                        unsafe_allow_html=True,
-                                    )
-                                with kcol[2]:
-                                    st.markdown(
-                                        f"<div style='border:1px solid #ddd;border-radius:6px;padding:8px'>"
-                                        f"<div style='font-size:12px;color:#666'>% &lt; lower</div>"
-                                        f"<div style='font-size:18px;font-weight:600'>{pct_below:.2f}%</div>"
-                                        f"<div style='font-size:11px;color:#888'>odsetek lewy ogon</div></div>",
-                                        unsafe_allow_html=True,
-                                    )
-                                with kcol[3]:
-                                    st.markdown(
-                                        f"<div style='border:1px solid #ddd;border-radius:6px;padding:8px'>"
-                                        f"<div style='font-size:12px;color:#666'>% &gt; upper</div>"
-                                        f"<div style='font-size:18px;font-weight:600'>{pct_above:.2f}%</div>"
-                                        f"<div style='font-size:11px;color:#888'>odsetek prawy ogon</div></div>",
-                                        unsafe_allow_html=True,
-                                    )
-                                with kcol[4]:
-                                    st.markdown(
-                                        f"<div style='border:1px solid #ddd;border-radius:6px;padding:8px'>"
-                                        f"<div style='font-size:12px;color:#666'>% łącznie</div>"
-                                        f"<div style='font-size:18px;font-weight:600'>{pct_total:.2f}%</div>"
-                                        f"<div style='font-size:11px;color:#888'>lewy+prawy</div></div>",
-                                        unsafe_allow_html=True,
-                                    )
-                                with kcol[5]:
-                                    st.markdown(
-                                        f"<div style='border:1px solid #ddd;border-radius:6px;padding:8px' "
-                                        f"title='L = Q1 - K·IQR, U = Q3 + K·IQR; IQR = Q3 - Q1; K ustawiasz suwakiem „K (Tukey/IQR)”.'>"
-                                        f"<div style='font-size:12px;color:#666'>Progi [L, U]</div>"
-                                        f"<div style='font-size:18px;font-weight:600'>[{lower:.2f}, {upper:.2f}]</div>"
-                                        f"<div style='font-size:11px;color:#888'>granice winsoryzacji</div></div>",
-                                        unsafe_allow_html=True,
-                                    )
-
-                                # mały odstęp pod KPI
-                                st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
-                                
-                            # =========================
-                            #  HISTOGRAM: słupki OBOK SIEBIE (Altair v5)
-                            # =========================
-                            base_vals = before.dropna()
-
-                            # 🔍 Pusta / degenerowana kolumna:
-                            # - same NaN po konwersji
-                            # - albo jedna unikalna wartość (brak wariancji)
-                            if base_vals.empty or base_vals.nunique() <= 1:
-                                st.info(
-                                    "Kolumna nie ma wariancji / brak danych liczbowych "
-                                    "(same NaN lub jedna unikalna wartość) – nie można narysować wykresów."
+    
+                # --- STATE: winsor verification ---
+                if "winsor_verify_ready" not in st.session_state:
+                    st.session_state.winsor_verify_ready = False
+                if "winsor_verify_params" not in st.session_state:
+                    st.session_state.winsor_verify_params = {}
+    
+                # 🔓 Czy expander ma startować rozwinięty?
+                if "sec7_adv_expanded" not in st.session_state:
+                    st.session_state.sec7_adv_expanded = False  # na wejściu do sekcji jest zamknięty
+    
+                st.write("### Zaawansowane ustawienia (opcjonalnie)")
+                with st.expander(
+                    "Pokaż / ukryj ustawienia zaawansowane",
+                    expanded=st.session_state.get("sec7_adv_expanded", False),
+                ):
+    
+                    drop_cols_user = st.multiselect(
+                        "Kolumny do usunięcia:",
+                        options=list(df.columns),
+                        default=basic_col_drop_default,
+                    )
+                    numeric_cols_for_winsor = df.select_dtypes(include=[np.number]).columns.tolist()
+                    winsorize_cols_user = st.multiselect(
+                        "Kolumny do przycięcia (winsoryzacja):",
+                        options=numeric_cols_for_winsor,
+                        default=[],
+                        key="adv_wins_cols",           # <<— TEN KEY jest ważny
+                        help="Podaj kolumny, które chcesz przyciąć (winsoryzacja).",
+                    )
+    
+                    # ✅ JEDYNY przycisk weryfikacji winsoryzacji – widoczny od razu
+                    go = st.form_submit_button(
+                        "🔎 Uruchom / odśwież weryfikację winsoryzacji",
+                        type="secondary",                # szary (bezpieczny); chcesz „blade czerwone”? patrz sekcja 3 (opcjonalny CSS)
+                        width='content',
+                        key="wins_verify_btn",
+                        help="Policz metryki i pokaż wizualizacje ‘przed vs po’ dla wybranej kolumny."
+                    )
+                    # jeśli użytkownik kliknął przycisk – od tej pory expander ma być zawsze rozwinięty
+                    if go:
+                        st.session_state.sec7_adv_expanded = True
+    
+                    # === WERYFIKACJA WINSORYZACJI — KONTYNUACJA SEKCJI „Ustawienia szybkiego czyszczenia” ===
+                    DF = locals().get("df_clean", locals().get("df", None))
+                    if DF is None:
+                        st.warning("Nie znaleziono ramki danych DF (df / df_clean). Upewnij się, że zmienna z danymi istnieje.")
+                    else:
+                        # pierwszy wybrany element z multiselecta „adv_wins_cols”
+                        # próbujemy kilku możliwych nazw key, żeby nie polegać na jednej konkretnej
+                        _possible_keys = [
+                            "adv_wins_cols",          # moja propozycja
+                            "wins_cols_to_clip",      # częsty wariant
+                            "wins_cols",              # inny wariant
+                            "winsorize_cols",         # inny wariant
+                            "wins_cols_preview"       # bywa i tak
+                        ]
+                        _selected_list = []
+                        for _k in _possible_keys:
+                            if _k in st.session_state and st.session_state[_k]:
+                                _selected_list = st.session_state[_k]
+                                break
+    
+                        _selected = None
+                        if isinstance(_selected_list, (list, tuple)) and len(_selected_list) > 0:
+                            _selected = _selected_list[0]
+                        elif isinstance(_selected_list, str) and _selected_list:
+                            _selected = _selected_list
+    
+                        # ——— Helpers (jedna, zwięzła wersja) ———
+                        def _to_num(s: pd.Series) -> pd.Series:
+                            return pd.to_numeric(s, errors="coerce")
+    
+                        def compute_iqr_fences(s: pd.Series, k: float = 1.5):
+                            s = _to_num(s).dropna()
+                            if s.empty:
+                                return np.nan, np.nan, s
+                            q1, q3 = s.quantile(0.25), s.quantile(0.75)
+                            iqr = q3 - q1
+                            return float(q1 - k * iqr), float(q3 + k * iqr), s
+    
+                        def winsorize_series(s: pd.Series, lower: float, upper: float) -> pd.Series:
+                            return _to_num(s).clip(lower=lower, upper=upper)
+    
+                        def mini_stats(s: pd.Series) -> dict:
+                            s = _to_num(s).dropna()
+                            if s.empty:
+                                return {"liczebność (n)": 0, "min": np.nan, "Q1": np.nan, "mediana": np.nan,
+                                        "Q3": np.nan, "max": np.nan, "średnia": np.nan, "odch.std.": np.nan, "IQR": np.nan}
+                            d = s.describe(percentiles=[.25, .5, .75])
+                            return {
+                                "liczebność (n)": int(s.size),
+                                "min": float(d["min"]),
+                                "Q1": float(d["25%"]),
+                                "mediana": float(d["50%"]),
+                                "Q3": float(d["75%"]),
+                                "max": float(d["max"]),
+                                "średnia": float(d["mean"]),
+                                "odch.std.": float(d["std"]),
+                                "IQR": float(d["75%"] - d["25%"]),
+                            }
+    
+                        # ——— UI: POKAZUJEMY dopiero, gdy wybrano kolumnę ———
+                        if _selected:
+                            # Sterowanie bez żadnych KPI nad nim
+                            c1, c2 = st.columns([1, 1])
+                            with c1:
+                                viz_mode = st.radio(
+                                    "Tryb wizualizacji",
+                                    ["Histogram", "ECDF"],
+                                    index=0,
+                                    horizontal=True,
+                                    key="wins_viz_mode_qc",
+                                    help="ECDF = Empiryczna Dystrybuanta Skumulowana. Oś Y w [0,1]; dobrze pokazuje ‘ściśnięcie’ ogonów."
                                 )
-                            else:
-                                vmin, vmax = float(base_vals.min()), float(base_vals.max())
-
-                                # JEDEN DataFrame z kolumną 'zestaw' — to KLUCZOWE dla xOffset
-                                plot_df = pd.concat(
-                                    [
-                                        pd.DataFrame({"value": before, "zestaw": "przed"}),
-                                        pd.DataFrame({"value": after,  "zestaw": "po"}),
-                                    ],
-                                    ignore_index=True
-                                ).dropna(subset=["value"])
-
-                                dom = ["przed", "po"]
-                                rng = ["#1f77b4", "#ff7f0e"]  # stałe kolory
-
-                            # =========================
-                            #  HISTOGRAM / ECDF
-                            # =========================
-                            base_vals = before.dropna()
-                            if base_vals.empty:
-                                st.info("Brak danych liczbowych po konwersji (NaN) – nie można narysować wykresów.")
-                            else:
-                                # 1) jeden DF „przed/po”
-                                plot_df = pd.concat(
-                                    [
-                                        pd.DataFrame({"value": before, "zestaw": "przed"}),
-                                        pd.DataFrame({"value": after,  "zestaw": "po"}),
-                                    ],
-                                    ignore_index=True,
-                                ).dropna(subset=["value"])
-
-                                vals = pd.to_numeric(plot_df["value"], errors="coerce").dropna()
-                                if vals.empty:
+                            with c2:
+                                k_iqr = st.slider(
+                                    "K (Tukey/IQR)", 1.0, 3.0,
+                                    float(st.session_state.get("wins_k_iqr_qc", 1.5)),
+                                    0.1, key="wins_k_iqr_qc",
+                                    help="K=1.5 (klasyczny Tukey). Większe K = łagodniejsze cięcie. Użyj większego K przy ciężkoogonowych rozkładach."
+                                )
+    
+                            # Cała logika i rysunki – TYLKO po kliknięciu (nie ma "luźnych" KPI nad sterowaniem)
+                            if go:
+                                col = _selected
+    
+                                # 1) brak kolumny -> tylko komunikat
+                                if not col:
+                                    st.warning("Najpierw wybierz kolumnę do winsoryzacji.")
+                                else:
+                                    # 2) inicjalizacja cache'a, jeśli jeszcze go nie ma
+                                    if "winsor_cache" not in st.session_state:
+                                        st.session_state["winsor_cache"] = {}
+    
+                                    cache = st.session_state["winsor_cache"]
+    
+                                    # 3) klucz cache: (nazwa kolumny, K zaokrąglone do 3 miejsc)
+                                    k_key = round(float(k_iqr), 3)
+                                    cache_key = (col, k_key)
+    
+                                    # 4) jeśli mamy w cache – używamy, inaczej liczymy i zapisujemy
+                                    if cache_key in cache:
+                                        data = cache[cache_key]
+                                        lower = data["lower"]
+                                        upper = data["upper"]
+                                        before = data["before"]
+                                        after = data["after"]
+                                    else:
+                                        lower, upper, before = compute_iqr_fences(DF[col], k=k_iqr)
+                                        after = winsorize_series(DF[col], lower, upper)
+    
+                                        cache[cache_key] = {
+                                            "lower": lower,
+                                            "upper": upper,
+                                            "before": before,
+                                            "after":  after,
+                                        }
+    
+                                    # 5) unikalna baza kluczy – zależy od kolumny i K (Tukey/IQR)
+                                    chart_key_base = f"wins_{col}_{float(k_iqr):.2f}"
+    
+                                    # 6) liczebność = liczba NIE-NaN (spójnie z mini_stats / tabelą)
+                                    before_num = before                    # 'before' ma już dropna()
+                                    n_before = int(before_num.size)
+    
+                                    after_num = _to_num(after).dropna()
+                                    n_after  = int(after_num.size)
+    
+                                    # 7) outliery PRZED – poniżej L lub powyżej U
+                                    below = int((before_num < lower).sum())
+                                    above = int((before_num > upper).sum())
+                                    out_before = below + above
+    
+                                    # 8) outliery PO – teoretycznie powinny być ≈ 0, ale liczmy „na wszelki wypadek”
+                                    out_after = int(((after_num < lower) | (after_num > upper)).sum())
+    
+                                    pct_below = 100.0 * below / n_before if n_before else 0.0
+                                    pct_above = 100.0 * above / n_before if n_before else 0.0
+                                    pct_total = pct_below + pct_above
+    
+                                    # 9) KPI w „kartach” (cyferki na górze)
+                                    kcol = st.columns(6)
+                                    with kcol[0]:
+                                        st.markdown(
+                                            f"<div style='border:1px solid #ddd;border-radius:6px;padding:8px'>"
+                                            f"<div style='font-size:12px;color:#666'>n przed &rarr; po</div>"
+                                            f"<div style='font-size:18px;font-weight:600'>{n_before:,} &rarr; {n_after:,}</div>"
+                                            f"<div style='font-size:11px;color:#888'>liczba obserwacji</div></div>",
+                                            unsafe_allow_html=True,
+                                        )
+                                    with kcol[1]:
+                                        st.markdown(
+                                            f"<div style='border:1px solid #ddd;border-radius:6px;padding:8px'>"
+                                            f"<div style='font-size:12px;color:#666'>n odstające przed &rarr; po</div>"
+                                            f"<div style='font-size:18px;font-weight:600'>{out_before:,} &rarr; {out_after:,}</div>"
+                                            f"<div style='font-size:11px;color:#888'>liczba wartości odstających ogółem</div></div>",
+                                            unsafe_allow_html=True,
+                                        )
+                                    with kcol[2]:
+                                        st.markdown(
+                                            f"<div style='border:1px solid #ddd;border-radius:6px;padding:8px'>"
+                                            f"<div style='font-size:12px;color:#666'>% &lt; lower</div>"
+                                            f"<div style='font-size:18px;font-weight:600'>{pct_below:.2f}%</div>"
+                                            f"<div style='font-size:11px;color:#888'>odsetek lewy ogon</div></div>",
+                                            unsafe_allow_html=True,
+                                        )
+                                    with kcol[3]:
+                                        st.markdown(
+                                            f"<div style='border:1px solid #ddd;border-radius:6px;padding:8px'>"
+                                            f"<div style='font-size:12px;color:#666'>% &gt; upper</div>"
+                                            f"<div style='font-size:18px;font-weight:600'>{pct_above:.2f}%</div>"
+                                            f"<div style='font-size:11px;color:#888'>odsetek prawy ogon</div></div>",
+                                            unsafe_allow_html=True,
+                                        )
+                                    with kcol[4]:
+                                        st.markdown(
+                                            f"<div style='border:1px solid #ddd;border-radius:6px;padding:8px'>"
+                                            f"<div style='font-size:12px;color:#666'>% łącznie</div>"
+                                            f"<div style='font-size:18px;font-weight:600'>{pct_total:.2f}%</div>"
+                                            f"<div style='font-size:11px;color:#888'>lewy+prawy</div></div>",
+                                            unsafe_allow_html=True,
+                                        )
+                                    with kcol[5]:
+                                        st.markdown(
+                                            f"<div style='border:1px solid #ddd;border-radius:6px;padding:8px' "
+                                            f"title='L = Q1 - K·IQR, U = Q3 + K·IQR; IQR = Q3 - Q1; K ustawiasz suwakiem „K (Tukey/IQR)”.'>"
+                                            f"<div style='font-size:12px;color:#666'>Progi [L, U]</div>"
+                                            f"<div style='font-size:18px;font-weight:600'>[{lower:.2f}, {upper:.2f}]</div>"
+                                            f"<div style='font-size:11px;color:#888'>granice winsoryzacji</div></div>",
+                                            unsafe_allow_html=True,
+                                        )
+    
+                                    # mały odstęp pod KPI
+                                    st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+                                    
+                                # =========================
+                                #  HISTOGRAM: słupki OBOK SIEBIE (Altair v5)
+                                # =========================
+                                base_vals = before.dropna()
+    
+                                # 🔍 Pusta / degenerowana kolumna:
+                                # - same NaN po konwersji
+                                # - albo jedna unikalna wartość (brak wariancji)
+                                if base_vals.empty or base_vals.nunique() <= 1:
+                                    st.info(
+                                        "Kolumna nie ma wariancji / brak danych liczbowych "
+                                        "(same NaN lub jedna unikalna wartość) – nie można narysować wykresów."
+                                    )
+                                else:
+                                    vmin, vmax = float(base_vals.min()), float(base_vals.max())
+    
+                                    # JEDEN DataFrame z kolumną 'zestaw' — to KLUCZOWE dla xOffset
+                                    plot_df = pd.concat(
+                                        [
+                                            pd.DataFrame({"value": before, "zestaw": "przed"}),
+                                            pd.DataFrame({"value": after,  "zestaw": "po"}),
+                                        ],
+                                        ignore_index=True
+                                    ).dropna(subset=["value"])
+    
+                                    dom = ["przed", "po"]
+                                    rng = ["#1f77b4", "#ff7f0e"]  # stałe kolory
+    
+                                # =========================
+                                #  HISTOGRAM / ECDF
+                                # =========================
+                                base_vals = before.dropna()
+                                if base_vals.empty:
                                     st.info("Brak danych liczbowych po konwersji (NaN) – nie można narysować wykresów.")
                                 else:
-                                    vmin, vmax = float(vals.min()), float(vals.max())
-                                    unique_vals = np.sort(vals.unique())
-
-                                    dom = ["przed", "po"]
-                                    rng = ["#1f77b4", "#ff7f0e"]
-
-                                    # ---------- A) HISTOGRAM (Altair – jak w _numeric_by_category_charts) ----------
-                                    if viz_mode == "Histogram":
-                                        # inteligentne binowanie – dokładnie ta sama logika co w 4C
-                                        bin_param = alt.Bin(maxbins=40, extent=[vmin, vmax])
-                                        if len(unique_vals) <= 2 and set(unique_vals).issubset({0.0, 1.0}):
-                                            bin_param = alt.Bin(extent=[-0.5, 1.5], step=1)
-                                        elif (
-                                            len(unique_vals) <= 12
-                                            and np.all(np.isfinite(unique_vals))
-                                            and np.all(np.mod(unique_vals, 1) == 0)
-                                        ):
-                                            loi, hii = float(unique_vals.min()), float(unique_vals.max())
-                                            bin_param = alt.Bin(extent=[loi - 0.5, hii + 0.5], step=1)
-
-                                        base_hist = alt.Chart(plot_df)
-
-                                        # wspólne biny + środek i szerokość binu
-                                        binned = (
-                                            base_hist
-                                            .transform_bin(
-                                                as_=["bin_start", "bin_end"],
-                                                field="value",
-                                                bin=bin_param,
-                                            )
-                                            .transform_calculate(
-                                                bin_mid="(datum.bin_start + datum.bin_end) / 2",
-                                                bin_w="(datum.bin_end - datum.bin_start)",
-                                            )
-                                        )
-
-                                        # rozstawiamy słupki kategorii wewnątrz binu – jak w _numeric_by_category_charts
-                                        _cat_domain_json = json.dumps(dom)   # ["przed", "po"]
-                                        _rank_expr = f"indexof({_cat_domain_json}, datum['zestaw'])"
-                                        _k_total = len(dom)
-
-                                        binned = (
-                                            binned
-                                            .transform_calculate(
-                                                cat_rank=_rank_expr,
-                                                k_total=str(_k_total),
-                                                band_fraction="0.85",
-                                                cat_w="(toNumber(datum.band_fraction) * datum.bin_w) / toNumber(datum.k_total)",
-                                                x_mid="datum.bin_mid + ( (datum.cat_rank - (toNumber(datum.k_total)-1)/2 ) * datum.cat_w )",
-                                                x_left="datum.x_mid - datum.cat_w/2",
-                                                x_right="datum.x_mid + datum.cat_w/2",
-                                            )
-                                        )
-
-                                        hist = (
-                                            binned
-                                            .mark_bar(opacity=0.85)
-                                            .encode(
-                                                x=alt.X("x_left:Q", title=col),
-                                                x2=alt.X2("x_right:Q"),
-                                                y=alt.Y("count():Q", title="Liczebność", stack=None),
-                                                color=alt.Color(
-                                                    "zestaw:N",
-                                                    sort=dom,
-                                                    scale=alt.Scale(domain=dom, range=rng),
-                                                    title="Zbiór",
-                                                ),
-                                                order=alt.Order("cat_rank:Q", sort="ascending"),
-                                                tooltip=[
-                                                    alt.Tooltip("zestaw:N", title="Zbiór"),
-                                                    alt.Tooltip("count():Q", title="liczebność"),
-                                                    alt.Tooltip("bin_start:Q", title="bin od", format=".2f"),
-                                                    alt.Tooltip("bin_end:Q",   title="bin do", format=".2f"),
-                                                ],
-                                            )
-                                            .properties(height=280)
-                                        )
-
-                                        # cieniowanie poza [L, U]
-                                        shade_df = pd.DataFrame(
-                                            {"x": [vmin, upper], "x2": [lower, vmax], "side": ["left", "right"]}
-                                        )
-                                        shade = (
-                                            alt.Chart(shade_df)
-                                            .mark_rect(opacity=0.10)
-                                            .encode(x="x:Q", x2="x2:Q")
-                                        )
-
-                                        # linie progów [L, U]
-                                        rules = (
-                                            alt.Chart(pd.DataFrame({"b": [lower, upper]}))
-                                            .mark_rule(strokeDash=[6, 3], opacity=0.9, color="#dc3545")
-                                            .encode(x="b:Q")
-                                        )
-
-                                        chart_layer = alt.layer(shade, hist, rules).resolve_scale(y="independent")
-
-                                        st.altair_chart(
-                                            chart_layer,
-                                            use_container_width=True,
-                                            key=f"{chart_key_base}_hist",
-                                        )
-
-                                    # ---------- B) ECDF (lekki, zostaje jak był) ----------
+                                    # 1) jeden DF „przed/po”
+                                    plot_df = pd.concat(
+                                        [
+                                            pd.DataFrame({"value": before, "zestaw": "przed"}),
+                                            pd.DataFrame({"value": after,  "zestaw": "po"}),
+                                        ],
+                                        ignore_index=True,
+                                    ).dropna(subset=["value"])
+    
+                                    vals = pd.to_numeric(plot_df["value"], errors="coerce").dropna()
+                                    if vals.empty:
+                                        st.info("Brak danych liczbowych po konwersji (NaN) – nie można narysować wykresów.")
                                     else:
-                                        ecdf_df = plot_df.sort_values("value").assign(
-                                            rank=lambda d: d.groupby("zestaw").cumcount() + 1
-                                        )
-                                        sizes = (
-                                            ecdf_df.groupby("zestaw")["rank"]
-                                            .transform("max")
-                                            .replace(0, np.nan)
-                                        )
-                                        ecdf_df["frac"] = ecdf_df["rank"] / sizes
-
-                                        ecdf = (
-                                            alt.Chart(ecdf_df)
-                                            .mark_line()
-                                            .encode(
-                                                x=alt.X(
-                                                    "value:Q",
-                                                    title=col,
-                                                    scale=alt.Scale(domain=[vmin, vmax]),
-                                                ),
-                                                y=alt.Y(
-                                                    "frac:Q",
-                                                    title="ECDF",
-                                                    scale=alt.Scale(domain=[0, 1]),
-                                                ),
-                                                color=alt.Color(
-                                                    "zestaw:N",
-                                                    sort=dom,
-                                                    scale=alt.Scale(domain=dom, range=rng),
-                                                    title="Zbiór",
-                                                ),
-                                                tooltip=[
-                                                    alt.Tooltip("zestaw:N", title="Zbiór"),
-                                                    alt.Tooltip("value:Q", title="Wartość", format=".2f"),
-                                                    alt.Tooltip("frac:Q",  title="Frakcja", format=".2f"),
-                                                ],
+                                        vmin, vmax = float(vals.min()), float(vals.max())
+                                        unique_vals = np.sort(vals.unique())
+    
+                                        dom = ["przed", "po"]
+                                        rng = ["#1f77b4", "#ff7f0e"]
+    
+                                        # ---------- A) HISTOGRAM (Altair – jak w _numeric_by_category_charts) ----------
+                                        if viz_mode == "Histogram":
+                                            # inteligentne binowanie – dokładnie ta sama logika co w 4C
+                                            bin_param = alt.Bin(maxbins=40, extent=[vmin, vmax])
+                                            if len(unique_vals) <= 2 and set(unique_vals).issubset({0.0, 1.0}):
+                                                bin_param = alt.Bin(extent=[-0.5, 1.5], step=1)
+                                            elif (
+                                                len(unique_vals) <= 12
+                                                and np.all(np.isfinite(unique_vals))
+                                                and np.all(np.mod(unique_vals, 1) == 0)
+                                            ):
+                                                loi, hii = float(unique_vals.min()), float(unique_vals.max())
+                                                bin_param = alt.Bin(extent=[loi - 0.5, hii + 0.5], step=1)
+    
+                                            base_hist = alt.Chart(plot_df)
+    
+                                            # wspólne biny + środek i szerokość binu
+                                            binned = (
+                                                base_hist
+                                                .transform_bin(
+                                                    as_=["bin_start", "bin_end"],
+                                                    field="value",
+                                                    bin=bin_param,
+                                                )
+                                                .transform_calculate(
+                                                    bin_mid="(datum.bin_start + datum.bin_end) / 2",
+                                                    bin_w="(datum.bin_end - datum.bin_start)",
+                                                )
                                             )
-                                            .properties(height=280)
+    
+                                            # rozstawiamy słupki kategorii wewnątrz binu – jak w _numeric_by_category_charts
+                                            _cat_domain_json = json.dumps(dom)   # ["przed", "po"]
+                                            _rank_expr = f"indexof({_cat_domain_json}, datum['zestaw'])"
+                                            _k_total = len(dom)
+    
+                                            binned = (
+                                                binned
+                                                .transform_calculate(
+                                                    cat_rank=_rank_expr,
+                                                    k_total=str(_k_total),
+                                                    band_fraction="0.85",
+                                                    cat_w="(toNumber(datum.band_fraction) * datum.bin_w) / toNumber(datum.k_total)",
+                                                    x_mid="datum.bin_mid + ( (datum.cat_rank - (toNumber(datum.k_total)-1)/2 ) * datum.cat_w )",
+                                                    x_left="datum.x_mid - datum.cat_w/2",
+                                                    x_right="datum.x_mid + datum.cat_w/2",
+                                                )
+                                            )
+    
+                                            hist = (
+                                                binned
+                                                .mark_bar(opacity=0.85)
+                                                .encode(
+                                                    x=alt.X("x_left:Q", title=col),
+                                                    x2=alt.X2("x_right:Q"),
+                                                    y=alt.Y("count():Q", title="Liczebność", stack=None),
+                                                    color=alt.Color(
+                                                        "zestaw:N",
+                                                        sort=dom,
+                                                        scale=alt.Scale(domain=dom, range=rng),
+                                                        title="Zbiór",
+                                                    ),
+                                                    order=alt.Order("cat_rank:Q", sort="ascending"),
+                                                    tooltip=[
+                                                        alt.Tooltip("zestaw:N", title="Zbiór"),
+                                                        alt.Tooltip("count():Q", title="liczebność"),
+                                                        alt.Tooltip("bin_start:Q", title="bin od", format=".2f"),
+                                                        alt.Tooltip("bin_end:Q",   title="bin do", format=".2f"),
+                                                    ],
+                                                )
+                                                .properties(height=280)
+                                            )
+    
+                                            # cieniowanie poza [L, U]
+                                            shade_df = pd.DataFrame(
+                                                {"x": [vmin, upper], "x2": [lower, vmax], "side": ["left", "right"]}
+                                            )
+                                            shade = (
+                                                alt.Chart(shade_df)
+                                                .mark_rect(opacity=0.10)
+                                                .encode(x="x:Q", x2="x2:Q")
+                                            )
+    
+                                            # linie progów [L, U]
+                                            rules = (
+                                                alt.Chart(pd.DataFrame({"b": [lower, upper]}))
+                                                .mark_rule(strokeDash=[6, 3], opacity=0.9, color="#dc3545")
+                                                .encode(x="b:Q")
+                                            )
+    
+                                            chart_layer = alt.layer(shade, hist, rules).resolve_scale(y="independent")
+    
+                                            altair_chart_stretch(st, 
+                                                chart_layer,
+                                                width='stretch',
+                                                key=f"{chart_key_base}_hist",
+                                            )
+    
+                                        # ---------- B) ECDF (lekki, zostaje jak był) ----------
+                                        else:
+                                            ecdf_df = plot_df.sort_values("value").assign(
+                                                rank=lambda d: d.groupby("zestaw").cumcount() + 1
+                                            )
+                                            sizes = (
+                                                ecdf_df.groupby("zestaw")["rank"]
+                                                .transform("max")
+                                                .replace(0, np.nan)
+                                            )
+                                            ecdf_df["frac"] = ecdf_df["rank"] / sizes
+    
+                                            ecdf = (
+                                                alt.Chart(ecdf_df)
+                                                .mark_line()
+                                                .encode(
+                                                    x=alt.X(
+                                                        "value:Q",
+                                                        title=col,
+                                                        scale=alt.Scale(domain=[vmin, vmax]),
+                                                    ),
+                                                    y=alt.Y(
+                                                        "frac:Q",
+                                                        title="ECDF",
+                                                        scale=alt.Scale(domain=[0, 1]),
+                                                    ),
+                                                    color=alt.Color(
+                                                        "zestaw:N",
+                                                        sort=dom,
+                                                        scale=alt.Scale(domain=dom, range=rng),
+                                                        title="Zbiór",
+                                                    ),
+                                                    tooltip=[
+                                                        alt.Tooltip("zestaw:N", title="Zbiór"),
+                                                        alt.Tooltip("value:Q", title="Wartość", format=".2f"),
+                                                        alt.Tooltip("frac:Q",  title="Frakcja", format=".2f"),
+                                                    ],
+                                                )
+                                                .properties(height=280)
+                                            )
+                                            rules = (
+                                                alt.Chart(pd.DataFrame({"b": [lower, upper]}))
+                                                .mark_rule(strokeDash=[6, 3], opacity=0.9, color="#dc3545")
+                                                .encode(x="b:Q")
+                                            )
+    
+                                            altair_chart_stretch(st, 
+                                                alt.layer(ecdf, rules),
+                                                width='stretch',
+                                                key=f"{chart_key_base}_ecdf",
+                                            )
+    
+                                    # 🔹 Boxplot (wąsy 1.5·IQR zgodnie z Tukey)
+                                    bL, bR = st.columns([1.3, 1.0])
+                                    with bL:
+                                        bp = (
+                                            alt.Chart(plot_df)
+                                            .mark_boxplot(extent=1.5, outliers=True)  # ← tu zmiana: 1.5·IQR (zamiast "min-max")
+                                            .encode(
+                                                y=alt.Y("zestaw:N", title=None, sort=dom),
+                                                x=alt.X("value:Q", title=None, scale=alt.Scale(domain=[vmin, vmax])),
+                                                color=alt.Color("zestaw:N", sort=dom, scale=alt.Scale(domain=dom, range=rng), legend=None),
+                                            )
+                                            .properties(height=150)
                                         )
-                                        rules = (
-                                            alt.Chart(pd.DataFrame({"b": [lower, upper]}))
-                                            .mark_rule(strokeDash=[6, 3], opacity=0.9, color="#dc3545")
-                                            .encode(x="b:Q")
+                                        # Linie median ‘przed’ i ‘po’
+                                        med_df = plot_df.groupby("zestaw")["value"].median().reset_index()
+                                        med_rule = alt.Chart(med_df).mark_rule(strokeDash=[4,4], color="#6c757d").encode(
+                                            x="value:Q", detail="zestaw:N"
                                         )
-
-                                        st.altair_chart(
-                                            alt.layer(ecdf, rules),
-                                            use_container_width=True,
-                                            key=f"{chart_key_base}_ecdf",
+    
+                                        # Warstwa „kropek-outlierów” w kolorze czerwonym (liczone wg progów [L,U])
+                                        out_df = plot_df[(plot_df["value"] < lower) | (plot_df["value"] > upper)]
+                                        out_layer = (
+                                            alt.Chart(out_df)
+                                            .mark_point(size=30, opacity=0.9, color="#dc3545")
+                                            .encode(
+                                                y=alt.Y("zestaw:N", sort=dom, title=None),
+                                                x=alt.X("value:Q")
+                                            )
                                         )
-
-                                # 🔹 Boxplot (wąsy 1.5·IQR zgodnie z Tukey)
-                                bL, bR = st.columns([1.3, 1.0])
-                                with bL:
-                                    bp = (
-                                        alt.Chart(plot_df)
-                                        .mark_boxplot(extent=1.5, outliers=True)  # ← tu zmiana: 1.5·IQR (zamiast "min-max")
-                                        .encode(
-                                            y=alt.Y("zestaw:N", title=None, sort=dom),
-                                            x=alt.X("value:Q", title=None, scale=alt.Scale(domain=[vmin, vmax])),
-                                            color=alt.Color("zestaw:N", sort=dom, scale=alt.Scale(domain=dom, range=rng), legend=None),
+    
+                                        altair_chart_stretch(st, alt.layer(bp, med_rule, out_layer), width='stretch', key=f"{chart_key_base}_box",)
+    
+    
+                                    with bR:
+                                        before_stats = mini_stats(before)
+                                        after_stats  = mini_stats(after)
+                                        rows = ["liczebność (n)", "min", "Q1", "mediana", "Q3", "max", "średnia", "odch.std.", "IQR"]
+                                        tbl = []
+                                        for r in rows:
+                                            b = before_stats.get(r, np.nan)
+                                            a = after_stats.get(r, np.nan)
+                                            d  = (a - b) if (isinstance(a,(int,float)) and isinstance(b,(int,float))) else np.nan
+                                            dp = (d / b * 100.0) if (isinstance(b,(int,float)) and b not in (0, np.nan)) else np.nan
+                                            tbl.append([r,
+                                                        f"{b:.4g}" if isinstance(b,(int,float)) else b,
+                                                        f"{a:.4g}" if isinstance(a,(int,float)) else a,
+                                                        f"{d:+.4g}" if isinstance(d,(int,float)) else "",
+                                                        f"{dp:+.2f}%" if isinstance(dp,(int,float)) else ""])
+                                        stats_df = pd.DataFrame(tbl, columns=["metryka","przed","po","Î”","Î”%"])
+                                        st_df_safe(stats_df, width='stretch', hide_index=True)
+    
+    
+                                    with bL:
+                                        st.markdown("<div style='height: 60px;'></div>", unsafe_allow_html=True)
+                                        st.caption(
+                                            "ℹ️ Liczebność liczona jest po konwersji do typów numerycznych i odrzuceniu NaN. "
+                                            "Winsoryzacja ścina ogony wg progów [L,U] (Tukey/IQR). \n\n"
+                                            f"▶️ Jeśli % łącznie ({pct_total:.2f}%) jest większe niż ok. 5% i mediana w tabeli po prawej "
+                                            "nie przesunęła się istotnie, zwykle możesz zaakceptować winsoryzację. "
+                                            "W przeciwnym razie rozważ większe K lub rezygnację z winsoryzacji dla tej kolumny."
                                         )
-                                        .properties(height=150)
-                                    )
-                                    # Linie median ‘przed’ i ‘po’
-                                    med_df = plot_df.groupby("zestaw")["value"].median().reset_index()
-                                    med_rule = alt.Chart(med_df).mark_rule(strokeDash=[4,4], color="#6c757d").encode(
-                                        x="value:Q", detail="zestaw:N"
-                                    )
-
-                                    # Warstwa „kropek-outlierów” w kolorze czerwonym (liczone wg progów [L,U])
-                                    out_df = plot_df[(plot_df["value"] < lower) | (plot_df["value"] > upper)]
-                                    out_layer = (
-                                        alt.Chart(out_df)
-                                        .mark_point(size=30, opacity=0.9, color="#dc3545")
-                                        .encode(
-                                            y=alt.Y("zestaw:N", sort=dom, title=None),
-                                            x=alt.X("value:Q")
-                                        )
-                                    )
-
-                                    st.altair_chart(alt.layer(bp, med_rule, out_layer), use_container_width=True, key=f"{chart_key_base}_box",)
-
-
-                                with bR:
-                                    before_stats = mini_stats(before)
-                                    after_stats  = mini_stats(after)
-                                    rows = ["liczebność (n)", "min", "Q1", "mediana", "Q3", "max", "średnia", "odch.std.", "IQR"]
-                                    tbl = []
-                                    for r in rows:
-                                        b = before_stats.get(r, np.nan)
-                                        a = after_stats.get(r, np.nan)
-                                        d  = (a - b) if (isinstance(a,(int,float)) and isinstance(b,(int,float))) else np.nan
-                                        dp = (d / b * 100.0) if (isinstance(b,(int,float)) and b not in (0, np.nan)) else np.nan
-                                        tbl.append([r,
-                                                    f"{b:.4g}" if isinstance(b,(int,float)) else b,
-                                                    f"{a:.4g}" if isinstance(a,(int,float)) else a,
-                                                    f"{d:+.4g}" if isinstance(d,(int,float)) else "",
-                                                    f"{dp:+.2f}%" if isinstance(dp,(int,float)) else ""])
-                                    stats_df = pd.DataFrame(tbl, columns=["metryka","przed","po","Δ","Δ%"])
-                                    st.dataframe(stats_df, use_container_width=True, hide_index=True)
-
-
-                                with bL:
-                                    st.markdown("<div style='height: 60px;'></div>", unsafe_allow_html=True)
-                                    st.caption(
-                                        "ℹ️ Liczebność liczona jest po konwersji do typów numerycznych i odrzuceniu NaN. "
-                                        "Winsoryzacja ścina ogony wg progów [L,U] (Tukey/IQR). \n\n"
-                                        f"▶️ Jeśli % łącznie ({pct_total:.2f}%) jest większe niż ok. 5% i mediana w tabeli po prawej "
-                                        "nie przesunęła się istotnie, zwykle możesz zaakceptować winsoryzację. "
-                                        "W przeciwnym razie rozważ większe K lub rezygnację z winsoryzacji dla tej kolumny."
-                                    )
-
+    
+            st.markdown("<div style='height: 0.35rem;'></div>", unsafe_allow_html=True)
             run_prep = st.form_submit_button("⚙️ Przygotuj dane do trenowania (automatycznie)", type="primary")
 
     # ── Submit handler ──────────────────────────────────────────────────────────
@@ -6339,30 +8029,48 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
             "remove_duplicates": remove_duplicates_user
         }
 
+        # Micro-profiler (tabela timingów) — reset na każde uruchomienie
+        st.session_state[STAGE2_PREP_TIMINGS_KEY] = []
+
         with st.spinner("🛠️ Przygotowuję dane do trenowania…"):
             # ⬇⬇⬇ KLUCZOWA ZMIANA: używamy PEŁNEGO zbioru df_full, nie próbki df ⬇⬇⬇
-            df_ready, prep_report = _auto_prepare_for_training(df_full, info_df, decisions)
-            ready_path, report_path = _persist_artifacts(df_ready, prep_report, latest_info)
-            hours_saved = _estimate_hours_saved(
-                n_rows_raw,
-                n_cols_raw,
-                high_null_cols,
-                duplicates_count,
-                auto_drop_candidates,
-                pairs_sorted,
-            )
-            cost_saved  = _estimate_cost_saved_pln(hours_saved)
-            # ➜ Handoff do etapu Data Chat (pakiet startowy)
-            handoff_path = _save_datachat_handoff(
-                df_ready=df_ready,
-                latest_info=latest_info,
-                summary_text=st.session_state.get("latest_summary_text", ""),
-                pairs_sorted=pairs_sorted,
-                prep_report_path=report_path,
-            )
-            st.toast(f"Pakiet Data Chat zapisany: {handoff_path}", icon="✅")
+            with stage2_prepare_step("auto_prepare_for_training"):
+                df_ready, prep_report = _auto_prepare_for_training(df_full, info_df, decisions)
+
+            with stage2_prepare_step("persist_artifacts"):
+                ready_path, report_path = _persist_artifacts(df_ready, prep_report, latest_info)
+
+            with stage2_prepare_step("estimate_savings"):
+                hours_saved = _estimate_hours_saved(
+                    n_rows_raw,
+                    n_cols_raw,
+                    high_null_cols,
+                    duplicates_count,
+                    auto_drop_candidates,
+                    pairs_sorted,
+                )
+                cost_saved  = _estimate_cost_saved_pln(hours_saved)
+
+            with stage2_prepare_step("datachat_handoff"):
+                # ➜ Handoff do etapu Data Chat (pakiet startowy)
+                handoff_path = _save_datachat_handoff(
+                    latest_info=latest_info,
+                    summary_text=st.session_state.get("latest_summary_text", ""),
+                    pairs_sorted=pairs_sorted,
+                    prep_report_path=report_path,
+                    info_df=info_df,
+                )
+                st.toast(f"Pakiet Data Chat zapisany: {handoff_path}", icon="✅")
 
         st.markdown(_success_hero_box(hours_saved, cost_saved), unsafe_allow_html=True)
+
+        with st.expander("⏱️ Timingi: przygotowanie danych (Stage2)", expanded=False):
+            timings_df = stage2_prepare_timing_df()
+            if timings_df.empty:
+                st.caption("Brak danych timingowych (uruchom przygotowanie ponownie).")
+            else:
+                st.dataframe(timings_df, width='stretch', hide_index=True)
+
         outlier_flags_count = len(prep_report["outlier_flags"])
         duplicates_removed  = prep_report["duplicates_removed"]
         n_cols_final        = prep_report["n_cols_final"]
@@ -6390,6 +8098,11 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
             st.json(prep_report)
 
     st.markdown('</div>', unsafe_allow_html=True)
+    _render_eda_debug_sidebar_exports(eda_debug_slots)
+
+    # --- Powtórzony potok na dole strony ---
+    render_flow_nav(current_id="02_Automat_EDA", key_prefix="flow_bottom")
+    st.markdown("---")
 
     # --- dla pewności żeby wszystkie zdarzenia trafiły do Langfuse ---
     lf = get_langfuse()
