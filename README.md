@@ -1,84 +1,93 @@
-# AUTO EDA FOR
+﻿# AUTO EDA FOR
 
-Asystent analizy danych i przygotowania modelu ML w Streamlit:
-- Wgrywasz plik (CSV / XLSX / PDF-tabela),
-- dostajesz natychmiastowy podgląd danych + maskowanie PII,
-- możesz pobrać dane jako CSV/XLSX lub ZIP z metadanymi,
-- możesz przetworzyć **cały zbiór** (nie tylko podgląd), zapisać go lokalnie i oznaczyć jako gotowy do trenowania,
-- aplikacja przekazuje ścieżki do tych artefaktów dalej (`latest_artifacts`), tak żeby następny krok („Trenowanie Modelu”) działał bez ponownego uploadu.
+AUTO EDA FOR to aplikacja Streamlit, która prowadzi użytkownika przez pełny potok pracy z danymi: od importu i sanity checku, przez automatyczną diagnostykę oraz opcjonalny Data Chat, aż do budowy modelu i predykcji.
 
-Architektura nastawiona jest na:
-- prosty onboarding analityka / marketera (zero kodu),
-- zgodność z prywatnością danych (maskowanie PII),
-- dalszą automatyzację: EDA, trenowanie modelu, scoring.
+## Co dostajesz
 
----
+### 1. Analiza Danych
+- import plików CSV, XLSX, PDF (tabele) i Parquet,
+- podgląd danych z maskowaniem PII,
+- szybki sanity check kolumn, braków i typów,
+- zapis artefaktów pełnego zbioru do kolejnych etapów.
 
-## Aktualny flow aplikacji
+### 2. Automat EDA
+- szybka diagnoza jakości danych,
+- automatyczne wykrywanie braków, duplikatów, outlierów i ryzyk,
+- rekomendacje cleaningu i przygotowania danych,
+- TL;DR i checklistę kolejnych kroków,
+- nazwy i opisy segmentów / klastrów wspierane przez LLM.
 
-### 1. Analiza Danych (pierwsza zakładka)
-- Wczytanie pliku źródłowego (CSV, XLSX, PDF-tabela).
-- Podgląd danych w dwóch trybach:
-  - szybkie scrollowanie (`st.dataframe`, sticky header),
-  - paginacja + wyszukiwarka (`itables` / DataTables).
-- Maskowanie PII (opcjonalne, ale domyślnie włączone).
-- Podsumowanie: typy kolumn, braki danych, rozmiar.
-- Eksport:
-  - `⬇ CSV (podgląd)`,
-  - `⬇ XLSX (podgląd)`,
-  - ZIP z metadanymi (`preview_masked.csv` + `meta.json`).
+### 3. Data Chat (opcjonalny deep dive)
+- zadawanie pytań o dane w języku naturalnym,
+- inteligentny dobór właściwej gałęzi odpowiedzi i zestawu wykresów,
+- executive takeaways, interpretacje i deep dive w wizualizacje,
+- możliwość potraktowania Etapu 3 jak osobnego centrum insightów.
 
-### 2. "Przelicz na całości i zapisz artefakty"
-- Kliknięcie przycisku uruchamia pełne przetworzenie całego pliku (nie tylko podglądu).
-- Dane po maskowaniu PII i metadane są zapisywane lokalnie (np. `C:\AUTO_EDA_FOR\ingest\...`).
-- W `st.session_state["latest_artifacts"]` zapisujemy ścieżki do:
-  - pełnego zbioru (po maskowaniu),
-  - pliku meta,
-  - katalogu runu,
-  - liczby wierszy / kolumn,
-  - znacznika czasu itp.
-- Dzięki temu kolejna zakładka ("Trenowanie Modelu") wie z automatu, jakiego zbioru ma użyć — bez ponownego uploadu pliku przez użytkownika.
+### 4. Trenowanie modelu
+- przejście do modelowania na danych przygotowanych w poprzednich etapach,
+- krótsza droga od zbioru wejściowego do gotowego pipeline'u,
+- miejsce na AutoML, tuning, wybór zwycięskiego modelu i walidację.
 
----
+### 5. Predykcja
+- scoring jednego rekordu lub całej paczki,
+- walidacja wejścia i eksport wyników,
+- finalny etap gotowy do użycia biznesowego.
 
-## Planowane kolejne kroki (Etap 2+)
-- Zakładka "Trenowanie Modelu":
-  - automatyczne wykrywanie gotowych danych przez `st.session_state["latest_artifacts"]`,
-  - podgląd i sanity-check zestawu treningowego,
-  - raport EDA (dystrybucje, korelacje, brakujące wartości, outliery, itp.),
-  - krótkie podsumowania tekstowe.
-- Później: półautomatyczne trenowanie modelu + scoring.
+## Jak płyną dane przez aplikację
 
----
+Najkrótsza ścieżka to:
+
+1 -> 2 -> 4 -> 5
+
+Jeśli chcesz wejść głębiej w analizę i zrozumieć dane przed modelowaniem, możesz skorzystać z dodatkowego przystanku:
+
+1 -> 2 -> 3 -> 4 -> 5
+
+Kluczowe założenie produktu jest proste: aplikacja zapisuje i przekazuje artefakty między etapami, więc użytkownik nie zaczyna od zera na każdej stronie.
+
+## Jak działa Data Chat
+
+Data Chat nie dobiera wykresów przypadkowo. Najpierw rozpoznaje cel pytania, a dopiero potem uruchamia rodzinę odpowiedzi najlepiej dopasowaną do tego celu.
+
+Przykładowe rodziny odpowiedzi:
+- Distribution - rozkład, percentyle, outliery, histogramy i boxploty,
+- Composition Static - struktura i udziały bez osi czasu,
+- Composition Over Time - zmiana udziałów i wartości w czasie,
+- Comparison - liderzy, rankingi i odstępstwa,
+- Relationship - zależności między zmiennymi,
+- Quality / Sanity - braki, duplikaty, anomalie i kolumny ryzyka,
+- Segmentation / Clusters - wielkość segmentów, profile i interpretacje klastrów.
+
+Na stronie startowej znajduje się dodatkowa sekcja z uproszczonym schematem inspirowanym Andrew Abelą, która pokazuje, jak różne pytania uruchamiają różne rodziny odpowiedzi.
 
 ## Uruchomienie lokalne
 
-Projekt działa jako zwykły skrypt Streamlit.  
-W tej chwili **nie wymagamy osobnego wirtualnego środowiska**, ale zalecamy mieć zainstalowane wymagane biblioteki z `requirements.txt`.
+### 1. Sklonuj repozytorium
 
-1. Sklonuj repozytorium:
-```bash
-git clone https://github.com/Kris1401/AUTO_EDA-FOR.git
-cd AUTO_EDA-FOR
-```
+    git clone https://github.com/Kris1401/AUTO_EDA-FOR.git
+    cd AUTO_EDA-FOR
 
-2. Zainstaluj zależności:
-```bash
-pip install -r requirements.txt
-```
+### 2. Zainstaluj zależności
 
-Jeśli używasz conda i chcesz mieć powtarzalne środowisko, możesz też zrobić:
-```bash
-conda env create -f environment.yml
-conda activate auto-eda-for
-```
+    pip install -r requirements.txt
 
-Ale nie jest to wymagane do prostego uruchomienia aplikacji.
+Opcjonalnie możesz skorzystać z Condy:
 
-3. Uruchom aplikację Streamlit:
-```bash
-streamlit run app/app.py
-```
+    conda env create -f environment.yml
+    conda activate auto-eda-for
 
-4. Aplikacja otworzy się w przeglądarce (domyślnie http://localhost:8501)
-Przejdź do zakładki **„Analiza Danych”**, wgraj plik i zobacz podgląd.
+### 3. Uruchom aplikację
+
+    streamlit run app/app.py
+
+## Konfiguracja
+
+W repo znajdują się pliki konfiguracyjne Streamlit i ustawienia środowiska używane przez aplikację. Jeśli pracujesz lokalnie, upewnij się, że wymagane klucze i parametry środowiskowe są dostępne zgodnie z bieżącą konfiguracją projektu.
+
+## Dla kogo jest ten projekt
+
+AUTO EDA FOR jest nastawione na:
+- analityka lub marketera, który chce dojść od danych do insightów i modelu bez kodowania całego procesu ręcznie,
+- szybki onboarding do eksploracji danych,
+- możliwie mały ładunek kognitywny przy przechodzeniu przez kolejne etapy,
+- spójny produktowy przepływ: dane -> diagnoza -> insighty -> model -> predykcja.
