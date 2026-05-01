@@ -213,10 +213,22 @@ def _scale_for_categories(cats: List[str]) -> alt.Scale:
 
 import requests
 import hashlib, re
-import openai as _openai
+try:
+    import openai as _openai
+except Exception:
+    _openai = None
 from uuid import uuid4
-from langfuse import Langfuse
-from langfuse.decorators import observe  # opcjonalny dekorator
+try:
+    from langfuse import Langfuse
+except Exception:
+    Langfuse = None
+try:
+    from langfuse.decorators import observe  # opcjonalny dekorator
+except Exception:
+    def observe(*args, **kwargs):
+        def _decorator(func):
+            return func
+        return _decorator
 
 from dotenv import load_dotenv
 
@@ -234,6 +246,8 @@ except Exception:
 @st.cache_resource(show_spinner=False)
 def get_langfuse():
     try:
+        if Langfuse is None:
+            return None
         # Zwraca obiekt Langfuse lub None, jeśli brak kluczy/połączenia
         if not (os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY")):
             return None
@@ -254,6 +268,17 @@ def get_lf_openai_client():
         if LFOpenAI is None:
             return None
         return LFOpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+    except Exception:
+        return None
+
+
+def get_plain_openai_client():
+    try:
+        if _openai is None:
+            return None
+        if not os.getenv("OPENAI_API_KEY"):
+            return None
+        return _openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
     except Exception:
         return None
 
@@ -603,7 +628,9 @@ def _eda_generate_tldr_markdown(
                 temperature=0.2,
             )
         else:
-            client = _openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+            client = get_plain_openai_client()
+            if client is None:
+                raise RuntimeError("Pakiet openai lub OPENAI_API_KEY nie jest dostępny.")
             resp = client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
@@ -1264,8 +1291,9 @@ def _describe_clusters_with_llm(
                 temperature=0.2,
             )
         else:
-            import openai as _openai
-            client = _openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+            client = get_plain_openai_client()
+            if client is None:
+                raise RuntimeError("Pakiet openai lub OPENAI_API_KEY nie jest dostępny.")
             resp = client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
@@ -1433,7 +1461,9 @@ def _describe_clusters_with_llm(
                 temperature=0.2,
             )
         else:
-            client = _openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+            client = get_plain_openai_client()
+            if client is None:
+                raise RuntimeError("Pakiet openai lub OPENAI_API_KEY nie jest dostępny.")
             resp = client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
@@ -3572,7 +3602,8 @@ def _eleven_list_models_cached(api_key: str):
 def _tts_openai_cached(text: str, voice: str, model: str, api_key: str):
     # zwraca (audio_bytes, err)
     try:
-        import openai as _openai
+        if _openai is None:
+            return b"", "Pakiet openai nie jest dostępny."
         client = _openai.OpenAI(api_key=api_key)
         # Speech API (nowy SDK)
         res = client.audio.speech.create(
@@ -7328,8 +7359,9 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                             temperature=0.3,
                         )
                     else:
-                        import openai as _openai
-                        client = _openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+                        client = get_plain_openai_client()
+                        if client is None:
+                            raise RuntimeError("Pakiet openai lub OPENAI_API_KEY nie jest dostępny.")
                         tl = client.chat.completions.create(
                             model=openai_tldr_model,
                             messages=[{"role": "user", "content": tl_dr_prompt}],
