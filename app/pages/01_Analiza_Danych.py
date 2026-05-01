@@ -212,22 +212,22 @@ def _render_itables_html(
     return html, iframe_h
 
 
-def _to_excel_bytes(df: pd.DataFrame) -> bytes:
+def _to_excel_bytes(df: pd.DataFrame) -> bytes | None:
     """
     Zwraca bytes gotowego pliku XLSX.
     Najpierw próbujemy użyć xlsxwriter (jeśli jest zainstalowany),
     a jeśli go nie ma – fallback do openpyxl.
     """
-    buf = io.BytesIO()
-    try:
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-            df.to_excel(writer, sheet_name="data", index=False)
-    except ModuleNotFoundError:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="data", index=False)
-    buf.seek(0)
-    return buf.getvalue()
+    for engine in ("xlsxwriter", "openpyxl"):
+        try:
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine=engine) as writer:
+                df.to_excel(writer, sheet_name="data", index=False)
+            buf.seek(0)
+            return buf.getvalue()
+        except (ImportError, ModuleNotFoundError):
+            continue
+    return None
 
 
 def _preview_download_buttons(df_view: pd.DataFrame):
@@ -247,17 +247,25 @@ def _preview_download_buttons(df_view: pd.DataFrame):
         )
 
     with col_xlsx:
-        st.download_button(
-            "⬇ XLSX (podgląd)",
-            data=_to_excel_bytes(df_view),
-            file_name="preview_masked.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
-            key="dl_xlsx_preview",
-            help="Eksport podglądu (po maskowaniu PII) do Excela.",
-        )
+        xlsx_data = _to_excel_bytes(df_view)
+        if xlsx_data is None:
+            st.button(
+                "⬇ XLSX (podgląd)",
+                disabled=True,
+                help="Eksport XLSX wymaga pakietu openpyxl albo xlsxwriter.",
+            )
+        else:
+            st.download_button(
+                "⬇ XLSX (podgląd)",
+                data=xlsx_data,
+                file_name="preview_masked.xlsx",
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+                key="dl_xlsx_preview",
+                help="Eksport podglądu (po maskowaniu PII) do Excela.",
+            )
 
 
 def _zip_bytes(df_out: pd.DataFrame, meta_obj, base_name: str) -> bytes:
@@ -789,6 +797,68 @@ def _read_tabular_source(path_or_url: str | Path, file_format: str, label: str) 
     return pd.read_csv(path_or_url)
 
 
+def _builtin_public_ts_dataset(spec: dict) -> pd.DataFrame | None:
+    """Small built-in fallback for public TS demos when cloud URLs are unavailable."""
+    url_env = spec.get("url_env")
+
+    if url_env == "TS_RETAIL_URL":
+        months = pd.date_range("2021-01-01", periods=48, freq="MS")
+        regions = ["North", "South", "West"]
+        products = ["A", "B"]
+        rows = []
+        for i, date in enumerate(months):
+            for region_idx, region in enumerate(regions):
+                for product_idx, product in enumerate(products):
+                    units = 80 + i * 3 + region_idx * 11 + product_idx * 17
+                    revenue = round(units * (18.5 + product_idx * 4.25), 2)
+                    rows.append(
+                        {
+                            "date": date,
+                            "region": region,
+                            "product": product,
+                            "units": units,
+                            "revenue": revenue,
+                        }
+                    )
+        return pd.DataFrame(rows)
+
+    if url_env == "TS_TEMPERATURE_URL":
+        months = pd.date_range("2015-01-01", periods=96, freq="MS")
+        rows = []
+        for i, date in enumerate(months):
+            seasonal = [0.2, 1.1, 4.0, 8.2, 12.4, 16.1, 18.5, 17.9, 14.2, 9.6, 4.8, 1.3]
+            baseline = seasonal[(date.month - 1) % 12]
+            trend = i * 0.018
+            rows.append(
+                {
+                    "date": date,
+                    "city": "Demo City",
+                    "avg_temp_c": round(baseline + trend, 2),
+                    "anomaly_c": round(trend - 0.35, 2),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    if url_env == "TS_ENERGY_URL":
+        days = pd.date_range("2024-01-01", periods=365, freq="D")
+        rows = []
+        for i, date in enumerate(days):
+            weekday_factor = 0.86 if date.weekday() >= 5 else 1.0
+            seasonal = 1.0 + (0.18 if date.month in (1, 2, 12) else 0.0)
+            kwh = round((21.5 + (i % 30) * 0.18) * weekday_factor * seasonal, 2)
+            rows.append(
+                {
+                    "date": date,
+                    "household_id": "H001",
+                    "energy_kwh": kwh,
+                    "weekday": date.day_name(),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    return None
+
+
 def _fallback_pycaret_demo_index() -> dict[str, dict]:
     demos: dict[str, dict] = {}
     for item in PYCARET_FALLBACK_DEMOS:
@@ -973,28 +1043,45 @@ def _load_demo_dataset(spec: dict, preview_limit: int | None = None):
                     )
                     df_full = _read_table(str(local_existing_path))
                 else:
-                    st.error(
-                        f"Nie udało się pobrać danych demo z `{url_env}`.\n\n"
-                        f"Szczegóły: {e}\n\n"
-                        "Na Streamlit Community Cloud sprawdź, czy sekret zawiera "
-                        "bezpośredni publiczny link do pliku, a nie stronę HTML, "
-                        "link prywatny albo wygasły signed URL."
-                    )
-                    st.stop()
+                    builtin_df = _builtin_public_ts_dataset(spec)
+                    if builtin_df is not None:
+                        st.warning(
+                            f"Nie udało się pobrać `{url_env}` z URL, więc używam "
+                            "wbudowanego zestawu demo dla szeregu czasowego.\n\n"
+                            f"Szczegóły: {e}"
+                        )
+                        df_full = builtin_df
+                    else:
+                        st.error(
+                            f"Nie udało się pobrać danych demo z `{url_env}`.\n\n"
+                            f"Szczegóły: {e}\n\n"
+                            "Na Streamlit Community Cloud sprawdź, czy sekret zawiera "
+                            "bezpośredni publiczny link do pliku, a nie stronę HTML, "
+                            "link prywatny albo wygasły signed URL."
+                        )
+                        st.stop()
         elif local_existing_path:
             # wariant 2: fallback – lokalny plik w repo
             df_full = _read_table(str(local_existing_path))
         else:
-            fmt_txt = spec.get("file_format", "CSV lub Parquet")
-            msg = (
-                f"Zestaw demo wymaga zdefiniowania zmiennej środowiskowej "
-                f"`{url_env}` z adresem URL do pliku ({fmt_txt}, np. z DigitalOcean "
-                "Spaces) **lub** umieszczenia pliku lokalnie pod ścieżką "
-                f"`{local_path}`.\n\n"
-                "Ustaw URL w `.env` **albo** dodaj lokalny plik i spróbuj ponownie."
-            )
-            st.error(msg)
-            st.stop()
+            builtin_df = _builtin_public_ts_dataset(spec)
+            if builtin_df is not None:
+                st.warning(
+                    f"Brak dostępnego pliku dla `{url_env}`, więc używam "
+                    "wbudowanego zestawu demo dla szeregu czasowego."
+                )
+                df_full = builtin_df
+            else:
+                fmt_txt = spec.get("file_format", "CSV lub Parquet")
+                msg = (
+                    f"Zestaw demo wymaga zdefiniowania zmiennej środowiskowej "
+                    f"`{url_env}` z adresem URL do pliku ({fmt_txt}, np. z DigitalOcean "
+                    "Spaces) **lub** umieszczenia pliku lokalnie pod ścieżką "
+                    f"`{local_path}`.\n\n"
+                    "Ustaw URL w `.env` **albo** dodaj lokalny plik i spróbuj ponownie."
+                )
+                st.error(msg)
+                st.stop()
 
     else:
         st.error(f"Nieznany typ zestawu demo: {kind}")

@@ -12,7 +12,11 @@ RE_NIP = re.compile(r"(?<!\d)(\d{{3}}[\-\s]?\d{{3}}[\-\s]?\d{{2}}[\-\s]?\d{{2}})
 
 PII_COL_GUESSES = {"email","e-mail","mail","telefon","phone","pesel","nip","adres","address"}
 
-def _mask_text(s: str) -> str:
+def _mask_text(s) -> str:
+    if pd.isna(s):
+        return s
+    if not isinstance(s, str):
+        s = str(s)
     s = RE_EMAIL.sub(lambda m: m.group(1)[0]+"***@***."+m.group(2).split(".")[-1], s)
     s = RE_PHONE.sub(lambda m: "***"+m.group(0)[-3:], s)
     s = RE_PESEL.sub(lambda m: "*******"+m.group(1)[-4:], s)
@@ -40,9 +44,9 @@ def mask_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str,int]]:
             masked[c] = masked[c].map(_mask_cell)
     # 2) skan tekstowy reszty (delikatnie – tylko object/string)
     for c in masked.select_dtypes(include=["object","string"]).columns:
-        before = masked[c].astype(str).copy()
+        before = masked[c].copy()
         after = before.map(_mask_text)
-        n = (before.values != after.values).sum()
+        n = (before.astype(str).values != after.astype(str).values).sum()
         if n:
             report[c] = report.get(c,0) + n
             masked[c] = after
