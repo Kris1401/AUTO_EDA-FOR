@@ -247,25 +247,15 @@ def _preview_download_buttons(df_view: pd.DataFrame):
         )
 
     with col_xlsx:
-        xlsx_data = _to_excel_bytes(df_view)
-        if xlsx_data is None:
-            st.button(
-                "⬇ XLSX (podgląd)",
-                disabled=True,
-                help="Eksport XLSX wymaga pakietu openpyxl albo xlsxwriter.",
-            )
-        else:
-            st.download_button(
-                "⬇ XLSX (podgląd)",
-                data=xlsx_data,
-                file_name="preview_masked.xlsx",
-                mime=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "spreadsheetml.sheet"
-                ),
-                key="dl_xlsx_preview",
-                help="Eksport podglądu (po maskowaniu PII) do Excela.",
-            )
+        st.button(
+            "⬇ XLSX (podgląd)",
+            disabled=True,
+            help=(
+                "Eksport XLSX jest wyłączony na Streamlit Community Cloud, "
+                "żeby ładowanie danych nie zależało od silników Excela. "
+                "Użyj CSV albo ZIP."
+            ),
+        )
 
 
 def _zip_bytes(df_out: pd.DataFrame, meta_obj, base_name: str) -> bytes:
