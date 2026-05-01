@@ -397,6 +397,7 @@ PUBLIC_TS_DEMOS: dict[str, dict] = {
 
 
 PYCARET_DATASET_BASE_URL = "https://raw.githubusercontent.com/pycaret/datasets/main"
+PYCARET_DEMO_INDEX_CACHE_VERSION = "full-pycaret-fallback-2026-05-01-v2"
 
 PYCARET_FALLBACK_DEMOS: tuple[dict[str, str], ...] = (
     # Friendly examples with short Polish descriptions.
@@ -811,12 +812,13 @@ def _fallback_pycaret_demo_index() -> dict[str, dict]:
 
 
 @st.cache_data(show_spinner=False)
-def _build_pycaret_demo_index() -> dict[str, dict]:
+def _build_pycaret_demo_index(cache_version: str) -> dict[str, dict]:
     """
     Buduje słownik demo-zbiorów z PyCaret dla zadań:
     klasyfikacja, regresja, klastrowanie, time series.
     Klucz: label dla selectboxa (bez słowa 'PyCaret').
     """
+    _ = cache_version
     try:
         from pycaret.datasets import get_data
     except Exception:
@@ -1276,7 +1278,7 @@ else:
         "przez EDA, aż po trenowanie modelu – bez przygotowywania własnego pliku."
     )
 
-    pycaret_demos = _build_pycaret_demo_index()
+    pycaret_demos = _build_pycaret_demo_index(PYCARET_DEMO_INDEX_CACHE_VERSION)
     public_demos = PUBLIC_TS_DEMOS
 
     all_demo_specs: dict[str, dict] = {}
