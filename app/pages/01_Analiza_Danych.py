@@ -532,8 +532,6 @@ def _fallback_pycaret_demo_index() -> dict[str, dict]:
             "description": desc,
             "label_short": f"{task}: {ds_name}",
         }
-    for label, spec in _fallback_pycaret_demo_index().items():
-        demos.setdefault(label, spec)
 
     return demos
 
@@ -625,6 +623,9 @@ def _build_pycaret_demo_index() -> dict[str, dict]:
                 "description": "",
                 "label_short": f"Szereg czasowy: {extra_ds}",
             }
+
+    for label, spec in _fallback_pycaret_demo_index().items():
+        demos.setdefault(label, spec)
 
     return demos
 
