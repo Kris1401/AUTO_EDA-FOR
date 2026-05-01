@@ -78,7 +78,15 @@ def _df_from_parquet(path: Path, max_rows: int | None = None) -> pd.DataFrame:
         return df.head(max_rows) if max_rows else df
 
 import streamlit as st
+
+st.set_page_config(
+    page_title="Auto EDA",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
 import streamlit.components.v1 as components
+
 try:
     from audio_recorder_streamlit import audio_recorder
 except Exception:

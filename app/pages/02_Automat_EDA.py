@@ -53,6 +53,13 @@ def _df_from_parquet(path: Path, max_rows: int | None = None) -> pd.DataFrame:
         return df.head(max_rows) if max_rows else df
 
 import streamlit as st
+
+st.set_page_config(
+    page_title="Auto EDA",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
 from core.ui_safe import altair_chart_stretch
 import altair as alt
 

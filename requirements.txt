@@ -1,5 +1,6 @@
 streamlit>=1.38
 pandas>=2.2
+pyarrow>=16.1
 numpy>=1.26
 plotly>=5.22
 python-dotenv>=1.0

@@ -8,9 +8,17 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import streamlit as st
 import pandas as pd
+
+st.set_page_config(
+    page_title="Auto EDA",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
 # ─────────────────────────────────────────────────────────────
 # Parquet-only storage helpers (Stage 1/2/3)
@@ -388,6 +396,148 @@ PUBLIC_TS_DEMOS: dict[str, dict] = {
 }
 
 
+PYCARET_DATASET_BASE_URL = "https://raw.githubusercontent.com/pycaret/datasets/main"
+
+PYCARET_FALLBACK_DEMOS: tuple[dict[str, str], ...] = (
+    {
+        "dataset": "juice",
+        "task": "Klasyfikacja",
+        "description": "Zakup produktu przez klienta.",
+    },
+    {
+        "dataset": "titanic",
+        "task": "Klasyfikacja",
+        "description": "Przezycie pasazera Titanica.",
+    },
+    {
+        "dataset": "iris",
+        "task": "Klasyfikacja",
+        "description": "Klasyczny zbior wieloklasowy.",
+    },
+    {
+        "dataset": "diamond",
+        "task": "Regresja",
+        "description": "Cena diamentu.",
+    },
+    {
+        "dataset": "insurance",
+        "task": "Regresja",
+        "description": "Koszty ubezpieczenia.",
+    },
+    {
+        "dataset": "jewellery",
+        "task": "Klasteryzacja",
+        "description": "Segmentacja klientow sklepu jubilerskiego.",
+    },
+    {
+        "dataset": "seeds",
+        "task": "Klasteryzacja",
+        "description": "Cechy nasion do grupowania.",
+    },
+)
+
+
+def _get_env_or_secret(name: str) -> str:
+    """Read Community Cloud secrets and local env with one code path."""
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        return ""
+    return str(value).strip() if value is not None else ""
+
+
+def _resolve_existing_path(path: str | Path | None) -> Path | None:
+    if not path:
+        return None
+
+    raw = Path(path)
+    candidates = [raw]
+    if not raw.is_absolute():
+        here = Path(__file__).resolve()
+        candidates.extend([Path.cwd() / raw, here.parent / raw])
+        candidates.extend(parent / raw for parent in here.parents[:3])
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists():
+            return resolved
+    return None
+
+
+def _pycaret_dataset_url(dataset: str, folder: str | None = None) -> str:
+    folder = (folder or "common").strip("/")
+    return f"{PYCARET_DATASET_BASE_URL}/data/{folder}/{dataset}.csv"
+
+
+def _read_url_bytes(url: str, label: str) -> bytes:
+    req = Request(url, headers={"User-Agent": "AutoEDA-Streamlit/1.0"})
+    try:
+        with urlopen(req, timeout=60) as response:
+            return response.read()
+    except HTTPError as e:
+        raise RuntimeError(
+            f"{label}: serwer zwrocil HTTP {e.code}. Sprawdz, czy URL prowadzi "
+            "bezposrednio do publicznego pliku i czy link nie wygasl."
+        ) from e
+    except URLError as e:
+        raise RuntimeError(
+            f"{label}: nie udalo sie polaczyc z adresem URL ({e.reason})."
+        ) from e
+    except TimeoutError as e:
+        raise RuntimeError(f"{label}: przekroczono limit czasu pobierania pliku.") from e
+
+
+def _read_tabular_source(path_or_url: str | Path, file_format: str, label: str) -> pd.DataFrame:
+    path_txt = str(path_or_url)
+    fmt = (file_format or "").lower()
+    if not fmt:
+        fmt = "parquet" if path_txt.lower().endswith(".parquet") else "csv"
+
+    if path_txt.lower().startswith(("http://", "https://")):
+        raw = _read_url_bytes(path_txt, label)
+        buffer = io.BytesIO(raw)
+        if fmt == "parquet":
+            return pd.read_parquet(buffer)
+        return pd.read_csv(buffer)
+
+    if fmt == "parquet":
+        return pd.read_parquet(path_or_url)
+    return pd.read_csv(path_or_url)
+
+
+def _fallback_pycaret_demo_index() -> dict[str, dict]:
+    demos: dict[str, dict] = {}
+    for item in PYCARET_FALLBACK_DEMOS:
+        task = item["task"]
+        ds_name = item["dataset"]
+        desc = item.get("description", "")
+        label = f"{task} - {ds_name}"
+        if desc:
+            label += f" - {desc}"
+        demos[label] = {
+            "kind": "pycaret",
+            "dataset": ds_name,
+            "folder": item.get("folder", "common"),
+            "task": task,
+            "description": desc,
+            "label_short": f"{task}: {ds_name}",
+        }
+    for label, spec in _fallback_pycaret_demo_index().items():
+        demos.setdefault(label, spec)
+
+    return demos
+
+
 
 @st.cache_data(show_spinner=False)
 def _build_pycaret_demo_index() -> dict[str, dict]:
@@ -399,12 +549,12 @@ def _build_pycaret_demo_index() -> dict[str, dict]:
     try:
         from pycaret.datasets import get_data
     except Exception:
-        return {}
+        return _fallback_pycaret_demo_index()
 
     try:
-        idx = get_data("index")
+        idx = get_data("index", verbose=False)
     except Exception:
-        return {}
+        return _fallback_pycaret_demo_index()
 
     df_idx = pd.DataFrame(idx)
     lower_map = {c.lower(): c for c in df_idx.columns}
@@ -491,20 +641,35 @@ def _load_demo_dataset(spec: dict, preview_limit: int | None = None):
 
     # 1) Wczytanie pełnego zbioru
     if kind == "pycaret":
+        dataset_name = str(spec.get("dataset", "")).strip()
+        folder = spec.get("folder")
         try:
             from pycaret.datasets import get_data
-        except Exception as e:
-            st.error(
-                "Nie mogę załadować danych demo, bo pakiet **pycaret** "
-                f"nie jest dostępny.\n\nSzczegóły: {e}"
-            )
-            st.stop()
-
-        df_full = get_data(spec["dataset"])
+            kwargs = {"verbose": False}
+            if folder:
+                kwargs["folder"] = folder
+            df_full = get_data(dataset_name, **kwargs)
+        except Exception as pycaret_error:
+            try:
+                fallback_url = _pycaret_dataset_url(dataset_name, folder)
+                df_full = _read_tabular_source(
+                    fallback_url,
+                    "csv",
+                    f"PyCaret dataset {dataset_name}",
+                )
+            except Exception as fallback_error:
+                st.error(
+                    "Nie mogę załadować zestawu demo PyCaret. "
+                    "Na Streamlit Community Cloud najczęściej oznacza to brak pakietu "
+                    "`pycaret` w `requirements.txt` albo brak dostępu do repozytorium "
+                    "z danymi PyCaret.\n\n"
+                    f"PyCaret: {pycaret_error}\n\nFallback CSV: {fallback_error}"
+                )
+                st.stop()
 
     elif kind in ("remote_csv", "remote_file"):
         url_env    = spec.get("url_env", "")
-        url        = os.getenv(url_env, "").strip()
+        url        = _get_env_or_secret(url_env)
         local_path = spec.get("local_path")
         file_format = (spec.get("file_format") or "").lower()
 
@@ -517,20 +682,32 @@ def _load_demo_dataset(spec: dict, preview_limit: int | None = None):
             return "csv"
 
         def _read_table(path: str) -> pd.DataFrame:
-            fmt = _infer_format(path)
-            if fmt == "parquet":
-                # Parquet (np. z DigitalOcean Spaces)
-                return pd.read_parquet(path)
-            else:
-                # CSV – domyślnie
-                return pd.read_csv(path)
+            return _read_tabular_source(path, _infer_format(path), url_env or str(path))
 
+        local_existing_path = _resolve_existing_path(local_path)
         if url:
             # wariant 1: wczytujemy tabelę z URL (CSV lub Parquet)
-            df_full = _read_table(url)
-        elif local_path and Path(local_path).exists():
+            try:
+                df_full = _read_table(url)
+            except Exception as e:
+                if local_existing_path:
+                    st.warning(
+                        f"Nie udało się pobrać `{url_env}` z URL, więc używam "
+                        f"lokalnego fallbacku: `{local_existing_path}`.\n\nSzczegóły: {e}"
+                    )
+                    df_full = _read_table(str(local_existing_path))
+                else:
+                    st.error(
+                        f"Nie udało się pobrać danych demo z `{url_env}`.\n\n"
+                        f"Szczegóły: {e}\n\n"
+                        "Na Streamlit Community Cloud sprawdź, czy sekret zawiera "
+                        "bezpośredni publiczny link do pliku, a nie stronę HTML, "
+                        "link prywatny albo wygasły signed URL."
+                    )
+                    st.stop()
+        elif local_existing_path:
             # wariant 2: fallback – lokalny plik w repo
-            df_full = _read_table(local_path)
+            df_full = _read_table(str(local_existing_path))
         else:
             fmt_txt = spec.get("file_format", "CSV lub Parquet")
             msg = (
