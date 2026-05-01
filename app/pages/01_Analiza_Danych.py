@@ -399,6 +399,22 @@ PUBLIC_TS_DEMOS: dict[str, dict] = {
 PYCARET_DATASET_BASE_URL = "https://raw.githubusercontent.com/pycaret/datasets/main"
 
 PYCARET_FALLBACK_DEMOS: tuple[dict[str, str], ...] = (
+    # Friendly examples with short Polish descriptions.
+    {
+        "dataset": "jewellery",
+        "task": "Klasteryzacja",
+        "description": "Segmentacja klientow sklepu jubilerskiego.",
+    },
+    {
+        "dataset": "seeds",
+        "task": "Klasteryzacja",
+        "description": "Cechy nasion do grupowania.",
+    },
+    {
+        "dataset": "iris",
+        "task": "Klasyfikacja",
+        "description": "Klasyczny zbior wieloklasowy.",
+    },
     {
         "dataset": "juice",
         "task": "Klasyfikacja",
@@ -410,11 +426,6 @@ PYCARET_FALLBACK_DEMOS: tuple[dict[str, str], ...] = (
         "description": "Przezycie pasazera Titanica.",
     },
     {
-        "dataset": "iris",
-        "task": "Klasyfikacja",
-        "description": "Klasyczny zbior wieloklasowy.",
-    },
-    {
         "dataset": "diamond",
         "task": "Regresja",
         "description": "Cena diamentu.",
@@ -424,15 +435,277 @@ PYCARET_FALLBACK_DEMOS: tuple[dict[str, str], ...] = (
         "task": "Regresja",
         "description": "Koszty ubezpieczenia.",
     },
+    # Full PyCaret common dataset index fallback. This keeps Streamlit Cloud useful
+    # even when pycaret.datasets.get_data("index") is unavailable.
+    {
+        "dataset": "asia_gdp",
+        "task": "Klasteryzacja",
+        "description": "",
+    },
+    {
+        "dataset": "elections",
+        "task": "Klasteryzacja",
+        "description": "",
+    },
+    {
+        "dataset": "facebook",
+        "task": "Klasteryzacja",
+        "description": "",
+    },
+    {
+        "dataset": "ipl",
+        "task": "Klasteryzacja",
+        "description": "",
+    },
     {
         "dataset": "jewellery",
         "task": "Klasteryzacja",
-        "description": "Segmentacja klientow sklepu jubilerskiego.",
+        "description": "",
+    },
+    {
+        "dataset": "mice",
+        "task": "Klasteryzacja",
+        "description": "",
+    },
+    {
+        "dataset": "migration",
+        "task": "Klasteryzacja",
+        "description": "",
+    },
+    {
+        "dataset": "perfume",
+        "task": "Klasteryzacja",
+        "description": "",
+    },
+    {
+        "dataset": "pokemon",
+        "task": "Klasteryzacja",
+        "description": "",
+    },
+    {
+        "dataset": "population",
+        "task": "Klasteryzacja",
+        "description": "",
+    },
+    {
+        "dataset": "public_health",
+        "task": "Klasteryzacja",
+        "description": "",
     },
     {
         "dataset": "seeds",
         "task": "Klasteryzacja",
-        "description": "Cechy nasion do grupowania.",
+        "description": "",
+    },
+    {
+        "dataset": "wholesale",
+        "task": "Klasteryzacja",
+        "description": "",
+    },
+    {
+        "dataset": "amazon",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "bank",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "blood",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "cancer",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "credit",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "CTG",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "diabetes",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "electrical_grid",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "employee",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "glass",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "heart",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "heart_disease",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "hepatitis",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "income",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "iris",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "juice",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "kiva",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "nba",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "poker",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "questions",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "satellite",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "telescope",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "titanic",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "us_presidential_election_results",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "wikipedia",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "wine",
+        "task": "Klasyfikacja",
+        "description": "",
+    },
+    {
+        "dataset": "automobile",
+        "task": "Regresja",
+        "description": "",
+    },
+    {
+        "dataset": "bike",
+        "task": "Regresja",
+        "description": "",
+    },
+    {
+        "dataset": "boston",
+        "task": "Regresja",
+        "description": "",
+    },
+    {
+        "dataset": "concrete",
+        "task": "Regresja",
+        "description": "",
+    },
+    {
+        "dataset": "diamond",
+        "task": "Regresja",
+        "description": "",
+    },
+    {
+        "dataset": "energy",
+        "task": "Regresja",
+        "description": "",
+    },
+    {
+        "dataset": "forest",
+        "task": "Regresja",
+        "description": "",
+    },
+    {
+        "dataset": "gold",
+        "task": "Regresja",
+        "description": "",
+    },
+    {
+        "dataset": "house",
+        "task": "Regresja",
+        "description": "",
+    },
+    {
+        "dataset": "insurance",
+        "task": "Regresja",
+        "description": "",
+    },
+    {
+        "dataset": "parkinsons",
+        "task": "Regresja",
+        "description": "",
+    },
+    {
+        "dataset": "spx",
+        "task": "Regresja",
+        "description": "",
+    },
+    {
+        "dataset": "traffic",
+        "task": "Regresja",
+        "description": "",
+    },
+    {
+        "dataset": "airline",
+        "task": "Szereg czasowy",
+        "description": "Linie lotnicze (airline)",
+    },
+    {
+        "dataset": "uschange",
+        "task": "Szereg czasowy",
+        "description": "Zmiany gospodarcze USA (uschange)",
     },
 )
 
