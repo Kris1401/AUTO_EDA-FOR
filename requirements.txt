@@ -14,6 +14,6 @@ openai
 elevenlabs
 pyttsx3
 python-dotenv
-langfuse==3.8.1*  # Python SDK
+langfuse==3.8.1  # Python SDK
 streamlit-mic-recorder
 audio-recorder-streamlit
