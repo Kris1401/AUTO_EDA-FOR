@@ -9155,17 +9155,41 @@ def _block3_seasonality(
         # Gdyby zostały NaN (np. pojedyncze skrajne braki), domykamy wyłącznie wewnątrz zakresu:
         y_trim = y_trim.ffill().bfill()
 
-        if (len(y_trim) < min_periods) or float(np.nanvar(y_trim.values)) == 0.0:
+        var_y = float(np.nanvar(y_trim.values))
+        if (len(y_trim) < 4) or var_y == 0.0:
             return None, {"skip": True, "skip_reason": "Za krótki lub stały szereg."}
 
-        if STL is None:
-            return None, {"skip": True, "skip_reason": "Brak statsmodels/STL."}
+        decomp_method = "stl"
+        if STL is not None and len(y_trim) >= min_periods:
+            try:
+                res = STL(y_trim, period=12, robust=True).fit()
+                seasonal_trim = pd.Series(res.seasonal, index=y_trim.index)
+                trend_trim = pd.Series(res.trend, index=y_trim.index)
+                resid_trim = pd.Series(res.resid, index=y_trim.index)
+            except Exception:
+                decomp_method = "detrended_rolling_fallback"
+        else:
+            decomp_method = "detrended_rolling_fallback"
 
-        res = STL(y_trim, period=12, robust=True).fit()
+        if decomp_method == "detrended_rolling_fallback":
+            # Short ranges on Streamlit Cloud often have only one sales year, so STL
+            # cannot estimate a stable 12-month component. Keep the heatmap useful by
+            # showing de-trended monthly deviation instead of hiding the whole block.
+            vals = y_trim.to_numpy(dtype=float)
+            x = np.arange(len(vals), dtype=float)
+            ok = np.isfinite(vals)
+            if int(ok.sum()) >= 2:
+                coeff = np.polyfit(x[ok], vals[ok], 1)
+                trend_vals = np.polyval(coeff, x)
+            else:
+                trend_vals = np.full(len(vals), float(np.nanmean(vals)))
 
-        seasonal_trim = pd.Series(res.seasonal, index=y_trim.index)
-        trend_trim = pd.Series(res.trend, index=y_trim.index)
-        resid_trim = pd.Series(res.resid, index=y_trim.index)
+            trend_trim = pd.Series(trend_vals, index=y_trim.index)
+            deviation = pd.Series(vals - trend_vals, index=y_trim.index)
+            win = 3 if len(deviation) < min_periods else 5
+            seasonal_trim = deviation.rolling(window=win, center=True, min_periods=1).mean()
+            seasonal_trim = seasonal_trim - float(np.nanmean(seasonal_trim.values))
+            resid_trim = deviation - seasonal_trim
 
         # Dla heatmapy trzymamy wspólną oś czasu, ale bez ekstrapolacji:
         seasonal = seasonal_trim.reindex(full_idx)
@@ -9238,6 +9262,7 @@ def _block3_seasonality(
             "stability_slope": slope,
             "peak_drift": peak_drift,
             "noise_cover_ratio": noise_cover,
+            "seasonality_method": decomp_method,
         }
         return panel_df, metrics
 
@@ -9674,6 +9699,7 @@ def _block3_seasonality(
         "seasonality_top_mode": _seasonality_top_mode,
         "seasonality_metric_col": _seasonality_metric_col,
         "seasonality_rows_top2": _seasonality_rows_top2,
+        "seasonality_methods": (scorecard_df["seasonality_method"].value_counts(dropna=False).to_dict() if "seasonality_method" in scorecard_df.columns and len(scorecard_df) else {}),
     })
 
     return a1, scorecard_df, stats
@@ -10927,7 +10953,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         _t_b = perf_counter()
         ch3, score_df, st3 = _block3_seasonality(df_time, cat_col, top_n=top_n)
         _timings["block_seasonality_build"] = (perf_counter() - _t_b) * 1000.0
-        blocks.append({"id": "cot__seasonality", "title": "🧭 Czy jest sezonowość sprzedaży i czy jest ona stabilna?", "desc": f"Analizujemy czystą sezonowość wartości sprzedaży (komponent seasonal z dekompozycji STL) dla Top10 elementów wymiaru {dimension_label} wg wartości sprzedaży w całym okresie. Heatmapa pokazuje kierunek i siłę odchyleń sezonowych w czasie, a scorecard poniżej porównuje siłę i stabilność sezonowości między elementami wymiaru.", "chart": ch3, "stats": st3, "score_df": score_df})
+        blocks.append({"id": "cot__seasonality", "title": "🧭 Czy jest sezonowość sprzedaży i czy jest ona stabilna?", "desc": f"Analizujemy czystą sezonowość wartości sprzedaży dla Top10 elementów wymiaru {dimension_label} wg wartości sprzedaży w całym okresie. Dla dłuższych serii używany jest STL, a dla krótszych zakresów bezpieczny fallback odchylenia po usunięciu trendu. Heatmapa pokazuje kierunek i siłę odchyleń sezonowych w czasie, a scorecard poniżej porównuje siłę i stabilność sezonowości między elementami wymiaru.", "chart": ch3, "stats": st3, "score_df": score_df})
 
         _t_b = perf_counter()
         ch4, st4 = _block4_slope_start_end(df_time_q, cat_col, top_n=top_n, include_other=include_other, winners_k=3, losers_k=3, df_time_total=df_time_q)
