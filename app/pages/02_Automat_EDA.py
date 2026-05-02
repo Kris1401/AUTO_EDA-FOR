@@ -11,6 +11,7 @@ from contextlib import contextmanager
 import logging
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Tuple, Dict, Any, List
 
 import numpy as np
@@ -326,8 +327,67 @@ def get_plain_openai_client():
         return None
 
 
+def _openai_error_message(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+        err = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(err, dict):
+            msg = err.get("message") or err.get("type") or str(err)
+        else:
+            msg = str(payload)[:500]
+    except Exception:
+        msg = (response.text or "").strip()[:500]
+
+    if response.status_code == 401:
+        return "OpenAI zwrocil 401: sprawdz OPENAI_API_KEY w Streamlit Secrets."
+    if response.status_code == 429:
+        return f"OpenAI zwrocil 429: limit lub brak srodkow na koncie. {msg}"
+    if response.status_code == 404:
+        return f"OpenAI zwrocil 404: sprawdz nazwe modelu. {msg}"
+    return f"OpenAI HTTP {response.status_code}: {msg}"
+
+
+def _openai_chat_completion_via_rest(
+    api_key: str,
+    model: str,
+    messages: list[dict],
+    temperature: float = 0.2,
+    **kwargs,
+):
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        **{k: v for k, v in kwargs.items() if v is not None},
+    }
+    response = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=90,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(_openai_error_message(response))
+
+    data = response.json()
+    try:
+        content = data["choices"][0]["message"].get("content") or ""
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI REST zwrocil nieoczekiwany format odpowiedzi: {exc}") from exc
+
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+        raw=data,
+    )
+
+
 def _openai_chat_completion(model: str, messages: list[dict], temperature: float = 0.2, **kwargs):
-    last_error: Exception | None = None
+    api_key = _get_env_or_secret("OPENAI_API_KEY")
+    errors: list[str] = []
+
     lf_openai = get_lf_openai_client()
     if lf_openai is not None:
         try:
@@ -338,23 +398,35 @@ def _openai_chat_completion(model: str, messages: list[dict], temperature: float
                 **kwargs,
             )
         except Exception as exc:
-            last_error = exc
+            errors.append(f"Langfuse SDK: {exc}")
 
     client = get_plain_openai_client()
-    if client is None:
-        raise RuntimeError("Pakiet openai lub OPENAI_API_KEY nie jest dostępny.")
+    if client is not None:
+        try:
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                **kwargs,
+            )
+        except Exception as exc:
+            errors.append(f"OpenAI SDK: {exc}")
+
+    if not api_key:
+        errors.append("brak OPENAI_API_KEY w .env i Streamlit Secrets")
+        raise RuntimeError("; ".join(errors))
 
     try:
-        return client.chat.completions.create(
+        return _openai_chat_completion_via_rest(
+            api_key=api_key,
             model=model,
             messages=messages,
             temperature=temperature,
             **kwargs,
         )
     except Exception as exc:
-        if last_error is not None:
-            raise RuntimeError(f"Langfuse/OpenAI error: {last_error}; plain OpenAI error: {exc}") from exc
-        raise
+        errors.append(f"OpenAI REST: {exc}")
+        raise RuntimeError("; ".join(errors)) from exc
 
 
 def _eda_internal_checkpoints_enabled() -> bool:
@@ -3639,19 +3711,43 @@ def _eleven_list_models_cached(api_key: str):
 @st.cache_data(show_spinner=False, ttl=1800, max_entries=64)
 def _tts_openai_cached(text: str, voice: str, model: str, api_key: str):
     # zwraca (audio_bytes, err)
+    errors: list[str] = []
     try:
-        if _openai is None:
-            return b"", "Pakiet openai nie jest dostępny."
-        client = _openai.OpenAI(api_key=api_key)
-        # Speech API (nowy SDK)
-        res = client.audio.speech.create(
-            model=model,
-            voice=voice,
-            input=text
-        )
-        return res.read(), ""
+        if _openai is not None:
+            client = _openai.OpenAI(api_key=api_key)
+            # Speech API (nowy SDK)
+            res = client.audio.speech.create(
+                model=model,
+                voice=voice,
+                input=text
+            )
+            return res.read(), ""
+        errors.append("pakiet openai nie jest dostepny")
     except Exception as e:
-        return b"", f"OpenAI TTS error: {e}"
+        errors.append(f"OpenAI SDK TTS: {e}")
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/audio/speech",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "voice": voice,
+                "input": (text or "")[:4096],
+                "response_format": "mp3",
+            },
+            timeout=90,
+        )
+        if response.status_code >= 400:
+            errors.append(_openai_error_message(response))
+            return b"", "OpenAI TTS error: " + "; ".join(errors)
+        return response.content, ""
+    except Exception as e:
+        errors.append(f"OpenAI REST TTS: {e}")
+        return b"", "OpenAI TTS error: " + "; ".join(errors)
 
 @st.cache_data(show_spinner=False, ttl=1800, max_entries=64)
 def _prep_anomaly_for_column(series: pd.Series, max_points_param: int = 5000):
