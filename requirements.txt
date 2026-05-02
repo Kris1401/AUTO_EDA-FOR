@@ -19,5 +19,5 @@ elevenlabs
 pyttsx3
 python-dotenv
 langfuse==3.8.1  # Python SDK
-streamlit-mic-recorder
-audio-recorder-streamlit
+streamlit-mic-recorder>=0.0.8
+audio-recorder-streamlit==0.0.10

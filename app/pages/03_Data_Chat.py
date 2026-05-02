@@ -38,6 +38,7 @@ import json
 import html
 import re
 import math
+import requests
 import numpy as np
 import pandas as pd
 
@@ -91,6 +92,56 @@ try:
     from audio_recorder_streamlit import audio_recorder
 except Exception:
     audio_recorder = None
+
+try:
+    from streamlit_mic_recorder import mic_recorder
+except Exception:
+    mic_recorder = None
+
+
+def _get_env_or_secret(name: str, default: str = "") -> str:
+    value = os.getenv(name, "")
+    if value:
+        return str(value).strip()
+    try:
+        value = st.secrets.get(name, "")  # type: ignore[attr-defined]
+    except Exception:
+        value = ""
+    if value is None:
+        return default
+    value = str(value).strip()
+    return value or default
+
+
+def _sync_secret_to_env(name: str) -> None:
+    if os.getenv(name):
+        return
+    value = _get_env_or_secret(name)
+    if value:
+        os.environ[name] = value
+
+
+_sync_secret_to_env("OPENAI_API_KEY")
+
+
+def _openai_error_message(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+        err = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(err, dict):
+            msg = err.get("message") or err.get("type") or str(err)
+        else:
+            msg = str(payload)[:500]
+    except Exception:
+        msg = (response.text or "").strip()[:500]
+
+    if response.status_code == 401:
+        return "OpenAI zwrocil 401: sprawdz OPENAI_API_KEY w Streamlit Secrets."
+    if response.status_code == 429:
+        return f"OpenAI zwrocil 429: limit lub brak srodkow na koncie. {msg}"
+    if response.status_code == 404:
+        return f"OpenAI zwrocil 404: sprawdz nazwe modelu. {msg}"
+    return f"OpenAI HTTP {response.status_code}: {msg}"
 
 # Optional: Stage 3 disk-based fallback (survives server restart).
 try:
@@ -1671,44 +1722,74 @@ def datachat_tts_generate(
     """Generuje MP3 z tekstu. Zwraca (bytes_mp3, error_str)."""
     try:
         if not api_key:
-            return b"", "Brak OPENAI_API_KEY (sprawdź .env)."
+            return b"", "Brak OPENAI_API_KEY w .env albo Streamlit Secrets."
         _t = (text or "").strip()
         if not _t:
             return b"", "Brak tekstu do narracji."
 
-        if OpenAI is None:
-            return b"", "Brak biblioteki `openai`. Zainstaluj: pip install openai"
+        audio_bytes = b""
+        errors: list[str] = []
 
-        client = OpenAI(api_key=api_key)
+        if OpenAI is not None:
+            try:
+                client = OpenAI(api_key=api_key)
 
-        # Różne wersje SDK obsługują różne nazwy parametru: response_format vs format
-        try:
-            resp = client.audio.speech.create(
-                model=model or "gpt-4o-mini-tts",
-                voice=voice or "alloy",
-                input=_t,
-                response_format="mp3",
-            )
-        except TypeError:
-            resp = client.audio.speech.create(
-                model=model or "gpt-4o-mini-tts",
-                voice=voice or "alloy",
-                input=_t,
-                format="mp3",
-            )
+                # Różne wersje SDK obsługują różne nazwy parametru: response_format vs format
+                try:
+                    resp = client.audio.speech.create(
+                        model=model or "gpt-4o-mini-tts",
+                        voice=voice or "alloy",
+                        input=_t,
+                        response_format="mp3",
+                    )
+                except TypeError:
+                    resp = client.audio.speech.create(
+                        model=model or "gpt-4o-mini-tts",
+                        voice=voice or "alloy",
+                        input=_t,
+                        format="mp3",
+                    )
 
-        # Różne typy odpowiedzi: bytes / obiekt z .read() / itp.
-        if isinstance(resp, (bytes, bytearray)):
-            audio_bytes = bytes(resp)
-        elif hasattr(resp, "read"):
-            audio_bytes = resp.read()
-        elif hasattr(resp, "content"):
-            audio_bytes = resp.content
+                # Różne typy odpowiedzi: bytes / obiekt z .read() / itp.
+                if isinstance(resp, (bytes, bytearray)):
+                    audio_bytes = bytes(resp)
+                elif hasattr(resp, "read"):
+                    audio_bytes = resp.read()
+                elif hasattr(resp, "content"):
+                    audio_bytes = resp.content
+                else:
+                    audio_bytes = bytes(resp)
+            except Exception as exc:
+                errors.append(f"OpenAI SDK TTS: {exc}")
         else:
-            audio_bytes = bytes(resp)
+            errors.append("pakiet openai nie jest dostepny")
 
         if not audio_bytes:
-            return b"", "TTS zwrócił pusty plik audio."
+            try:
+                response = requests.post(
+                    "https://api.openai.com/v1/audio/speech",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model or "gpt-4o-mini-tts",
+                        "voice": voice or "alloy",
+                        "input": _t[:4096],
+                        "response_format": "mp3",
+                    },
+                    timeout=90,
+                )
+                if response.status_code >= 400:
+                    errors.append(_openai_error_message(response))
+                else:
+                    audio_bytes = response.content
+            except Exception as exc:
+                errors.append(f"OpenAI REST TTS: {exc}")
+
+        if not audio_bytes:
+            detail = "; ".join(errors) if errors else "TTS zwrocil pusty plik audio."
+            return b"", detail
         return audio_bytes, None
 
     except Exception as e:
@@ -2751,6 +2832,19 @@ def _plan_chart_placeholder(question: str) -> Dict[str, Any]:
     # router go pobiera z session_state. Jeśli nie ma – minimalny fallback.
     return {"intent": "distribution", "primary_chart": {"chart_type": "histogram+kde", "x": None}}
 
+def _audio_filename_for_mime(mime_type: str) -> str:
+    mime = (mime_type or "audio/wav").lower()
+    if "webm" in mime:
+        return "datachat_input.webm"
+    if "mpeg" in mime or "mp3" in mime:
+        return "datachat_input.mp3"
+    if "ogg" in mime:
+        return "datachat_input.ogg"
+    if "m4a" in mime or "mp4" in mime:
+        return "datachat_input.m4a"
+    return "datachat_input.wav"
+
+
 def _transcribe_audio_to_text(audio_bytes: bytes, mime_type: str = "audio/wav") -> tuple[str, str]:
     """
     Bezpieczna transkrypcja audio -> tekst.
@@ -2759,11 +2853,9 @@ def _transcribe_audio_to_text(audio_bytes: bytes, mime_type: str = "audio/wav") 
     """
     if not audio_bytes:
         return "", "Brak danych audio."
-    if OpenAI is None:
-        return "", "Brak biblioteki `openai` w środowisku. Zainstaluj: pip install openai"
-    api_key = os.getenv("OPENAI_API_KEY", "")
+    api_key = _get_env_or_secret("OPENAI_API_KEY")
     if not api_key:
-        return "", "Brak OPENAI_API_KEY w zmiennych środowiskowych."
+        return "", "Brak OPENAI_API_KEY w .env albo Streamlit Secrets."
 
     # szybki guard: nie transkrybuj „kliknięć”
     try:
@@ -2777,22 +2869,129 @@ def _transcribe_audio_to_text(audio_bytes: bytes, mime_type: str = "audio/wav") 
         pass
 
     stt_model = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")
+    filename = _audio_filename_for_mime(mime_type)
+    errors: list[str] = []
+
+    if OpenAI is not None:
+        try:
+            client = OpenAI(api_key=api_key)
+            f = io.BytesIO(audio_bytes)
+            f.name = filename
+            resp = client.audio.transcriptions.create(
+                model=stt_model,
+                file=f,
+                language="pl",  # ✅ wymusza polski (eliminuje “zostawanie” w RU)
+                prompt="Transkrybuj po polsku. Zachowaj oryginalne brzmienie i interpunkcję.",
+            )
+            text = (getattr(resp, "text", "") or "").strip()
+            if text:
+                return text, ""
+            errors.append("OpenAI SDK STT: model nie zwrocil tekstu")
+        except Exception as e:
+            errors.append(f"OpenAI SDK STT: {e}")
+    else:
+        errors.append("pakiet openai nie jest dostepny")
+
     try:
-        client = OpenAI(api_key=api_key)
-        f = io.BytesIO(audio_bytes)
-        f.name = "datachat_input.wav"
-        resp = client.audio.transcriptions.create(
-            model=stt_model,
-            file=f,
-            language="pl",  # ✅ wymusza polski (eliminuje “zostawanie” w RU)
-            prompt="Transkrybuj po polsku. Zachowaj oryginalne brzmienie i interpunkcję.",
+        response = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            data={
+                "model": stt_model,
+                "language": "pl",
+                "prompt": "Transkrybuj po polsku. Zachowaj oryginalne brzmienie i interpunkcję.",
+                "response_format": "json",
+            },
+            files={
+                "file": (filename, audio_bytes, mime_type or "audio/wav"),
+            },
+            timeout=90,
         )
-        text = (resp.text or "").strip()
+        if response.status_code >= 400:
+            return "", "; ".join(errors + [_openai_error_message(response)])
+        payload = response.json()
+        text = str(payload.get("text") or "").strip()
         if not text:
             return "", "Model nie zwrócił tekstu."
         return text, ""
     except Exception as e:
-        return "", f"OpenAI STT error: {e}"
+        return "", "; ".join(errors + [f"OpenAI REST STT: {e}"])
+
+
+def _render_datachat_audio_recorder() -> tuple[bytes | None, str, str]:
+    """Render available microphone widget and normalize output to bytes + MIME."""
+    provider = ""
+    errors: list[str] = []
+
+    if audio_recorder is not None:
+        try:
+            audio_bytes = audio_recorder(
+                text="Kliknij:",
+                recording_color="#ff4b4b",
+                neutral_color="#dddddd",
+                icon_name="microphone",
+                icon_size="4x",
+            )
+            if audio_bytes:
+                return bytes(audio_bytes), "audio/wav", "audio_recorder_streamlit"
+            return None, "audio/wav", "audio_recorder_streamlit"
+        except Exception as exc:
+            errors.append(f"audio_recorder_streamlit: {type(exc).__name__}")
+
+    if mic_recorder is not None:
+        try:
+            recorded = mic_recorder(
+                start_prompt="Nagrywaj",
+                stop_prompt="Stop",
+                just_once=False,
+                use_container_width=True,
+                key="datachat_mic_recorder",
+            )
+            if isinstance(recorded, dict):
+                raw = recorded.get("bytes")
+                fmt = str(recorded.get("format") or "wav").lower().strip(".")
+                if raw:
+                    return bytes(raw), f"audio/{fmt}", "streamlit_mic_recorder"
+            elif isinstance(recorded, (bytes, bytearray)):
+                return bytes(recorded), "audio/wav", "streamlit_mic_recorder"
+            return None, "audio/wav", "streamlit_mic_recorder"
+        except Exception as exc:
+            errors.append(f"streamlit_mic_recorder: {type(exc).__name__}")
+
+    audio_input = getattr(st, "audio_input", None)
+    if callable(audio_input):
+        try:
+            uploaded = audio_input(
+                "Nagraj pytanie",
+                key="datachat_audio_input",
+                label_visibility="collapsed",
+            )
+            if uploaded is not None:
+                raw = uploaded.getvalue()
+                mime = str(getattr(uploaded, "type", "") or "audio/wav")
+                if raw:
+                    return bytes(raw), mime, "st.audio_input"
+            provider = provider or "st.audio_input"
+        except TypeError:
+            try:
+                uploaded = audio_input("Nagraj pytanie", key="datachat_audio_input")
+                if uploaded is not None:
+                    raw = uploaded.getvalue()
+                    mime = str(getattr(uploaded, "type", "") or "audio/wav")
+                    if raw:
+                        return bytes(raw), mime, "st.audio_input"
+            except Exception as exc:
+                errors.append(f"st.audio_input: {type(exc).__name__}")
+        except Exception as exc:
+            errors.append(f"st.audio_input: {type(exc).__name__}")
+
+    if not provider:
+        st.caption("Brak komponentu nagrywania audio. Sprawdz instalacje: audio-recorder-streamlit lub streamlit-mic-recorder.")
+    elif errors:
+        st.caption("Nagrywanie audio jest chwilowo niedostepne: " + "; ".join(errors[:2]))
+
+    return None, "audio/wav", provider or ""
+
 
 def _deterministic_questions(has_time: bool) -> list[str]:
     """
@@ -3187,17 +3386,7 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
-        audio_bytes = None
-        if audio_recorder is None:
-            st.caption("Brak audio_recorder_streamlit")
-        else:
-            audio_bytes = audio_recorder(
-                text="Kliknij:",
-                recording_color="#ff4b4b",
-                neutral_color="#dddddd",
-                icon_name="microphone",
-                icon_size="4x",
-            )
+        audio_bytes, audio_mime, audio_provider = _render_datachat_audio_recorder()
 
     # STT: transkrypcja PRZED textboxem — TYLKO gdy nagranie jest nowe
     if audio_bytes and not analysis_running:
@@ -3207,7 +3396,10 @@ def main() -> None:
 
         if sig != last_sig:
             st.session_state["dc_last_audio_sig"] = sig
-            txt, err = _transcribe_audio_to_text(audio_bytes=audio_bytes, mime_type="audio/wav")
+            st.session_state["dc_last_audio_bytes"] = audio_bytes
+            st.session_state["dc_last_audio_mime"] = audio_mime or "audio/wav"
+            st.session_state["dc_last_audio_provider"] = audio_provider or ""
+            txt, err = _transcribe_audio_to_text(audio_bytes=audio_bytes, mime_type=audio_mime or "audio/wav")
             if err:
                 st.warning(f"Nie udało się przetranskrybować: {err}")
             elif txt:
@@ -3223,6 +3415,12 @@ def main() -> None:
             placeholder="Wpisz pytanie lub użyj mikrofonu po lewej…",
             on_change=_sync_prompt_and_sidebar_intent,
         )
+
+    last_audio_bytes = st.session_state.get("dc_last_audio_bytes")
+    if last_audio_bytes:
+        last_audio_mime = str(st.session_state.get("dc_last_audio_mime") or "audio/wav")
+        st.caption("Odtwórz ostatnie nagranie pytania")
+        st.audio(last_audio_bytes, format=last_audio_mime)
 
     # Dolna linia: Run / Stop
     live_prompt = (st.session_state.get("datachat_prompt_input") or "").strip()
@@ -4072,8 +4270,8 @@ def main() -> None:
                 dc_tts_voice = str(st.session_state.get("dc_tts_voice", "shimmer") or "shimmer")
                 dc_tts_model = str(st.session_state.get("dc_tts_model", os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")) or "gpt-4o-mini-tts")
 
-                # API KEY z .env / env
-                api_key = os.getenv("OPENAI_API_KEY", "")
+                # API KEY z .env / env / Streamlit Secrets
+                api_key = _get_env_or_secret("OPENAI_API_KEY")
 
                 # klucz odpowiedzi (żeby audio było per odpowiedź + per głos/model)
                 # (używamy tego samego klucza co historia)
