@@ -235,6 +235,41 @@ from dotenv import load_dotenv
 # Wczytaj .env (OPENAI_API_KEY, ELEVENLABS_API_KEY, VOICE_* itp.)
 load_dotenv(override=True)
 
+
+def _get_env_or_secret(name: str, default: str = "") -> str:
+    """Read local env and Streamlit Community Cloud secrets with one code path."""
+    value = os.getenv(name, "")
+    if value:
+        return str(value).strip()
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        value = ""
+    if value is None:
+        return default
+    value = str(value).strip()
+    return value or default
+
+
+def _sync_secret_to_env(name: str) -> None:
+    """Expose Streamlit secrets to SDKs that read only environment variables."""
+    if os.getenv(name):
+        return
+    value = _get_env_or_secret(name)
+    if value:
+        os.environ[name] = value
+
+
+for _secret_name in (
+    "OPENAI_API_KEY",
+    "LANGFUSE_PUBLIC_KEY",
+    "LANGFUSE_SECRET_KEY",
+    "LANGFUSE_HOST",
+    "ELEVENLABS_API_KEY",
+):
+    _sync_secret_to_env(_secret_name)
+
+
 # Altair: nie tniemy >5k wierszy
 alt.data_transformers.disable_max_rows()
 
@@ -249,13 +284,15 @@ def get_langfuse():
         if Langfuse is None:
             return None
         # Zwraca obiekt Langfuse lub None, jeśli brak kluczy/połączenia
-        if not (os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY")):
+        public_key = _get_env_or_secret("LANGFUSE_PUBLIC_KEY")
+        secret_key = _get_env_or_secret("LANGFUSE_SECRET_KEY")
+        if not (public_key and secret_key):
             return None
         return Langfuse(
-            public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
-            secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
-            host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
-            release=os.getenv("LANGFUSE_RELEASE", "app-eda@dev"),
+            public_key=public_key,
+            secret_key=secret_key,
+            host=_get_env_or_secret("LANGFUSE_HOST", "https://cloud.langfuse.com"),
+            release=_get_env_or_secret("LANGFUSE_RELEASE", "app-eda@dev"),
             sdk_integration="streamlit"
         )
     except Exception:
@@ -267,7 +304,12 @@ def get_lf_openai_client():
     try:
         if LFOpenAI is None:
             return None
-        return LFOpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+        if not (_get_env_or_secret("LANGFUSE_PUBLIC_KEY") and _get_env_or_secret("LANGFUSE_SECRET_KEY")):
+            return None
+        api_key = _get_env_or_secret("OPENAI_API_KEY")
+        if not api_key:
+            return None
+        return LFOpenAI(api_key=api_key)
     except Exception:
         return None
 
@@ -276,11 +318,43 @@ def get_plain_openai_client():
     try:
         if _openai is None:
             return None
-        if not os.getenv("OPENAI_API_KEY"):
+        api_key = _get_env_or_secret("OPENAI_API_KEY")
+        if not api_key:
             return None
-        return _openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+        return _openai.OpenAI(api_key=api_key)
     except Exception:
         return None
+
+
+def _openai_chat_completion(model: str, messages: list[dict], temperature: float = 0.2, **kwargs):
+    last_error: Exception | None = None
+    lf_openai = get_lf_openai_client()
+    if lf_openai is not None:
+        try:
+            return lf_openai.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                **kwargs,
+            )
+        except Exception as exc:
+            last_error = exc
+
+    client = get_plain_openai_client()
+    if client is None:
+        raise RuntimeError("Pakiet openai lub OPENAI_API_KEY nie jest dostępny.")
+
+    try:
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            **kwargs,
+        )
+    except Exception as exc:
+        if last_error is not None:
+            raise RuntimeError(f"Langfuse/OpenAI error: {last_error}; plain OpenAI error: {exc}") from exc
+        raise
 
 
 def _eda_internal_checkpoints_enabled() -> bool:
@@ -620,22 +694,11 @@ def _eda_generate_tldr_markdown(
     }
 
     try:
-        lf_openai = get_lf_openai_client()
-        if lf_openai:
-            resp = lf_openai.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
-        else:
-            client = get_plain_openai_client()
-            if client is None:
-                raise RuntimeError("Pakiet openai lub OPENAI_API_KEY nie jest dostępny.")
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
+        resp = _openai_chat_completion(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
 
         raw_text = (resp.choices[0].message.content or "").strip()
         debug["raw_text"] = raw_text
@@ -1176,7 +1239,7 @@ def _describe_clusters_with_llm(
     if cluster_col not in df.columns:
         return {}
 
-    if not os.getenv("OPENAI_API_KEY"):
+    if not _get_env_or_secret("OPENAI_API_KEY"):
         return {}
 
     # Neutralna, inkluzywna nazwa obiektów
@@ -1280,25 +1343,12 @@ def _describe_clusters_with_llm(
     )
     prompt += json.dumps(cluster_summaries, ensure_ascii=False, indent=2)
 
-    # ---------- Wywołanie OpenAI / Langfuse ----------
-    lf_client = get_lf_openai_client()
-
     try:
-        if lf_client is not None:
-            resp = lf_client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
-        else:
-            client = get_plain_openai_client()
-            if client is None:
-                raise RuntimeError("Pakiet openai lub OPENAI_API_KEY nie jest dostępny.")
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
+        resp = _openai_chat_completion(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
 
         raw = (resp.choices[0].message.content or "").strip()
 
@@ -1406,7 +1456,7 @@ def _describe_clusters_with_llm(
         _eda_register_exec_result("cluster_labels", "fallback_deterministic_selected", model=model)
         return fallback_labels
 
-    if not os.getenv("OPENAI_API_KEY"):
+    if not _get_env_or_secret("OPENAI_API_KEY"):
         debug.update(
             {
                 "used_fallback": True,
@@ -1451,24 +1501,12 @@ def _describe_clusters_with_llm(
     )
     prompt += json.dumps(cluster_summaries, ensure_ascii=False, indent=2)
 
-    lf_client = get_lf_openai_client()
-
     try:
-        if lf_client is not None:
-            resp = lf_client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
-        else:
-            client = get_plain_openai_client()
-            if client is None:
-                raise RuntimeError("Pakiet openai lub OPENAI_API_KEY nie jest dostępny.")
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
+        resp = _openai_chat_completion(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
 
         raw = (resp.choices[0].message.content or "").strip()
         debug["raw_text"] = raw
@@ -3517,8 +3555,8 @@ def _run_tts_for_summary(
         )
 
     # Bezpieczniki na klucze/API
-    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-    eleven_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    openai_key = _get_env_or_secret("OPENAI_API_KEY")
+    eleven_key = _get_env_or_secret("ELEVENLABS_API_KEY")
 
     # Trace wspólny dla obu dostawców (opcjonalny – tylko jeśli Langfuse jest dostępny)
     lf_client = None
@@ -7311,6 +7349,15 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
 
     run_prep = False
     if st.session_state["sec7_revealed"]:
+        if (
+            _get_env_or_secret("OPENAI_API_KEY")
+            and (st.session_state.get("eda_summary_debug_v1") or {}).get("used_fallback")
+            and not st.session_state.get("eda_ai_retry_after_secret_fix_v1")
+        ):
+            st.session_state["latest_summary_text"] = ""
+            st.session_state.pop("eda_summary_debug_v1", None)
+            st.session_state["eda_ai_retry_after_secret_fix_v1"] = True
+
         # ── Przygotowanie promptu do TL;DR (raz) ────────────────────────────────
         if not st.session_state.get("latest_summary_text"):
             base_facts = [
@@ -7351,22 +7398,11 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
 
                 try:
                     # --- LLM: generacja podsumowania ---
-                    lf_openai = get_lf_openai_client()
-                    if lf_openai:
-                        tl = lf_openai.chat.completions.create(
-                            model=openai_tldr_model,
-                            messages=[{"role": "user", "content": tl_dr_prompt}],
-                            temperature=0.3,
-                        )
-                    else:
-                        client = get_plain_openai_client()
-                        if client is None:
-                            raise RuntimeError("Pakiet openai lub OPENAI_API_KEY nie jest dostępny.")
-                        tl = client.chat.completions.create(
-                            model=openai_tldr_model,
-                            messages=[{"role": "user", "content": tl_dr_prompt}],
-                            temperature=0.3,
-                        )
+                    tl = _openai_chat_completion(
+                        model=openai_tldr_model,
+                        messages=[{"role": "user", "content": tl_dr_prompt}],
+                        temperature=0.3,
+                    )
                     summary_text = (tl.choices[0].message.content or "").strip()
 
                     # Fallback, gdyby LLM zwrócił pusty tekst
