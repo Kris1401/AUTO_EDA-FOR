@@ -5885,23 +5885,23 @@ def _quick_narrative_score_v2(text: str, block_id: str, mode: str, stats: Dict[s
             if vv and vv.lower() not in {"other", "unknown", "kategorii", "lider", "winner", "loser"}:
                 names.append(vv)
 
-    if any(n.lower() in tl for n in names) or any(q in t for q in ['"', 'â€ž', 'â€ť']):
+    if any(n.lower() in tl for n in names) or any(q in t for q in ['"', '„', '”']):
         score += 1
         reasons.append("category_or_driver_reference")
 
     has_mechanism = _exec_has_named_mechanism_signal(t, block_id=block_id) or any(
-        w in tl for w in ["oznacza", "wskazuje na", "sygnalizuje", "implikuje", "ryzyko", "szansa", "presjÄ™"]
+        w in tl for w in ["oznacza", "wskazuje na", "sygnalizuje", "implikuje", "ryzyko", "szansa", "presję"]
     )
     if has_mechanism:
         score += 1
         reasons.append("business_mechanism")
 
     if any(w in tl for w in [
-        "rdzeĹ„ portfela", "obrona lidera", "realok", "alok", "priorytet", "portfel",
+        "rdzeń portfela", "obrona lidera", "realok", "alok", "priorytet", "portfel",
         "availability", "ekspozycj", "zapas", "kalendarz", "aktywac", "challenger",
-        "dywersyfik", "koncentrac", "strukturaln", "przesuniÄ™cie popytu",
-        "selektywna aktywacja", "szczytowych miesiÄ…cach", "okresach szczytu",
-        "okresach szczytowych", "kanaĹ‚Ăłw sprzedaĹĽy", "przychodu w okresach szczytu"
+        "dywersyfik", "koncentrac", "strukturaln", "przesunięcie popytu",
+        "selektywna aktywacja", "szczytowych miesiącach", "okresach szczytu",
+        "okresach szczytowych", "kanałów sprzedaży", "przychodu w okresach szczytu"
     ]) or _exec_has_business_lever_signal(t):
         score += 1
         reasons.append("strategic_implication")
@@ -5912,21 +5912,21 @@ def _quick_narrative_score_v2(text: str, block_id: str, mode: str, stats: Dict[s
         reasons.append("decision_or_recommendation")
 
     if any(p in tl for p in [
-        "zwiÄ™kszyÄ‡ inwestycje w marketing",
-        "monitorowaÄ‡ trendy",
-        "obserwowaÄ‡ kategoriÄ™",
-        "naleĹĽy monitorowaÄ‡",
-        "naleĹĽy przeanalizowaÄ‡",
-        "warto rozwaĹĽyÄ‡"
+        "zwiększyć inwestycje w marketing",
+        "monitorować trendy",
+        "obserwować kategorię",
+        "należy monitorować",
+        "należy przeanalizować",
+        "warto rozważyć"
     ]):
         penalties.append("generic_action")
         score = max(0, score - 1)
 
     if any(p in tl for p in [
         "praktycznie remis",
-        "gap udziaĹ‚u",
+        "gap udziału",
         "metryka sugeruje",
-        "amplituda powinna decydowaÄ‡"
+        "amplituda powinna decydować"
     ]):
         penalties.append("technical_engine_language")
         score = max(0, score - 1)
@@ -5941,26 +5941,26 @@ def _quick_narrative_score_v2(text: str, block_id: str, mode: str, stats: Dict[s
 
     block_bonus = 0
     if block_id == "cot__mix_share_topN" and (
-        any(w in tl for w in ["rdzeĹ„ portfela", "obrona lidera", "erozj", "fragmentac"])
+        any(w in tl for w in ["rdzeń portfela", "obrona lidera", "erozj", "fragmentac"])
         or _exec_has_named_mechanism_signal(t, block_id=block_id)
     ):
         block_bonus = 1
-    elif block_id == "cot__winners_losers" and any(w in tl for w in ["transfer udziaĹ‚u", "przejÄ™cie popytu", "driver wzrostu", "realok"]):
+    elif block_id == "cot__winners_losers" and any(w in tl for w in ["transfer udziału", "przejęcie popytu", "driver wzrostu", "realok"]):
         block_bonus = 1
     elif block_id == "cot__winners_losers" and _exec_has_winners_losers_exec_signal(t):
         block_bonus = 1
     elif block_id == "cot__seasonality" and any(
-        w in tl for w in ["kalendarz", "zapas", "ekspozycj", "szczyt sezonu", "bĹ‚Ä…d planowania"]
+        w in tl for w in ["kalendarz", "zapas", "ekspozycj", "szczyt sezonu", "błąd planowania"]
     ):
         block_bonus = 1
     elif block_id == "cot__start_end" and (
-        any(w in tl for w in ["trwaĹ‚", "strukturaln", "nowy ukĹ‚ad", "przesuniÄ™cie popytu"])
+        any(w in tl for w in ["trwał", "strukturaln", "nowy układ", "przesunięcie popytu"])
         or ("realokacj wspar" in tn)
         or _exec_has_start_end_exec_signal(t)
     ):
         block_bonus = 1
     elif block_id == "cot__concentration" and any(
-        w in tl for w in ["zaleĹĽnoĹ›Ä‡ od rdzenia", "odpornoĹ›Ä‡ portfela", "challenger", "koncentrac", "dywersyfik"]
+        w in tl for w in ["zależność od rdzenia", "odporność portfela", "challenger", "koncentrac", "dywersyfik"]
     ):
         block_bonus = 1
 
@@ -5991,22 +5991,22 @@ def _quick_narrative_score_v2(text: str, block_id: str, mode: str, stats: Dict[s
 
     if block_id == "cot__concentration":
         if any(w in tl for w in [
-            "challenger", "challengerĂłw", "challengery",
-            "odpornoĹ›Ä‡ portfela",
-            "zaleĹĽnoĹ›Ä‡ od rdzenia",
-            "ograniczenia zaleĹĽnoĹ›ci od rdzenia",
-            "ograniczyÄ‡ zaleĹĽnoĹ›Ä‡ od rdzenia",
+            "challenger", "challengerów", "challengery",
+            "odporność portfela",
+            "zależność od rdzenia",
+            "ograniczenia zależności od rdzenia",
+            "ograniczyć zależność od rdzenia",
             "dywersyfikacja portfela",
-            "wzmocnienie challengerĂłw",
-            "realokacja wsparcia dla challengerĂłw",
-            "realokacja wsparcia na challengerĂłw",
+            "wzmocnienie challengerów",
+            "realokacja wsparcia dla challengerów",
+            "realokacja wsparcia na challengerów",
         ]):
             score += 1
             reasons.append("block_specific_exec_direction")
 
         if "realokacja wsparcia" in tl and not any(w in tl for w in [
-            "challenger", "challengerĂłw", "obrona lidera",
-            "odpornoĹ›Ä‡ portfela", "zaleĹĽnoĹ›Ä‡ od rdzenia", "dywersyfik"
+            "challenger", "challengerów", "obrona lidera",
+            "odporność portfela", "zależność od rdzenia", "dywersyfik"
         ]):
             score = max(0, score - 1)
             penalties.append("generic_decision_direction")
@@ -6163,7 +6163,7 @@ def _legacy_exec_selector_quality_bonus_v2(text: str, block_id: str, stats: Dict
         bonus += 1
         reasons.append("explicit_business_lever")
 
-    if re.search(r"\b\d+\s*[-â€“]\s*\d+\s*(?:cykl|cykle|miesiac|miesiace|miesiecy)\b", tl) or ("kpi" in tl) or ("pp" in tl):
+    if re.search(r"\b\d+\s*[-–]\s*\d+\s*(?:cykl|cykle|miesiac|miesiace|miesiecy)\b", tl) or ("kpi" in tl) or ("pp" in tl):
         bonus += 1
         reasons.append("horizon_or_kpi")
 

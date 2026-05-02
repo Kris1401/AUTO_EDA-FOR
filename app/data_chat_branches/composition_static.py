@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any, Dict, Optional, Tuple
@@ -65,7 +65,7 @@ def _is_numeric_continuous_legacy(s: pd.Series, max_low_card: int = 30) -> bool:
 
 
 def _infer_value_col(df: pd.DataFrame) -> str | None:
-    """Heurystyka: preferuj realna wartosc sprzedaĹĽy, nie cene jednostkowa."""
+    """Heurystyka: preferuj realna wartosc sprzedaży, nie cene jednostkowa."""
     candidates = get_value_candidate_columns(df)
     if candidates:
         return candidates[0]
@@ -74,7 +74,7 @@ def _infer_value_col(df: pd.DataFrame) -> str | None:
 
 
 def _infer_best_group_col(df: pd.DataFrame, exclude: set[str] | None = None) -> str | None:
-    """Fallback heurystyka: wybierz sensownÄ… kolumnÄ™ kategorycznÄ… (nie time-like, nie ID)."""
+    """Fallback heurystyka: wybierz sensowną kolumnę kategoryczną (nie time-like, nie ID)."""
     exclude = exclude or set()
     preferred = ["sector", "segment", "category", "kategoria", "mszoning", "type", "brand", "subclass", "class"]
     obj_cols = [c for c in df.columns if c not in exclude and str(df[c].dtype) in ("object", "category", "bool")]
@@ -133,7 +133,7 @@ def _bin_numeric(series: pd.Series, max_bins: int = 30, method: str = "quantile"
         meta["bins"] = nuniq
         return labels, meta
 
-    # target bins ~ 15â€“25 (then capped by max_bins)
+    # target bins ~ 15–25 (then capped by max_bins)
     target_bins = int(min(max_bins, max(12, min(24, int(round(math.sqrt(len(s_non))))))))
 
     def _nice_step(raw_step: float) -> float:
@@ -161,7 +161,7 @@ def _bin_numeric(series: pd.Series, max_bins: int = 30, method: str = "quantile"
             mx = float(s_non.max())
             use_lo, use_hi = mn, mx
             if math.isfinite(lo) and math.isfinite(hi) and hi > lo:
-                # if the 1â€“99% span is much tighter than full range, clip
+                # if the 1–99% span is much tighter than full range, clip
                 if (hi - lo) < 0.85 * (mx - mn):
                     use_lo, use_hi = lo, hi
                     meta["clip"] = {"q01": lo, "q99": hi}
@@ -661,7 +661,7 @@ def build_stats_payload(
         return payload
 
     if not group_col or group_col not in df.columns or not value_col or value_col not in df.columns:
-        payload["error"] = "Brak kolumny grupowej lub wartoĹ›ciowej."
+        payload["error"] = "Brak kolumny grupowej lub wartościowej."
         return payload
 
     try:
@@ -682,7 +682,7 @@ def build_stats_payload(
         total_value = float(agg["value"].sum())
         n_groups = int(len(agg))
         if total_value <= 0 or n_groups == 0:
-            payload["error"] = "Brak wartoĹ›ci po agregacji dla wybranego ukĹ‚adu kolumn."
+            payload["error"] = "Brak wartości po agregacji dla wybranego układu kolumn."
             return payload
 
         agg["share"] = agg["value"] / total_value
@@ -1356,7 +1356,7 @@ def _format_cs_pct(value: Any) -> str:
     try:
         return f"{float(value):.2f}%".replace(".", ",")
     except Exception:
-        return "â€”"
+        return "—"
 
 
 def _build_mix_exec_repair(stats: Dict[str, Any]) -> str | None:
@@ -1368,19 +1368,19 @@ def _build_mix_exec_repair(stats: Dict[str, Any]) -> str | None:
     if not focus_group or not focus_component or focus_component_pct is None or focus_group_share_pct is None:
         return None
     sentence1 = (
-        f"W grupie '{focus_group}' udziaĹ‚ '{focus_component}' w mixie wynosi "
+        f"W grupie '{focus_group}' udział '{focus_component}' w mixie wynosi "
         f"{_format_cs_pct(focus_component_pct)}, a sama grupa odpowiada za "
-        f"{_format_cs_pct(focus_group_share_pct)} caĹ‚kowitej wartoĹ›ci."
+        f"{_format_cs_pct(focus_group_share_pct)} całkowitej wartości."
     )
     if focus_gap_pp is not None:
         sentence2 = (
-            f"Rekomendacja: traktuj '{focus_component}' jako gĹ‚Ăłwny driver tej grupy "
-            f"i monitoruj lukÄ™ {_format_cs_pct(focus_gap_pp).replace('%', ' pp')} do kolejnego skĹ‚adnika."
+            f"Rekomendacja: traktuj '{focus_component}' jako główny driver tej grupy "
+            f"i monitoruj lukę {_format_cs_pct(focus_gap_pp).replace('%', ' pp')} do kolejnego składnika."
         )
     else:
         sentence2 = (
-            f"Rekomendacja: traktuj '{focus_component}' jako gĹ‚Ăłwny driver tej grupy "
-            f"i monitoruj zmianÄ™ jego udziaĹ‚u w kolejnych przebiegach."
+            f"Rekomendacja: traktuj '{focus_component}' jako główny driver tej grupy "
+            f"i monitoruj zmianę jego udziału w kolejnych przebiegach."
         )
     return f"{sentence1} {sentence2}"
 
@@ -1395,20 +1395,20 @@ def _build_marimekko_exec_repair(stats: Dict[str, Any]) -> str | None:
     if not top_cell_group or not top_cell_component or top_cell_area_pct is None or not top_width_group or top_width_pct is None:
         return None
     sentence1 = (
-        f"NajwiÄ™ksza komĂłrka '{top_cell_group} Ă— {top_cell_component}' wnosi "
-        f"{_format_cs_pct(top_cell_area_pct)} caĹ‚kowitej wartoĹ›ci, szerokoĹ›Ä‡ grupy "
+        f"Największa komórka '{top_cell_group} × {top_cell_component}' wnosi "
+        f"{_format_cs_pct(top_cell_area_pct)} całkowitej wartości, szerokość grupy "
         f"'{top_width_group}' wynosi {_format_cs_pct(top_width_pct)} totalu, "
-        f"a udziaĹ‚ '{top_cell_component}' wewnÄ…trz tej grupy to {_format_cs_pct(top_cell_height_pct) if top_cell_height_pct is not None else 'â€”'}."
+        f"a udział '{top_cell_component}' wewnątrz tej grupy to {_format_cs_pct(top_cell_height_pct) if top_cell_height_pct is not None else '—'}."
     )
     if top_cell_height_pct is not None:
         sentence2 = (
-            f"Rekomendacja: zarzÄ…dzaj tÄ… komĂłrkÄ… osobno, bo Ĺ‚Ä…czy wysokÄ… skalÄ™ grupy "
-            f"z udziaĹ‚em {_format_cs_pct(top_cell_height_pct)} tego skĹ‚adnika wewnÄ…trz grupy."
+            f"Rekomendacja: zarządzaj tą komórką osobno, bo łączy wysoką skalę grupy "
+            f"z udziałem {_format_cs_pct(top_cell_height_pct)} tego składnika wewnątrz grupy."
         )
     else:
         sentence2 = (
-            f"Rekomendacja: zarzÄ…dzaj tÄ… komĂłrkÄ… osobno, bo Ĺ‚Ä…czy wysokÄ… skalÄ™ grupy "
-            f"z najwiÄ™kszym wkĹ‚adem do caĹ‚kowitej wartoĹ›ci."
+            f"Rekomendacja: zarządzaj tą komórką osobno, bo łączy wysoką skalę grupy "
+            f"z największym wkładem do całkowitej wartości."
     )
     return f"{sentence1} {sentence2}"
 
@@ -1473,7 +1473,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
     render_insights = bool(ctx.get("render_insights", True))
     filters_signature = ctx.get("filters") or {}
 
-    # â”€â”€ CS sidebar params (source of truth) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── CS sidebar params (source of truth) ──────────────────────────────────
     group_col_sel  = ctx.get("cs_group_col")   # Kategoria 1 (selected)
     group_col2_sel = ctx.get("cs_group_col2")  # Kategoria 2 (selected)
     top_n          = int(ctx.get("cs_top_n") or 10)
@@ -1481,12 +1481,12 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
     price_col_sel  = ctx.get("cs_price_col")   # optional (price corridor)
     runtime_signature = _make_cs_runtime_signature(df, filters_signature)
 
-    # â”€â”€ metric slots z main (st.empty()) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── metric slots z main (st.empty()) ────────────────────────────────────
     ui_ov       = ((ctx.get("ui") or {}).get("overview") or {})
     metric_val  = ui_ov.get("metric_value")
     metric_txn  = ui_ov.get("metric_txn")
     chart_slot  = ui_ov.get("chart_slot")
-    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ─────────────────────────────────────────────
     # Executive takeaway (McKinsey Headline) + per-block guidance
     question = str((ctx.get("question") or "")).strip()
     # Ensure the engine sees the question (batch + single-call paths rely on ctx["question"])
@@ -1562,7 +1562,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         block = {"key": key, "anchors": anchors or {}}
         stats: Dict[str, Any] = {}
 
-        # stats_payload moĹĽe pochodziÄ‡ z routera (ctx) â€“ jeĹ›li nie ma, uĹĽyj pustego
+        # stats_payload może pochodzić z routera (ctx) – jeśli nie ma, użyj pustego
         _stats_payload = ctx.get("stats_payload")
         if isinstance(_stats_payload, dict):
             stats.update(_stats_payload)
@@ -1581,7 +1581,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             llm_fn=llm_takeaway_fn,
         )
         # ET v1.0 contract: NIE Ucinamy tekstu lokalnie.
-        # JeĹ›li tekst jest za dĹ‚ugi, to ma siÄ™ zawijaÄ‡ w UI (wrap), a nie koĹ„czyÄ‡ "â€¦".
+        # Jeśli tekst jest za długi, to ma się zawijać w UI (wrap), a nie kończyć "…".
         if isinstance(txt, str):
             txt = txt.strip()
             if min_chars and len(txt) < min_chars:
@@ -1602,7 +1602,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 unsafe_allow_html=True,
             )
             return txt
-        st.markdown("đź§  **Executive takeaway:** â€”")
+        st.markdown("🧠 **Executive takeaway:** —")
         return None
 
 
@@ -1615,14 +1615,14 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     df = _sanitize_df_columns(df)
 
-    # â”€â”€ value_col: heurystyka (bez hardcoded nazwy kolumny) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── value_col: heurystyka (bez hardcoded nazwy kolumny) ──────────────────
     value_col = _infer_value_col(df)
 
-    # â”€â”€ resolve group_col selection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── resolve group_col selection ──────────────────────────────────────────
     if False:
         group_col_sel = _infer_best_group_col(df)
 
-    # â”€â”€ PRICE MODE: numeric continuous selected OR explicit price_col â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── PRICE MODE: numeric continuous selected OR explicit price_col ────────
     price_col: Optional[str] = None
     if price_col_sel and isinstance(price_col_sel, str) and price_col_sel in df.columns:
         price_col = price_col_sel
@@ -1639,7 +1639,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
     if not group_col or group_col not in df.columns:
         group_col = _infer_best_group_col(df) or group_col_sel
 
-    # â”€â”€ group_col2 gating â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── group_col2 gating ───────────────────────────────────────────────────
     group_col2: Optional[str] = None
     if group_col2_sel and group_col2_sel in df.columns and group_col2_sel != group_col:
         # disallow continuous numeric as category 2 (causes cognitive + technical issues)
@@ -1648,15 +1648,15 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         else:
             group_col2 = group_col2_sel
 
-    # â”€â”€ quick UX note (only once per render) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── quick UX note (only once per render) ────────────────────────────────
     if False and price_mode:
         st.info(
-            f"Wybrana kolumna **{group_col_sel}** wyglÄ…da na cenÄ™ (zmienna ciÄ…gĹ‚a). "
-            f"UĹĽywam jej do analizy **Korytarza cenowego**, a strukturÄ™ segmentĂłw budujÄ™ na **{group_col}**. "
-            f"To chroni Mix/Marimekko przed eksplozjÄ… kategorii."
+            f"Wybrana kolumna **{group_col_sel}** wygląda na cenę (zmienna ciągła). "
+            f"Używam jej do analizy **Korytarza cenowego**, a strukturę segmentów buduję na **{group_col}**. "
+            f"To chroni Mix/Marimekko przed eksplozją kategorii."
         )
 
-    # â”€â”€ KPI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── KPI ─────────────────────────────────────────────────────────────────
     resolved = resolve_grouping_selection(df, group_col_sel, group_col2_sel, price_col_sel)
     group_col = resolved.get("group_col")
     group_col2 = resolved.get("group_col2")
@@ -1865,9 +1865,9 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     if price_mode and group_col:
         st.info(
-            f"Wybrana kolumna **{group_col_sel}** wyglÄ…da na cenÄ™ (zmienna ciÄ…gĹ‚a). "
-            f"UĹĽywam jej do analizy **Korytarza cenowego**, a strukturÄ™ segmentĂłw budujÄ™ na **{group_col}**. "
-            f"To chroni Mix/Marimekko przed eksplozjÄ… kategorii."
+            f"Wybrana kolumna **{group_col_sel}** wygląda na cenę (zmienna ciągła). "
+            f"Używam jej do analizy **Korytarza cenowego**, a strukturę segmentów buduję na **{group_col}**. "
+            f"To chroni Mix/Marimekko przed eksplozją kategorii."
         )
 
     metric_qty = ui_ov.get("metric_qty")
@@ -1876,13 +1876,13 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         if metric_val is not None:
             if value_col and value_col in df.columns:
                 total_value = float(pd.to_numeric(df[value_col], errors="coerce").fillna(0).clip(lower=0).sum())
-                metric_val.metric("Suma wartoĹ›ci", f"{total_value:,.0f}".replace(",", " "))
+                metric_val.metric("Suma wartości", f"{total_value:,.0f}".replace(",", " "))
             else:
-                metric_val.metric("Suma wartoĹ›ci", "â€”")
+                metric_val.metric("Suma wartości", "—")
 
         if metric_qty is not None:
             _qty_col = None
-            for _hint in ["quantity", "qty", "count", "units", "ilosc", "iloĹ›Ä‡", "sztuk"]:
+            for _hint in ["quantity", "qty", "count", "units", "ilosc", "ilość", "sztuk"]:
                 for _c in df.columns:
                     if _hint in str(_c).lower() and pd.api.types.is_numeric_dtype(df[_c]):
                         _qty_col = _c
@@ -1892,9 +1892,9 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
 
             if _qty_col and _qty_col in df.columns:
                 _qty_total = float(pd.to_numeric(df[_qty_col], errors="coerce").fillna(0).clip(lower=0).sum())
-                metric_qty.metric("Suma iloĹ›ci", f"{_qty_total:,.0f}".replace(",", " "))
+                metric_qty.metric("Suma ilości", f"{_qty_total:,.0f}".replace(",", " "))
             else:
-                metric_qty.metric("Suma iloĹ›ci", "â€”")
+                metric_qty.metric("Suma ilości", "—")
 
         if metric_txn is not None:
             metric_txn.metric("Liczba transakcji", f"{len(df):,}".replace(",", " "))
@@ -1944,7 +1944,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                             fig = px.treemap(agg, path=path, values="value")
                             fig.update_traces(
                                 textinfo="label+percent root",
-                                hovertemplate="<b>%{label}</b><br>WartoĹ›Ä‡: %{value:,.0f}<br>UdziaĹ‚: %{percentRoot:.1%}<extra></extra>",
+                                hovertemplate="<b>%{label}</b><br>Wartość: %{value:,.0f}<br>Udział: %{percentRoot:.1%}<extra></extra>",
                             )
                             fig.update_layout(
                                 margin=dict(l=0, r=0, t=0, b=0),
@@ -1953,9 +1953,9 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                             )
                             st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
                 except Exception:
-                    st.warning("Nie udaĹ‚o siÄ™ wyrenderowaÄ‡ treemapy dla wybranych ustawieĹ„.")
+                    st.warning("Nie udało się wyrenderować treemapy dla wybranych ustawień.")
             else:
-                st.info("Brak kolumny grupowej lub wartoĹ›ciowej â€” wybierz w sidebarze innÄ… kategoriÄ™ lub miarÄ™.")
+                st.info("Brak kolumny grupowej lub wartościowej — wybierz w sidebarze inną kategorię lub miarę.")
 
     if not render_insights:
         return {"chart_meta": {"kind": "composition_static"}, "chart_context": {}}
@@ -2047,10 +2047,10 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
     # Batch ET only when the user enters Kluczowe insighty.
     _ensure_cs_takeaways()
 
-    # â”€â”€ TAB INSIGHTS: blocks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── TAB INSIGHTS: blocks ────────────────────────────────────────────────
     with tab_insights:
         if not (group_col and value_col and group_col in df.columns and value_col in df.columns):
-            st.info("Brak kolumny grupowej lub wartoĹ›ciowej â€” zmieĹ„ dane lub wybierz kategoriÄ™ w sidebarze.")
+            st.info("Brak kolumny grupowej lub wartościowej — zmień dane lub wybierz kategorię w sidebarze.")
             return {"chart_meta": {"kind": "composition_static"}, "chart_context": {}}
 
         try:
@@ -2073,7 +2073,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                     total = float(fallback_agg[value_col].sum() or 0.0)
                     fallback_agg["share"] = fallback_agg[value_col] / total if total else 0.0
 
-                    st.markdown("### Ranking wartosci wedlug kategorii")
+                    st.markdown("### Ranking wartości według kategorii")
                     rank_chart = (
                         alt.Chart(fallback_agg)
                         .mark_bar()
@@ -2084,11 +2084,11 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                                 title=None,
                                 axis=alt.Axis(labelLimit=260),
                             ),
-                            x=alt.X(f"{value_col}:Q", title="Wartosc"),
+                            x=alt.X(f"{value_col}:Q", title="Wartość"),
                             tooltip=[
                                 alt.Tooltip("group_label:N", title="Kategoria"),
-                                alt.Tooltip(f"{value_col}:Q", format=",.0f", title="Wartosc"),
-                                alt.Tooltip("share:Q", format=".1%", title="Udzial"),
+                                alt.Tooltip(f"{value_col}:Q", format=",.0f", title="Wartość"),
+                                alt.Tooltip("share:Q", format=".1%", title="Udział"),
                             ],
                         )
                         .properties(height=min(520, max(280, 56 + 28 * int(fallback_agg.shape[0]))))
@@ -2139,7 +2139,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                                 0.0,
                             )
 
-                            st.markdown("### Mix wewnatrz kategorii")
+                            st.markdown("### Mix wewnątrz kategorii")
                             mix_chart = (
                                 alt.Chart(mix_agg)
                                 .mark_bar()
@@ -2150,13 +2150,13 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                                         title=None,
                                         axis=alt.Axis(labelLimit=260),
                                     ),
-                                    x=alt.X("pct:Q", stack="zero", title="Udzial w kategorii", axis=alt.Axis(format="%")),
+                                    x=alt.X("pct:Q", stack="zero", title="Udział w kategorii", axis=alt.Axis(format="%")),
                                     color=alt.Color("subgroup:N", title=str(group_col2)),
                                     tooltip=[
                                         alt.Tooltip("group_label:N", title="Kategoria"),
                                         alt.Tooltip("subgroup:N", title=str(group_col2)),
-                                        alt.Tooltip(f"{value_col}:Q", format=",.0f", title="Wartosc"),
-                                        alt.Tooltip("pct:Q", format=".1%", title="Udzial w kategorii"),
+                                        alt.Tooltip(f"{value_col}:Q", format=",.0f", title="Wartość"),
+                                        alt.Tooltip("pct:Q", format=".1%", title="Udział w kategorii"),
                                     ],
                                 )
                                 .properties(height=min(520, max(280, 56 + 28 * int(fallback_agg.shape[0]))))
@@ -2197,7 +2197,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         _tw = dict(ctx.get("cs_takeaways") or ctx.get("takeaways") or {})
 
         def _guidance(sens: str, interp: str, best: str) -> None:
-            # âś… Use global Guidance v1.0 (same renderer + CSS contract as Distribution)
+            # ✅ Use global Guidance v1.0 (same renderer + CSS contract as Distribution)
             render_guidance(
                 sens=sens,
                 interp=interp,
@@ -2210,7 +2210,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             txt = str((_tw.get(key) or "")).strip()
             render_exec_takeaway(txt)
 
-        # â”€â”€ aggregation: FULL + Top-N + Other (shares over FULL) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── aggregation: FULL + Top-N + Other (shares over FULL) ────────────
         topn = min(max(5, int(top_n or 10)), 50)
         synthetic_group_tail = f"Pozostale (poza Top-{topn})"
         all_known_groups = {
@@ -2235,8 +2235,8 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         # =========================
         # Block 1: Ranking (Top-N)
         # =========================
-        st.markdown("### Jak wyglÄ…da struktura wartoĹ›ci (absoluty)?")
-        st.caption("Ranking wartoĹ›ci pozwala precyzyjnie porĂłwnaÄ‡ wielkoĹ›Ä‡ segmentĂłw.")
+        st.markdown("### Jak wygląda struktura wartości (absoluty)?")
+        st.caption("Ranking wartości pozwala precyzyjnie porównać wielkość segmentów.")
 
         rank_df = head.copy()
         rank_df["group_label"] = rank_df["group"].astype(str)
@@ -2246,11 +2246,11 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             .mark_bar()
             .encode(
                 y=alt.Y("group_label:N", sort="-x", title=None, axis=alt.Axis(labelLimit=220)),
-                x=alt.X("value:Q", title="WartoĹ›Ä‡ (Suma)"),
+                x=alt.X("value:Q", title="Wartość (Suma)"),
                 tooltip=[
                     alt.Tooltip("group_label:N", title="Kategoria"),
-                    alt.Tooltip("value:Q", format=",.0f", title="WartoĹ›Ä‡"),
-                    alt.Tooltip("share_full:Q", format=".1%", title="UdziaĹ‚ w caĹ‚oĹ›ci"),
+                    alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
+                    alt.Tooltip("share_full:Q", format=".1%", title="Udział w całości"),
                 ],
             )
             .properties(height=420)
@@ -2270,9 +2270,9 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             },
         )
         _guidance(
-            sens='Daje â€žtwardÄ…â€ť skalÄ™ i porĂłwnanie wielkoĹ›ci segmentĂłw.',
-            interp='DuĹĽe rĂłĹĽnice dĹ‚ugoĹ›ci sĹ‚upkĂłw oznaczajÄ… dominacjÄ™ kilku segmentĂłw.',
-            best='Utrzymuj sortowanie malejÄ…ce i ogranicz liczbÄ™ kategorii (TOPâ€‘N + Other).',
+            sens='Daje „twardą” skalę i porównanie wielkości segmentów.',
+            interp='Duże różnice długości słupków oznaczają dominację kilku segmentów.',
+            best='Utrzymuj sortowanie malejące i ogranicz liczbę kategorii (TOP‑N + Other).',
         )
         st.divider()
 
@@ -2280,7 +2280,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         # Block 2: Waterfall (Top-N + Other)
         # =========================
         st.markdown("### Co realnie buduje total?")
-        st.caption("Waterfall pokazuje wkĹ‚ad segmentĂłw do Ĺ‚Ä…cznej wartoĹ›ci (Topâ€‘N + reszta).")
+        st.caption("Waterfall pokazuje wkład segmentów do łącznej wartości (Top‑N + reszta).")
 
         wf = head.copy()
         wf["label"] = wf["group"].astype(str)
@@ -2335,7 +2335,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             text=[f"{v:,.0f}".replace(",", " ") for v in x],
             textposition="outside",
             connector={"line": {"width": 1}},
-            # âś… poprawna nazwa: totals (nie "total")
+            # ✅ poprawna nazwa: totals (nie "total")
             totals={"marker": {"color": "#2D6CDF"}},
             increasing={"marker": {"color": "#2AAE6A"}},
             decreasing={"marker": {"color": "#D64550"}},
@@ -2344,7 +2344,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         fig_wf.update_layout(
             height=430,
             margin=dict(l=20, r=20, t=10, b=30),
-            xaxis_title="WkĹ‚ad do totalu",
+            xaxis_title="Wkład do totalu",
             yaxis_title=None,
             yaxis=dict(autorange="reversed", categoryorder="array", categoryarray=y),
             showlegend=False,
@@ -2363,17 +2363,17 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             },
         )
         _guidance(
-            sens="Identyfikuje gĹ‚Ăłwne dĹşwignie wyniku i porzÄ…dkuje priorytety dziaĹ‚aĹ„.",
-            interp='NajwiÄ™ksze â€žkrokiâ€ť to segmenty o najwiÄ™kszym wkĹ‚adzie; â€žOtherâ€ť pokazuje ogon wartoĹ›ci.',
-            best="Zwykle wystarczy TOPâ€‘5/10 + Other; zbyt wiele krokĂłw pogarsza czytelnoĹ›Ä‡.",
+            sens="Identyfikuje główne dźwignie wyniku i porządkuje priorytety działań.",
+            interp='Największe „kroki” to segmenty o największym wkładzie; „Other” pokazuje ogon wartości.',
+            best="Zwykle wystarczy TOP‑5/10 + Other; zbyt wiele kroków pogarsza czytelność.",
         )
         st.divider()
 
         # =========================
         # Block 3: Pareto (Concentration)
         # =========================
-        st.markdown("### Czy wartoĹ›Ä‡ sprzedaĹĽy jest skoncentrowana?")
-        st.caption("Pareto pokazuje, czy wiÄ™kszoĹ›Ä‡ wartoĹ›ci generuje niewielka liczba segmentĂłw.")
+        st.markdown("### Czy wartość sprzedaży jest skoncentrowana?")
+        st.caption("Pareto pokazuje, czy większość wartości generuje niewielka liczba segmentów.")
 
         pareto = base.copy()
         pareto["group_label"] = pareto["group"].astype(str)
@@ -2412,34 +2412,34 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         fig_p.add_trace(go.Bar(
             x=x_labels,
             y=pareto_vis["value"],
-            name="WartoĹ›Ä‡",
+            name="Wartość",
             marker=dict(color=bar_colors),
         ))
 
         fig_p.add_trace(go.Scatter(
             x=x_labels,
             y=pareto_vis["cum"] * 100,
-            name="Skumulowany udziaĹ‚ %",
+            name="Skumulowany udział %",
             yaxis="y2",
             mode="lines+markers",
         ))
 
-        # đź”µ Marker w punkcie przeciÄ™cia 80% (na krzywej Pareto)
-        # idx progu: p_n-1 (p_n = liczba segmentĂłw potrzebnych do osiÄ…gniÄ™cia cutoff)
+        # 🔵 Marker w punkcie przecięcia 80% (na krzywej Pareto)
+        # idx progu: p_n-1 (p_n = liczba segmentów potrzebnych do osiągnięcia cutoff)
         idx_cut = int(max(0, min((p_n or 1) - 1, len(pareto_vis) - 1)))
 
-        # % skumulowany w punkcie progu (oĹ› y2)
+        # % skumulowany w punkcie progu (oś y2)
         y_cut_pct = float(pareto_vis.loc[idx_cut, "cum"] * 100.0)
 
         fig_p.add_trace(
             go.Scatter(
-                x=[x_labels[idx_cut]],          # spĂłjne z osiÄ… X (lista etykiet)
+                x=[x_labels[idx_cut]],          # spójne z osią X (lista etykiet)
                 y=[y_cut_pct],                  # % na osi y2
                 mode="markers",
                 marker=dict(
                     size=9,
                     color="red",                # Gestalt: ten sam kod semantyczny co linie progu (czerwone kropkowane)
-                    line=dict(color="white", width=1),  # lekki â€śringâ€ť dla czytelnoĹ›ci na niebieskiej krzywej
+                    line=dict(color="white", width=1),  # lekki “ring” dla czytelności na niebieskiej krzywej
                 ),
                 hoverinfo="skip",
                 showlegend=False,
@@ -2450,8 +2450,8 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         fig_p.update_layout(
             height=420,
             margin=dict(l=20, r=20, t=20, b=80),
-            yaxis=dict(title="WartoĹ›Ä‡"),
-            yaxis2=dict(title="Skumulowany udziaĹ‚ %", overlaying="y", side="right", range=[0, 105]),
+            yaxis=dict(title="Wartość"),
+            yaxis2=dict(title="Skumulowany udział %", overlaying="y", side="right", range=[0, 105]),
             legend=dict(orientation="h", yanchor="bottom", y=-0.35),
         )
 
@@ -2464,7 +2464,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             yref="y2",
         )
 
-        # --- vertical line at crossing + label "prĂłg 80%"
+        # --- vertical line at crossing + label "próg 80%"
         if x_cut is not None:
             # limit vline height to primary Y axis (bar scale)
             y_max_val = float(pareto_vis["value"].max()) if len(pareto_vis) else 0.0
@@ -2484,11 +2484,11 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             fig_p.add_annotation(
                 x=x_cut,
                 xref="x",
-                y=0.95,              # â¬…ď¸Ź zamiast 1.0 â€” faktyczne obniĹĽenie
+                y=0.95,              # ⬅️ zamiast 1.0 — faktyczne obniżenie
                 yref="paper",
-                text=f"prĂłg {int(cutoff*100)}%",
+                text=f"próg {int(cutoff*100)}%",
                 showarrow=False,
-                xanchor="center",  # Ĺ‚adniej: centralnie nad liniÄ…
+                xanchor="center",  # ładniej: centralnie nad linią
                 yanchor="bottom",
                 font=dict(color="black", size=11),
                 bgcolor="rgba(255,255,255,0.0)",
@@ -2508,9 +2508,9 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             },
         )
         _guidance(
-            sens=f"Szybko ocenia koncentracjÄ™ (np. {int(cutoff*100)}/{100-int(cutoff*100)}) i ryzyko zaleĹĽnoĹ›ci od top segmentĂłw.",
-            interp="JeĹ›li kumulacja roĹ›nie bardzo szybko na pierwszych segmentach, wartoĹ›Ä‡ jest silnie skoncentrowana.",
-            best="Przy silnej koncentracji buduj osobne strategie dla top segmentĂłw i long taila.",
+            sens=f"Szybko ocenia koncentrację (np. {int(cutoff*100)}/{100-int(cutoff*100)}) i ryzyko zależności od top segmentów.",
+            interp="Jeśli kumulacja rośnie bardzo szybko na pierwszych segmentach, wartość jest silnie skoncentrowana.",
+            best="Przy silnej koncentracji buduj osobne strategie dla top segmentów i long taila.",
         )
         st.divider()
 
@@ -2518,7 +2518,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         # Block 4: Price corridor (NEW)
         # =========================
         st.markdown("### Korytarz cenowy (Price corridor)")
-        st.caption("KtĂłre przedziaĹ‚y cenowe generujÄ… wiÄ™kszoĹ›Ä‡ wartoĹ›ci? (rekomendowane dla kolumn typu cena).")
+        st.caption("Które przedziały cenowe generują większość wartości? (rekomendowane dla kolumn typu cena).")
 
         if price_col and price_col in df.columns and value_col in df.columns:
             corr, meta_bin = _build_price_corridor_from_stats(stats_payload)
@@ -2535,21 +2535,21 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
 
                 c1, c2, c3 = st.columns(3)
                 with c1:
-                    st.metric("Cena P80 (80% wartoĹ›ci)", f"{p80_price:,.0f}" if p80_price is not None else "â€”")
+                    st.metric("Cena P80 (80% wartości)", f"{p80_price:,.0f}" if p80_price is not None else "—")
                 with c2:
                     if lo_edge is not None and hi_edge is not None:
-                        st.metric("Korytarz (20â€“80)", f"{lo_edge:,.0f} â€“ {hi_edge:,.0f}")
+                        st.metric("Korytarz (20–80)", f"{lo_edge:,.0f} – {hi_edge:,.0f}")
                     else:
-                        st.metric("Korytarz (20â€“80)", "â€”")
+                        st.metric("Korytarz (20–80)", "—")
                 with c3:
-                    st.metric("UdziaĹ‚ korytarza", f"{corridor_share:.1f}%")
+                    st.metric("Udział korytarza", f"{corridor_share:.1f}%")
 
                 bar_colors = ["#1f77b4" if i <= idx80 else "#d9d9d9" for i in range(len(corr))]
                 fig = px.bar(
                     corr,
                     x="x_i",
                     y="value",
-                    labels={"x_i": "PrzedziaĹ‚ ceny", "value": "WartoĹ›Ä‡ (w binie)"},
+                    labels={"x_i": "Przedział ceny", "value": "Wartość (w binie)"},
                     title=None,
                 )
                 fig.update_traces(marker=dict(color=bar_colors), selector=dict(type="bar"))
@@ -2605,7 +2605,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                     y=0.95,
                     yref="paper",
                     yshift=0,
-                    text="prĂłg 80%",
+                    text="próg 80%",
                     showarrow=False,
                     xanchor="center",
                     yanchor="bottom",
@@ -2615,7 +2615,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 fig.update_layout(
                     height=460,
                     margin=dict(l=20, r=20, t=20, b=110),
-                    yaxis=dict(title="WartoĹ›Ä‡"),
+                    yaxis=dict(title="Wartość"),
                     yaxis2=dict(
                         title="Kumulacja (%)",
                         overlaying="y",
@@ -2639,13 +2639,13 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 if not str(_tw.get("price_corridor", "")).strip():
                     if (lo_edge is not None) and (hi_edge is not None) and (p80_price is not None):
                         _tw["price_corridor"] = (
-                            f"WartoĹ›Ä‡ jest skoncentrowana cenowo: korytarz {lo_edge:,.0f}â€“{hi_edge:,.0f} generuje "
-                            f"{corridor_share:.1f}% wartoĹ›ci, a prĂłg P80 wypada przy {p80_price:,.0f}."
+                            f"Wartość jest skoncentrowana cenowo: korytarz {lo_edge:,.0f}–{hi_edge:,.0f} generuje "
+                            f"{corridor_share:.1f}% wartości, a próg P80 wypada przy {p80_price:,.0f}."
                         ).replace(",", " ")
                     else:
                         _tw["price_corridor"] = (
-                            f"WartoĹ›Ä‡ jest skoncentrowana cenowo: korytarz (20â€“80) generuje {corridor_share:.1f}% wartoĹ›ci "
-                            f"(P80: {p80_price if p80_price is not None else 'â€”'})."
+                            f"Wartość jest skoncentrowana cenowo: korytarz (20–80) generuje {corridor_share:.1f}% wartości "
+                            f"(P80: {p80_price if p80_price is not None else '—'})."
                         ).replace(",", " ")
 
                 _exec_takeaway(
@@ -2661,21 +2661,21 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                     },
                 )
                 _guidance(
-                    sens="Identyfikuje â€žsweet spotâ€ť cenowy â€” przedziaĹ‚y, ktĂłre generujÄ… wiÄ™kszoĹ›Ä‡ wartoĹ›ci.",
-                    interp=f"80% wartoĹ›ci osiÄ…ga siÄ™ do przedziaĹ‚u **{bin80_label}** (biny o rĂłwnym kroku; krok â‰ {meta_bin.get('step')}).",
-                    best="Zapewnij dostÄ™pnoĹ›Ä‡ i ekspozycjÄ™ w korytarzu; ofertÄ™ premium traktuj osobno.",
+                    sens="Identyfikuje „sweet spot” cenowy — przedziały, które generują większość wartości.",
+                    interp=f"80% wartości osiąga się do przedziału **{bin80_label}** (biny o równym kroku; krok ≈ {meta_bin.get('step')}).",
+                    best="Zapewnij dostępność i ekspozycję w korytarzu; ofertę premium traktuj osobno.",
                 )
                 st.divider()
 
                 if meta_bin.get("clip"):
                     q01 = meta_bin["clip"].get("q01")
                     q99 = meta_bin["clip"].get("q99")
-                    st.caption(f"Uwaga: binning przycina skrajne outliery (1â€“99%): {q01:,.2f} â€“ {q99:,.2f}.")
+                    st.caption(f"Uwaga: binning przycina skrajne outliery (1–99%): {q01:,.2f} – {q99:,.2f}.")
         else:
-            st.info("Wybierz kolumnÄ™ ceny (numerycznÄ…) w filtrach CS, aby pokazaÄ‡ korytarz cenowy.")
+            st.info("Wybierz kolumnę ceny (numeryczną) w filtrach CS, aby pokazać korytarz cenowy.")
 
-        st.markdown("### Jak wyglÄ…da mix w ramach grup?")
-        st.caption("100% stacked pokazuje udziaĹ‚ skĹ‚adnikĂłw w ramach kaĹĽdego segmentu (bez wpĹ‚ywu skali totalu).")
+        st.markdown("### Jak wygląda mix w ramach grup?")
+        st.caption("100% stacked pokazuje udział składników w ramach każdego segmentu (bez wpływu skali totalu).")
 
         mix_agg = None
         if group_col2 and group_col2 in df.columns and group_col2 != group_col:
@@ -2705,14 +2705,14 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                     ))
                 fig_mix.update_layout(
                     barmode="stack",
-                    xaxis=dict(title="UdziaĹ‚ %", range=[0, 105]),
+                    xaxis=dict(title="Udział %", range=[0, 105]),
                     yaxis=dict(title=None),
                     legend=dict(orientation="h", yanchor="bottom", y=-0.28, title=str(group_col2)),
                     margin=dict(l=20, r=20, t=30, b=70),
                     height=450,
                 )
 
-                # âś… zapisz dokĹ‚adnie to, czego uĹĽywa MIX (ĹĽeby Marimekko byĹ‚o 1:1)
+                # ✅ zapisz dokładnie to, czego używa MIX (żeby Marimekko było 1:1)
                 try:
                     cw = list(fig_mix.layout.colorway) if fig_mix.layout.colorway else []
                     if cw:
@@ -2725,7 +2725,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             except Exception as e:
                 st.warning(f"Mix error: {e}")
         else:
-            st.info("WĹ‚Ä…cz **KategoriÄ™ 2** w sidebarze (kategorycznÄ… / lowâ€‘card), aby zobaczyÄ‡ mix.")
+            st.info("Włącz **Kategorię 2** w sidebarze (kategoryczną / low‑card), aby zobaczyć mix.")
 
         _exec_takeaway(
             "mix",
@@ -2737,22 +2737,22 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             },
         )
         _guidance(
-            sens="PorĂłwnuje struktury wewnÄ™trzne miÄ™dzy segmentami (mix), niezaleĹĽnie od wielkoĹ›ci.",
-            interp="RĂłĹĽne proporcje skĹ‚adnikĂłw miÄ™dzy segmentami oznaczajÄ… rĂłĹĽne profile/mix.",
-            best="Ogranicz skĹ‚adniki do Topâ€‘7 + Other, inaczej wykres staje siÄ™ nieczytelny.",
+            sens="Porównuje struktury wewnętrzne między segmentami (mix), niezależnie od wielkości.",
+            interp="Różne proporcje składników między segmentami oznaczają różne profile/mix.",
+            best="Ogranicz składniki do Top‑7 + Other, inaczej wykres staje się nieczytelny.",
         )
         st.divider()
 
         # =========================
-        # Block 6: Marimekko (PRO) â€” guarded + fallback
+        # Block 6: Marimekko (PRO) — guarded + fallback
         # =========================
-        st.markdown("### Marimekko (PRO): skala Ă— struktura")
+        st.markdown("### Marimekko (PRO): skala × struktura")
         st.caption(
-            "Variable width Ĺ‚Ä…czy 2 wymiary naraz: szerokoĹ›Ä‡ segmentu = udziaĹ‚ w totalu (skala), "
-            "wysokoĹ›Ä‡ kolorĂłw = struktura w ramach segmentu."
+            "Variable width łączy 2 wymiary naraz: szerokość segmentu = udział w totalu (skala), "
+            "wysokość kolorów = struktura w ramach segmentu."
         )
 
-        # Jawny opis semantyki (MUST) â€” utrzymuj nad wykresem
+        # Jawny opis semantyki (MUST) — utrzymuj nad wykresem
         st.markdown(
             """
         <div style="
@@ -2763,9 +2763,9 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             margin-bottom: 0.40rem;
         ">
         <ul style="margin-left: 1rem; padding-left: 0;">
-        <li><b>SzerokoĹ›Ä‡ segmentu</b> = udziaĹ‚ segmentu w totalu (skala).</li>
-        <li><b>WysokoĹ›Ä‡ koloru</b> = udziaĹ‚ skĹ‚adnika w ramach segmentu (struktura).</li>
-        <li><b>Pole prostokÄ…ta</b> = wkĹ‚ad <i>segment Ă— skĹ‚adnik</i> do totalu.</li>
+        <li><b>Szerokość segmentu</b> = udział segmentu w totalu (skala).</li>
+        <li><b>Wysokość koloru</b> = udział składnika w ramach segmentu (struktura).</li>
+        <li><b>Pole prostokąta</b> = wkład <i>segment × składnik</i> do totalu.</li>
         </ul>
         </div>
         """,
@@ -2773,16 +2773,16 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         if mix_agg is None or mix_agg.empty:
-            st.info("Wybierz KategoriÄ™ 2, aby zbudowaÄ‡ Marimekko.")
+            st.info("Wybierz Kategorię 2, aby zbudować Marimekko.")
         else:
             # if too many groups/subs -> fallback to stacked
             n_groups = int(mix_agg[group_col].nunique(dropna=True))
             n_subs = int(mix_agg[group_col2].nunique(dropna=True))
             if n_groups > 12 or n_subs > 10:
-                st.info("Zbyt wiele segmentĂłw/skĹ‚adnikĂłw dla czytelnego Marimekko â€” pokazujÄ™ uproszczony 100% stacked.")
+                st.info("Zbyt wiele segmentów/składników dla czytelnego Marimekko — pokazuję uproszczony 100% stacked.")
             else:
                 try:
-                    # Total (do tooltipĂłw i sanity)
+                    # Total (do tooltipów i sanity)
                     total_value = float(mix_agg["value"].sum() or 1.0)
 
                     # widths = total share per group; use the same frame as Mix/ET
@@ -2799,10 +2799,10 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                     # build rectangles manually
                     x0 = 0.0
                     fig_mm = go.Figure()
-                    # âś… kolory 1:1 jak w MIX (zapisane wczeĹ›niej)
+                    # ✅ kolory 1:1 jak w MIX (zapisane wcześniej)
                     cw = st.session_state.get("cs_mix_colorway") or []
                     if not cw:
-                        # awaryjnie: Plotly default colorway (gdyby MIX nie zdÄ…ĹĽyĹ‚ siÄ™ zbudowaÄ‡)
+                        # awaryjnie: Plotly default colorway (gdyby MIX nie zdążył się zbudować)
                         cw = ["#0B5ED7","#8EC9FF","#ff7f0e","#ffbb78","#2ca02c", 
                               "#98df8a","#d62728","#ff9896","#9467bd","#c5b0d5", 
                               "#8c564b","#c49c94","#e377c2","#f7b731","#17becf",]
@@ -2810,13 +2810,13 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
 
                     subs = sorted(mm[group_col2].unique(), key=lambda s: ("ogon" in str(s).lower(), str(s)))
 
-                    # "Other" zawsze szary (czytelnoĹ›Ä‡ + Gestalt)
+                    # "Other" zawsze szary (czytelność + Gestalt)
                     color_map = {s: cw[i % len(cw)] for i, s in enumerate(subs)}
                     for s in subs:
                         if "ogon" in str(s).lower():
                             color_map[s] = "#E0E0E0"
 
-                    # â”€â”€ Label w polu (warunkowy) + auto kolor tekstu + tooltip â”€â”€
+                    # ── Label w polu (warunkowy) + auto kolor tekstu + tooltip ──
                     def _hex_to_rgb(hx: str) -> tuple[int, int, int]:
                         hx = (hx or "").lstrip("#")
                         if len(hx) != 6:
@@ -2824,7 +2824,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                         return tuple(int(hx[i : i + 2], 16) for i in (0, 2, 4))
 
                     def _rel_lum(rgb: tuple[int, int, int]) -> float:
-                        # wzglÄ™dna luminancja (WCAG-ish)
+                        # względna luminancja (WCAG-ish)
                         def _ch(c: float) -> float:
                             c = c / 255.0
                             return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
@@ -2833,12 +2833,12 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                         return 0.2126 * _ch(r) + 0.7152 * _ch(g) + 0.0722 * _ch(b)
 
                     def _text_color(fill: str) -> str:
-                        # czarny na jasnych, biaĹ‚y na ciemnych
+                        # czarny na jasnych, biały na ciemnych
                         return "#111111" if _rel_lum(_hex_to_rgb(fill)) > 0.45 else "#ffffff"
 
-                    # progi etykiet (ĹĽeby nie zabiÄ‡ czytelnoĹ›ci)
-                    MIN_W_PCT = 4.0   # min szerokoĹ›Ä‡ segmentu
-                    MIN_H_PCT = 4.0  # min wysokoĹ›Ä‡ komĂłrki
+                    # progi etykiet (żeby nie zabić czytelności)
+                    MIN_W_PCT = 4.0   # min szerokość segmentu
+                    MIN_H_PCT = 4.0  # min wysokość komórki
                     MIN_AREA = 0.8  # min pole (w% * h%)
 
                     hover_x, hover_y, hover_cd = [], [], []
@@ -2865,7 +2865,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                                 fillcolor=fill,
                             )
 
-                            # Tooltip: dodaj "niewidzialny" punkt w Ĺ›rodku prostokÄ…ta
+                            # Tooltip: dodaj "niewidzialny" punkt w środku prostokąta
                             hover_x.append(x0 + w / 2)
                             hover_y.append(y0 + h / 2)
                             hover_cd.append(
@@ -2879,7 +2879,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                                 ]
                             )
 
-                            # Label w polu: tylko jeĹ›li komĂłrka jest wystarczajÄ…co duĹĽa
+                            # Label w polu: tylko jeśli komórka jest wystarczająco duża
                             if (width_pct >= MIN_W_PCT) and (height_pct >= MIN_H_PCT) and ((width_pct * height_pct) >= MIN_AREA):
                                 fig_mm.add_annotation(
                                     x=x0 + w / 2,
@@ -2904,10 +2904,10 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                             hovertemplate=(
                                 "<b>%{customdata[0]}</b><br>"
                                 f"{group_col2}: " + "%{customdata[1]}<br>"
-                                "WartoĹ›Ä‡: %{customdata[2]:,.0f}<br>"
-                                "UdziaĹ‚ segmentu w totalu (szerokoĹ›Ä‡): %{customdata[3]:.1f}%<br>"
-                                "UdziaĹ‚ skĹ‚adnika w segmencie (wysokoĹ›Ä‡): %{customdata[4]:.1f}%<br>"
-                                "UdziaĹ‚ komĂłrki w totalu (pole): %{customdata[5]:.1f}%<extra></extra>"
+                                "Wartość: %{customdata[2]:,.0f}<br>"
+                                "Udział segmentu w totalu (szerokość): %{customdata[3]:.1f}%<br>"
+                                "Udział składnika w segmencie (wysokość): %{customdata[4]:.1f}%<br>"
+                                "Udział komórki w totalu (pole): %{customdata[5]:.1f}%<extra></extra>"
                             ),
                             showlegend=False,
                         )
@@ -2916,13 +2916,13 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                     fig_mm.update_layout(
                         height=420,
                         margin=dict(l=20, r=20, t=30, b=40),
-                        xaxis=dict(title="UdziaĹ‚ w totalu (%)", range=[0, 100], showgrid=False, zeroline=False),
+                        xaxis=dict(title="Udział w totalu (%)", range=[0, 100], showgrid=False, zeroline=False),
                         yaxis=dict(title="Struktura (%)", range=[0, 100], showgrid=False, zeroline=False),
                         showlegend=False,
                     )
                     st.plotly_chart(fig_mm, width="stretch", config={"displayModeBar": False})
                 except Exception:
-                    st.info("Nie udaĹ‚o siÄ™ wyrenderowaÄ‡ Marimekko dla tych danych â€” uĹĽyj wykresu Mix.")
+                    st.info("Nie udało się wyrenderować Marimekko dla tych danych — użyj wykresu Mix.")
 
         _exec_takeaway(
             "marimekko",
@@ -2934,9 +2934,9 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             },
         )
         _guidance(
-            sens="Pokazuje jednoczeĹ›nie skalÄ™ segmentu (udziaĹ‚ w totalu) i jego strukturÄ™ (skĹ‚ad).",
-            interp="Szerokie segmenty majÄ… najwiÄ™kszy wpĹ‚yw na wynik, a dominujÄ…ce kolory wskazujÄ… kluczowe skĹ‚adniki.",
-            best="Ogranicz liczbÄ™ segmentĂłw (Topâ€‘N) i skĹ‚adnikĂłw (Topâ€‘7 + Other), aby wykres byĹ‚ czytelny.",
+            sens="Pokazuje jednocześnie skalę segmentu (udział w totalu) i jego strukturę (skład).",
+            interp="Szerokie segmenty mają największy wpływ na wynik, a dominujące kolory wskazują kluczowe składniki.",
+            best="Ogranicz liczbę segmentów (Top‑N) i składników (Top‑7 + Other), aby wykres był czytelny.",
         )
 
 
