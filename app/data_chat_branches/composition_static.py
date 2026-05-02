@@ -10,7 +10,10 @@ import re
 import time
 import numpy as np
 import pandas as pd
-import plotly.express as px  # type: ignore
+try:
+    import plotly.express as px  # type: ignore
+except Exception:
+    px = None
 import streamlit as st
 from core.ui_safe import altair_chart_stretch
 from data_chat_core.ui_contract import render_exec_takeaway, render_guidance
@@ -1933,18 +1936,22 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                         )
 
                     if not agg.empty:
-                        path = ["group", "subgroup"] if use_two_levels else ["group"]
-                        fig = px.treemap(agg, path=path, values="value")
-                        fig.update_traces(
-                            textinfo="label+percent root",
-                            hovertemplate="<b>%{label}</b><br>WartoĹ›Ä‡: %{value:,.0f}<br>UdziaĹ‚: %{percentRoot:.1%}<extra></extra>",
-                        )
-                        fig.update_layout(
-                            margin=dict(l=0, r=0, t=0, b=0),
-                            height=520,
-                            uniformtext=dict(minsize=10, mode="hide"),
-                        )
-                        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+                        if px is None:
+                            st.info("Treemapa wymaga biblioteki Plotly. Pokazuje tabele agregacji.")
+                            st.dataframe(agg.head(50), width="stretch")
+                        else:
+                            path = ["group", "subgroup"] if use_two_levels else ["group"]
+                            fig = px.treemap(agg, path=path, values="value")
+                            fig.update_traces(
+                                textinfo="label+percent root",
+                                hovertemplate="<b>%{label}</b><br>WartoĹ›Ä‡: %{value:,.0f}<br>UdziaĹ‚: %{percentRoot:.1%}<extra></extra>",
+                            )
+                            fig.update_layout(
+                                margin=dict(l=0, r=0, t=0, b=0),
+                                height=520,
+                                uniformtext=dict(minsize=10, mode="hide"),
+                            )
+                            st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
                 except Exception:
                     st.warning("Nie udaĹ‚o siÄ™ wyrenderowaÄ‡ treemapy dla wybranych ustawieĹ„.")
             else:
@@ -2046,7 +2053,39 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             st.info("Brak kolumny grupowej lub wartoĹ›ciowej â€” zmieĹ„ dane lub wybierz kategoriÄ™ w sidebarze.")
             return {"chart_meta": {"kind": "composition_static"}, "chart_context": {}}
 
-        import plotly.graph_objects as go  # type: ignore
+        try:
+            import plotly.graph_objects as go  # type: ignore
+        except Exception as exc:
+            st.warning(
+                "Zaawansowane wykresy Composition Static wymagaja biblioteki Plotly. "
+                "Strona dziala dalej; pokazuje skrocony widok tabelaryczny."
+            )
+            if group_col and value_col and group_col in df.columns and value_col in df.columns:
+                try:
+                    fallback_agg = (
+                        df[[group_col, value_col]]
+                        .assign(**{value_col: pd.to_numeric(df[value_col], errors="coerce")})
+                        .dropna(subset=[group_col, value_col])
+                        .groupby(group_col, dropna=False)[value_col]
+                        .sum()
+                        .sort_values(ascending=False)
+                        .head(int(top_n or 10))
+                        .reset_index()
+                    )
+                    st.dataframe(fallback_agg, width="stretch")
+                except Exception:
+                    pass
+            record_debug_checkpoint("cs.plotly_missing", error=f"{type(exc).__name__}: {exc}")
+            return {
+                "chart_meta": {"kind": "composition_static", "plotly_available": False},
+                "chart_context": {
+                    "group_col": group_col,
+                    "group_col2": group_col2,
+                    "value_col": value_col,
+                    "price_col": price_col,
+                    "stats_payload": stats_payload if isinstance(stats_payload, dict) else {},
+                },
+            }
 
         # takeaways dict (from main LLM cache)
         # fallback: allow also generic key name "takeaways" if used elsewhere
