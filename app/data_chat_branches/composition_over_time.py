@@ -9819,6 +9819,27 @@ def _fallback_seasonality_heatmap(
         .configure_view(strokeOpacity=0)
     )
 
+def _fallback_seasonality_heatmap_from_raw(
+    df: pd.DataFrame,
+    *,
+    time_col: Optional[str],
+    cat_col: Optional[str],
+    value_col: Optional[str] = None,
+    qty_col: Optional[str] = None,
+    price_col: Optional[str] = None,
+    top_n: int = 10,
+) -> Optional[alt.Chart]:
+    """Rebuild the monthly table from raw data, then use the robust fallback heatmap."""
+    if df is None or df.empty or not time_col or not cat_col:
+        return None
+    if time_col not in df.columns or cat_col not in df.columns:
+        return None
+    try:
+        df_time = _prep_time_df(df, time_col, cat_col, value_col, qty_col, price_col)
+    except Exception:
+        return None
+    return _fallback_seasonality_heatmap(df_time, cat_col, top_n=top_n)
+
 def _block4_slope_start_end(
     df_time: pd.DataFrame,
     cat_col: str,
@@ -12342,6 +12363,17 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             ch = _unwrap_altair_chart(ch)
             if ch is None and b.get("id") == "cot__seasonality":
                 _raw_ch = _fallback_seasonality_heatmap(df_time, cat_col, top_n=top_n)
+                ch = _unwrap_altair_chart(_raw_ch)
+            if ch is None and b.get("id") == "cot__seasonality":
+                _raw_ch = _fallback_seasonality_heatmap_from_raw(
+                    df,
+                    time_col=time_col,
+                    cat_col=cat_col,
+                    value_col=value_col,
+                    qty_col=qty_col,
+                    price_col=price_col,
+                    top_n=top_n,
+                )
                 ch = _unwrap_altair_chart(_raw_ch)
             if ch is None:
                 if debug_perf:
