@@ -9156,11 +9156,11 @@ def _block3_seasonality(
         y_trim = y_trim.ffill().bfill()
 
         var_y = float(np.nanvar(y_trim.values))
-        if (len(y_trim) < 4) or var_y == 0.0:
+        if len(y_trim) < 1:
             return None, {"skip": True, "skip_reason": "Za krótki lub stały szereg."}
 
         decomp_method = "stl"
-        if STL is not None and len(y_trim) >= min_periods:
+        if STL is not None and len(y_trim) >= min_periods and var_y > 0.0:
             try:
                 res = STL(y_trim, period=12, robust=True).fit()
                 seasonal_trim = pd.Series(res.seasonal, index=y_trim.index)
@@ -9559,6 +9559,8 @@ def _block3_seasonality(
 
     a1 = alt.Chart.from_dict(spec)
 
+    _seasonality_focus_category = None
+    _seasonality_focus_weight = None
     _seasonality_focus_amplitude = None
     _seasonality_focus_verdict = None
     _seasonality_focus_share = None
@@ -9703,6 +9705,119 @@ def _block3_seasonality(
     })
 
     return a1, scorecard_df, stats
+
+def _fallback_seasonality_heatmap(
+    df_time: pd.DataFrame,
+    cat_col: str,
+    top_n: int = 10,
+) -> Optional[alt.Chart]:
+    """Last-resort heatmap for short/flat ranges where STL-style scoring returns no chart."""
+    if df_time is None or df_time.empty:
+        return None
+    if "__month" not in df_time.columns or "__value" not in df_time.columns or cat_col not in df_time.columns:
+        return None
+
+    df = df_time[["__month", cat_col, "__value"]].copy()
+    df["__month"] = pd.to_datetime(df["__month"], errors="coerce")
+    df["__value"] = pd.to_numeric(df["__value"], errors="coerce")
+    df = df.dropna(subset=["__month", cat_col, "__value"])
+    if df.empty:
+        return None
+
+    total_by_cat = (
+        df.groupby(cat_col, dropna=False)["__value"]
+        .sum()
+        .sort_values(ascending=False)
+    )
+    selected = [str(c) for c in total_by_cat.index.astype(str).tolist()[: max(1, int(top_n or 1))]]
+    if not selected:
+        return None
+
+    grouped = (
+        df[df[cat_col].astype(str).isin(selected)]
+        .groupby(["__month", cat_col], as_index=False)["__value"]
+        .sum()
+        .rename(columns={cat_col: "Category", "__value": "value"})
+    )
+    if grouped.empty:
+        return None
+
+    full_idx = pd.date_range(grouped["__month"].min(), grouped["__month"].max(), freq="MS")
+    rows: list[dict] = []
+    for cat in selected:
+        s = (
+            grouped[grouped["Category"].astype(str) == str(cat)]
+            .set_index("__month")["value"]
+            .reindex(full_idx)
+        )
+        y = pd.to_numeric(s, errors="coerce")
+        if y.notna().sum() == 0:
+            continue
+        y = y.interpolate(method="time", limit_area="inside").ffill().bfill().astype(float)
+        vals = y.to_numpy(dtype=float)
+        x = np.arange(len(vals), dtype=float)
+        ok = np.isfinite(vals)
+        if int(ok.sum()) >= 2 and float(np.nanvar(vals)) > 0.0:
+            coeff = np.polyfit(x[ok], vals[ok], 1)
+            trend = np.polyval(coeff, x)
+            seasonal = vals - trend
+        else:
+            seasonal = np.zeros(len(vals), dtype=float)
+        if len(seasonal):
+            seasonal = seasonal - float(np.nanmean(seasonal))
+        for period, seasonal_val in zip(full_idx, seasonal):
+            rows.append(
+                {
+                    "period": period,
+                    "Category": str(cat),
+                    "seasonal": float(seasonal_val) if np.isfinite(seasonal_val) else 0.0,
+                }
+            )
+
+    hm = pd.DataFrame(rows)
+    if hm.empty:
+        return None
+    hm["CategoryLabel"] = hm["Category"].astype(str)
+    v = pd.to_numeric(hm["seasonal"], errors="coerce").dropna()
+    absmax = float(np.nanquantile(np.abs(v.to_numpy(dtype=float)), 0.95)) if not v.empty else 0.0
+    if not np.isfinite(absmax) or absmax <= 0:
+        absmax = 1.0
+
+    n_periods = max(1, int(hm["period"].nunique()))
+    height = int(np.clip(34 * max(1, len(selected)), 120, 360))
+    tick_step = 1 if n_periods <= 14 else (2 if n_periods <= 26 else 3)
+
+    return (
+        alt.Chart(hm)
+        .mark_rect(stroke="rgba(0,0,0,0.18)", strokeWidth=0.6)
+        .encode(
+            x=alt.X(
+                "period:T",
+                timeUnit="yearmonth",
+                title="Miesiąc-rok",
+                axis=alt.Axis(
+                    format="%b %Y",
+                    labelAngle=45,
+                    labelOverlap="greedy",
+                    tickCount={"interval": "month", "step": tick_step},
+                ),
+            ),
+            y=alt.Y("CategoryLabel:N", title="", sort=selected, axis=alt.Axis(labelLimit=500)),
+            color=alt.Color(
+                "seasonal:Q",
+                title="Odchylenie",
+                scale=alt.Scale(domain=[-absmax, absmax], scheme="redblue"),
+                legend=alt.Legend(orient="right", format=",.0f"),
+            ),
+            tooltip=[
+                alt.Tooltip("CategoryLabel:N", title="Kategoria"),
+                alt.Tooltip("period:T", title="Miesiąc", format="%b %Y"),
+                alt.Tooltip("seasonal:Q", title="Odchylenie", format=",.0f"),
+            ],
+        )
+        .properties(height=height)
+        .configure_view(strokeOpacity=0)
+    )
 
 def _block4_slope_start_end(
     df_time: pd.DataFrame,
@@ -12225,6 +12340,9 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             ch = b.get("chart")
             _raw_ch = ch
             ch = _unwrap_altair_chart(ch)
+            if ch is None and b.get("id") == "cot__seasonality":
+                _raw_ch = _fallback_seasonality_heatmap(df_time, cat_col, top_n=top_n)
+                ch = _unwrap_altair_chart(_raw_ch)
             if ch is None:
                 if debug_perf:
                     st.error(
