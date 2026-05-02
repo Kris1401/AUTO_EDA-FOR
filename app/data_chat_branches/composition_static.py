@@ -2056,10 +2056,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         try:
             import plotly.graph_objects as go  # type: ignore
         except Exception as exc:
-            st.warning(
-                "Zaawansowane wykresy Composition Static wymagaja biblioteki Plotly. "
-                "Strona dziala dalej; pokazuje skrocony widok tabelaryczny."
-            )
+            record_debug_checkpoint("cs.plotly_missing", error=f"{type(exc).__name__}: {exc}")
             if group_col and value_col and group_col in df.columns and value_col in df.columns:
                 try:
                     fallback_agg = (
@@ -2072,12 +2069,120 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                         .head(int(top_n or 10))
                         .reset_index()
                     )
-                    st.dataframe(fallback_agg, width="stretch")
-                except Exception:
-                    pass
-            record_debug_checkpoint("cs.plotly_missing", error=f"{type(exc).__name__}: {exc}")
+                    fallback_agg["group_label"] = fallback_agg[group_col].astype(str)
+                    total = float(fallback_agg[value_col].sum() or 0.0)
+                    fallback_agg["share"] = fallback_agg[value_col] / total if total else 0.0
+
+                    st.markdown("### Ranking wartosci wedlug kategorii")
+                    rank_chart = (
+                        alt.Chart(fallback_agg)
+                        .mark_bar()
+                        .encode(
+                            y=alt.Y(
+                                "group_label:N",
+                                sort="-x",
+                                title=None,
+                                axis=alt.Axis(labelLimit=260),
+                            ),
+                            x=alt.X(f"{value_col}:Q", title="Wartosc"),
+                            tooltip=[
+                                alt.Tooltip("group_label:N", title="Kategoria"),
+                                alt.Tooltip(f"{value_col}:Q", format=",.0f", title="Wartosc"),
+                                alt.Tooltip("share:Q", format=".1%", title="Udzial"),
+                            ],
+                        )
+                        .properties(height=min(520, max(280, 56 + 28 * int(fallback_agg.shape[0]))))
+                    )
+                    altair_chart_stretch(st, rank_chart, width="stretch")
+
+                    _exec_takeaway(
+                        "ranking",
+                        anchors={
+                            "metric": value_col,
+                            "cat1": group_col,
+                            "top_segment": str(fallback_agg.iloc[0].get(group_col)) if not fallback_agg.empty else None,
+                            "top_value": float(fallback_agg.iloc[0].get(value_col, 0.0)) if not fallback_agg.empty else None,
+                            "top_share_pct": float(fallback_agg.iloc[0].get("share", 0.0)) * 100.0 if not fallback_agg.empty else None,
+                            "n_segments": int(fallback_agg.shape[0]),
+                        },
+                    )
+
+                    if group_col2 and group_col2 in df.columns and group_col2 != group_col:
+                        mix_source = (
+                            df[[group_col, group_col2, value_col]]
+                            .assign(**{value_col: pd.to_numeric(df[value_col], errors="coerce")})
+                            .dropna(subset=[group_col, group_col2, value_col])
+                        )
+                        top_groups = set(fallback_agg[group_col].astype(str).tolist())
+                        mix_source = mix_source[mix_source[group_col].astype(str).isin(top_groups)]
+                        if not mix_source.empty:
+                            mix_agg = (
+                                mix_source
+                                .groupby([group_col, group_col2], dropna=False)[value_col]
+                                .sum()
+                                .reset_index()
+                            )
+                            sub_totals = mix_agg.groupby(group_col2, dropna=False)[value_col].sum().sort_values(ascending=False)
+                            top_subs = set(sub_totals.head(8).index.tolist())
+                            mix_agg["subgroup"] = mix_agg[group_col2].where(mix_agg[group_col2].isin(top_subs), "Pozostale")
+                            mix_agg = (
+                                mix_agg
+                                .groupby([group_col, "subgroup"], dropna=False)[value_col]
+                                .sum()
+                                .reset_index()
+                            )
+                            mix_agg["group_label"] = mix_agg[group_col].astype(str)
+                            mix_agg["group_total"] = mix_agg.groupby(group_col, dropna=False)[value_col].transform("sum")
+                            mix_agg["pct"] = np.where(
+                                mix_agg["group_total"] > 0,
+                                mix_agg[value_col] / mix_agg["group_total"],
+                                0.0,
+                            )
+
+                            st.markdown("### Mix wewnatrz kategorii")
+                            mix_chart = (
+                                alt.Chart(mix_agg)
+                                .mark_bar()
+                                .encode(
+                                    y=alt.Y(
+                                        "group_label:N",
+                                        sort=list(fallback_agg["group_label"]),
+                                        title=None,
+                                        axis=alt.Axis(labelLimit=260),
+                                    ),
+                                    x=alt.X("pct:Q", stack="zero", title="Udzial w kategorii", axis=alt.Axis(format="%")),
+                                    color=alt.Color("subgroup:N", title=str(group_col2)),
+                                    tooltip=[
+                                        alt.Tooltip("group_label:N", title="Kategoria"),
+                                        alt.Tooltip("subgroup:N", title=str(group_col2)),
+                                        alt.Tooltip(f"{value_col}:Q", format=",.0f", title="Wartosc"),
+                                        alt.Tooltip("pct:Q", format=".1%", title="Udzial w kategorii"),
+                                    ],
+                                )
+                                .properties(height=min(520, max(280, 56 + 28 * int(fallback_agg.shape[0]))))
+                            )
+                            altair_chart_stretch(st, mix_chart, width="stretch")
+
+                            _exec_takeaway(
+                                "mix",
+                                anchors={
+                                    "metric": value_col,
+                                    "cat1": group_col,
+                                    "cat2": group_col2,
+                                    "top_n": int(top_n) if "top_n" in locals() else None,
+                                },
+                            )
+                except Exception as fallback_exc:
+                    record_debug_checkpoint(
+                        "cs.altair_fallback_failed",
+                        error=f"{type(fallback_exc).__name__}: {fallback_exc}",
+                    )
+                    try:
+                        st.dataframe(fallback_agg, width="stretch")
+                    except Exception:
+                        pass
             return {
-                "chart_meta": {"kind": "composition_static", "plotly_available": False},
+                "chart_meta": {"kind": "composition_static", "plotly_available": False, "altair_fallback": True},
                 "chart_context": {
                     "group_col": group_col,
                     "group_col2": group_col2,
