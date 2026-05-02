@@ -5,7 +5,10 @@ openpyxl>=3.1.5
 requests>=2.32
 typing-extensions>=4.12
 numpy>=1.26
-plotly==5.24.1
+plotly>=5.24.1,<6
+narwhals>=1.15
+packaging>=23
+tenacity>=8.2
 python-dotenv>=1.0
 pydantic>=2.8
 Pillow>=10.4

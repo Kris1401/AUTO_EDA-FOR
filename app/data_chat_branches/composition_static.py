@@ -1094,6 +1094,60 @@ def _build_treemap_frame(
     return agg.reset_index(drop=True), use_two_levels
 
 
+def _render_altair_overview_composition(agg: pd.DataFrame, *, use_two_levels: bool) -> None:
+    """Render an overview chart when Plotly treemap is not available."""
+    if not isinstance(agg, pd.DataFrame) or agg.empty:
+        st.info("Brak danych do wizualizacji struktury.")
+        return
+
+    chart_df = agg.copy()
+    chart_df["value"] = pd.to_numeric(chart_df.get("value"), errors="coerce").fillna(0.0)
+    chart_df = chart_df[chart_df["value"] > 0].copy()
+    if chart_df.empty:
+        st.info("Brak dodatnich wartości do wizualizacji struktury.")
+        return
+
+    chart_df["group_label"] = chart_df["group"].astype(str)
+    total = float(chart_df["value"].sum() or 0.0)
+    chart_df["share"] = chart_df["value"] / total if total else 0.0
+    height = min(620, max(320, 70 + 28 * int(chart_df["group_label"].nunique())))
+
+    if use_two_levels and "subgroup" in chart_df.columns:
+        chart_df["subgroup_label"] = chart_df["subgroup"].astype(str)
+        chart = (
+            alt.Chart(chart_df)
+            .mark_bar()
+            .encode(
+                y=alt.Y("group_label:N", sort="-x", title=None, axis=alt.Axis(labelLimit=260)),
+                x=alt.X("value:Q", stack="zero", title="Wartość"),
+                color=alt.Color("subgroup_label:N", title="Podkategoria"),
+                tooltip=[
+                    alt.Tooltip("group_label:N", title="Kategoria"),
+                    alt.Tooltip("subgroup_label:N", title="Podkategoria"),
+                    alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
+                    alt.Tooltip("share:Q", format=".1%", title="Udział w całości"),
+                ],
+            )
+            .properties(height=height)
+        )
+    else:
+        chart = (
+            alt.Chart(chart_df.sort_values("value", ascending=False))
+            .mark_bar()
+            .encode(
+                y=alt.Y("group_label:N", sort="-x", title=None, axis=alt.Axis(labelLimit=260)),
+                x=alt.X("value:Q", title="Wartość"),
+                tooltip=[
+                    alt.Tooltip("group_label:N", title="Kategoria"),
+                    alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
+                    alt.Tooltip("share:Q", format=".1%", title="Udział w całości"),
+                ],
+            )
+            .properties(height=height)
+        )
+    altair_chart_stretch(st, chart, width="stretch")
+
+
 def _build_mix_exec_frame(
     df: pd.DataFrame,
     group_col: str | None,
@@ -1465,6 +1519,330 @@ def _repair_cs_batch_takeaway(label: str, text: str, stats: Dict[str, Any]) -> t
     if repaired and isinstance(repaired, str) and repaired.strip():
         return repaired.strip(), True
     return str(text or "").strip(), False
+
+
+def _render_altair_composition_static_insights(
+    *,
+    df: pd.DataFrame,
+    stats_payload: Dict[str, Any],
+    group_col: str,
+    group_col2: str | None,
+    value_col: str,
+    price_col: str | None,
+    top_n: int,
+    cutoff: float,
+    mix_exec_frame: pd.DataFrame,
+    exec_takeaway_fn: Any,
+    guidance_fn: Any,
+) -> Dict[str, Any]:
+    topn = min(max(5, int(top_n or 10)), 50)
+    synthetic_group_tail = f"Pozostale (poza Top-{topn})"
+    all_known_groups = {
+        str(v)
+        for v in (
+            list((stats_payload or {}).get("top_labels") or [])
+            + list((stats_payload or {}).get("display_labels") or [])
+        )
+    }
+    if synthetic_group_tail in all_known_groups:
+        synthetic_group_tail = f"{synthetic_group_tail} [ogon]"
+
+    base, head, total_full, hhi = _build_cs_structure_frames_from_stats(
+        stats_payload=stats_payload,
+        top_n=topn,
+        synthetic_group_tail=synthetic_group_tail,
+    )
+    if base.empty or head.empty:
+        st.info("Brak danych do analizy struktury po grupowaniu.")
+        return {"chart_meta": {"kind": "composition_static", "plotly_available": False}, "chart_context": {}}
+
+    def _safe_exec(key: str, anchors: Dict[str, Any]) -> None:
+        try:
+            exec_takeaway_fn(key, anchors)
+        except Exception:
+            pass
+
+    def _safe_guidance(sens: str, interp: str, best: str) -> None:
+        try:
+            guidance_fn(sens, interp, best)
+        except Exception:
+            pass
+
+    st.caption(f"HHI (koncentracja): **{hhi:,.0f}**".replace(",", " "))
+
+    # 1. Ranking
+    st.markdown("### Jak wygląda struktura wartości (absoluty)?")
+    st.caption("Ranking wartości pozwala precyzyjnie porównać wielkość segmentów.")
+    rank_df = head.copy()
+    rank_df["group_label"] = rank_df["group"].astype(str)
+    rank_chart = (
+        alt.Chart(rank_df)
+        .mark_bar()
+        .encode(
+            y=alt.Y("group_label:N", sort="-x", title=None, axis=alt.Axis(labelLimit=240)),
+            x=alt.X("value:Q", title="Wartość"),
+            tooltip=[
+                alt.Tooltip("group_label:N", title="Kategoria"),
+                alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
+                alt.Tooltip("share_full:Q", format=".1%", title="Udział w całości"),
+            ],
+        )
+        .properties(height=min(520, max(320, 70 + 28 * int(rank_df.shape[0]))))
+    )
+    altair_chart_stretch(st, rank_chart, width="stretch")
+    _safe_exec(
+        "ranking",
+        {
+            "metric": value_col,
+            "cat1": group_col,
+            "top_segment": str(rank_df.iloc[0].get("group")) if not rank_df.empty else None,
+            "top_value": float(rank_df.iloc[0].get("value", 0.0)) if not rank_df.empty else None,
+            "top_share_pct": float(rank_df.iloc[0].get("share_full", 0.0)) * 100.0 if not rank_df.empty else None,
+            "n_segments": int(rank_df.shape[0]),
+            "hhi": float(hhi) if hhi is not None else None,
+        },
+    )
+    _safe_guidance(
+        "Daje twardą skalę i porównanie wielkości segmentów.",
+        "Najdłuższe słupki wskazują segmenty, które budują największą część wyniku.",
+        "Utrzymuj sortowanie malejące i ogranicz liczbę kategorii do Top-N oraz reszty.",
+    )
+    st.divider()
+
+    # 2. Contribution / waterfall equivalent
+    st.markdown("### Co realnie buduje total?")
+    st.caption("Wkład segmentów do łącznej wartości (Top-N + reszta).")
+    wf = (
+        head.assign(label=head["group"].astype(str))
+        .groupby("label", as_index=False, dropna=False)
+        .agg(value=("value", "sum"))
+        .sort_values("value", ascending=False)
+        .reset_index(drop=True)
+    )
+    wf_total = float(wf["value"].sum() or 0.0)
+    wf["share"] = wf["value"] / wf_total if wf_total else 0.0
+    wf_chart = (
+        alt.Chart(wf)
+        .mark_bar()
+        .encode(
+            y=alt.Y("label:N", sort="-x", title=None, axis=alt.Axis(labelLimit=240)),
+            x=alt.X("value:Q", title="Wkład do totalu"),
+            color=alt.condition(alt.datum.label == synthetic_group_tail, alt.value("#d9d9d9"), alt.value("#2AAE6A")),
+            tooltip=[
+                alt.Tooltip("label:N", title="Segment"),
+                alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
+                alt.Tooltip("share:Q", format=".1%", title="Udział"),
+            ],
+        )
+        .properties(height=min(500, max(300, 70 + 28 * int(wf.shape[0]))))
+    )
+    altair_chart_stretch(st, wf_chart, width="stretch")
+    _safe_exec(
+        "waterfall",
+        {
+            "metric": value_col,
+            "cat1": group_col,
+            "top_item": str(wf.iloc[0]["label"]) if not wf.empty else None,
+            "top_item_value": float(wf.iloc[0]["value"]) if not wf.empty else None,
+            "top_item_share_pct": float(wf.iloc[0]["share"] * 100.0) if not wf.empty else None,
+            "n_items": int(wf.shape[0]),
+        },
+    )
+    _safe_guidance(
+        "Identyfikuje główne dźwignie wyniku i porządkuje priorytety działań.",
+        "Największe wkłady to segmenty o największym wpływie na total.",
+        "Przy silnym ogonie rozdziel strategię dla top segmentów i long taila.",
+    )
+    st.divider()
+
+    # 3. Pareto
+    st.markdown("### Czy wartość sprzedaży jest skoncentrowana?")
+    st.caption("Pareto pokazuje, czy większość wartości generuje niewielka liczba segmentów.")
+    pareto = base.copy()
+    pareto["group_label"] = pareto["group"].astype(str)
+    max_bars = max(25, topn)
+    pareto_vis = pareto.head(max_bars).copy()
+    if len(pareto) > max_bars:
+        rest_val = float(pareto.iloc[max_bars:]["value"].sum())
+        rest_row = pd.DataFrame([{"group_label": synthetic_group_tail, "value": rest_val}])
+        pareto_vis = pd.concat([pareto_vis, rest_row], ignore_index=True)
+    pareto_total = float(pareto_vis["value"].sum() or 1.0)
+    pareto_vis["rank"] = range(1, len(pareto_vis) + 1)
+    pareto_vis["rank_label"] = pareto_vis["group_label"].astype(str)
+    pareto_vis["cum_pct"] = (pareto_vis["value"] / pareto_total).cumsum() * 100.0
+    p_n = int((pareto_vis["cum_pct"] >= cutoff * 100.0).idxmax() + 1) if (pareto_vis["cum_pct"] >= cutoff * 100.0).any() else int(pareto_vis.shape[0])
+    pareto_bar = alt.Chart(pareto_vis).mark_bar(color="#1f77b4").encode(
+        x=alt.X("rank_label:N", sort=None, title=None, axis=alt.Axis(labelAngle=-35, labelLimit=120)),
+        y=alt.Y("value:Q", title="Wartość"),
+        tooltip=[
+            alt.Tooltip("group_label:N", title="Kategoria"),
+            alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
+            alt.Tooltip("cum_pct:Q", format=".1f", title="Skumulowany udział %"),
+        ],
+    )
+    pareto_line = alt.Chart(pareto_vis).mark_line(color="#D64550", point=True).encode(
+        x=alt.X("rank_label:N", sort=None),
+        y=alt.Y("cum_pct:Q", title="Skumulowany udział %", scale=alt.Scale(domain=[0, 105])),
+    )
+    pareto_rule = alt.Chart(pd.DataFrame({"threshold": [cutoff * 100.0]})).mark_rule(color="#D64550", strokeDash=[4, 4]).encode(
+        y="threshold:Q"
+    )
+    altair_chart_stretch(st, (pareto_bar + pareto_line + pareto_rule).resolve_scale(y="independent").properties(height=430), width="stretch")
+    _safe_exec(
+        "pareto",
+        {
+            "metric": value_col,
+            "cat1": group_col,
+            "cutoff_pct": float(cutoff) * 100.0,
+            "p_n": int(p_n),
+            "n_segments": int(pareto_vis.shape[0]),
+            "top_share_pct": float(pareto_vis.iloc[p_n - 1]["cum_pct"]) if p_n and (p_n - 1) < len(pareto_vis) else None,
+        },
+    )
+    _safe_guidance(
+        f"Szybko ocenia koncentrację i ryzyko zależności od top segmentów.",
+        "Szybki wzrost krzywej na pierwszych segmentach oznacza silną koncentrację wartości.",
+        "Przy silnej koncentracji buduj osobne strategie dla top segmentów i long taila.",
+    )
+    st.divider()
+
+    # 4. Price corridor
+    st.markdown("### Korytarz cenowy (Price corridor)")
+    st.caption("Które przedziały cenowe generują większość wartości?")
+    if price_col and price_col in df.columns and value_col in df.columns:
+        corr, meta_bin = _build_price_corridor_from_stats(stats_payload)
+        if corr.empty:
+            st.info("Brak danych do analizy cenowej po filtrach.")
+        else:
+            idx80 = int(meta_bin.get("hi_idx", 0))
+            lo_idx = int(meta_bin.get("lo_idx", 0))
+            corridor_share = float(meta_bin.get("corridor_share_pct") or float(corr.loc[lo_idx:idx80, "share"].sum() * 100.0))
+            lo_edge = meta_bin.get("corridor_low")
+            hi_edge = meta_bin.get("corridor_high")
+            p80_price = meta_bin.get("p80_price")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Cena P80 (80% wartości)", f"{p80_price:,.0f}" if p80_price is not None else "—")
+            with c2:
+                st.metric("Korytarz (20-80)", f"{lo_edge:,.0f} - {hi_edge:,.0f}" if lo_edge is not None and hi_edge is not None else "—")
+            with c3:
+                st.metric("Udział korytarza", f"{corridor_share:.1f}%")
+            corr_plot = corr.copy()
+            corr_plot["in_corridor"] = (corr_plot["x_i"] >= lo_idx) & (corr_plot["x_i"] <= idx80)
+            price_bar = alt.Chart(corr_plot).mark_bar().encode(
+                x=alt.X("price_bin:N", sort=None, title="Przedział ceny", axis=alt.Axis(labelAngle=-35, labelLimit=140)),
+                y=alt.Y("value:Q", title="Wartość"),
+                color=alt.condition(alt.datum.in_corridor, alt.value("#1f77b4"), alt.value("#d9d9d9")),
+                tooltip=[
+                    alt.Tooltip("price_bin:N", title="Przedział"),
+                    alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
+                    alt.Tooltip("cum_pct:Q", format=".1f", title="Kumulacja %"),
+                ],
+            )
+            price_line = alt.Chart(corr_plot).mark_line(color="#D64550", point=True).encode(
+                x=alt.X("price_bin:N", sort=None),
+                y=alt.Y("cum_pct:Q", title="Kumulacja (%)", scale=alt.Scale(domain=[0, 105])),
+            )
+            price_rule = alt.Chart(pd.DataFrame({"threshold": [80.0]})).mark_rule(color="#D64550", strokeDash=[4, 4]).encode(y="threshold:Q")
+            altair_chart_stretch(st, (price_bar + price_line + price_rule).resolve_scale(y="independent").properties(height=450), width="stretch")
+            _safe_exec(
+                "price_corridor",
+                {
+                    "metric": value_col,
+                    "price_col": price_col,
+                    "p80_price": meta_bin.get("p80_price"),
+                    "corridor_low": meta_bin.get("corridor_low"),
+                    "corridor_high": meta_bin.get("corridor_high"),
+                    "corridor_share_pct": meta_bin.get("corridor_share_pct"),
+                    "bin_step": meta_bin.get("step"),
+                },
+            )
+            _safe_guidance(
+                "Identyfikuje przedziały cenowe, które generują większość wartości.",
+                "Korytarz 20-80 wskazuje cenowy zakres największej koncentracji sprzedaży.",
+                "Zapewnij dostępność i ekspozycję w korytarzu; ofertę premium traktuj osobno.",
+            )
+    else:
+        st.info("Wybierz kolumnę ceny w filtrach CS, aby pokazać korytarz cenowy.")
+    st.divider()
+
+    # 5. Mix
+    st.markdown("### Jak wygląda mix w ramach grup?")
+    st.caption("100% stacked pokazuje udział składników w ramach każdego segmentu.")
+    mix_agg = mix_exec_frame.copy() if isinstance(mix_exec_frame, pd.DataFrame) else pd.DataFrame()
+    if group_col2 and group_col2 in df.columns and group_col2 != group_col and not mix_agg.empty:
+        mix_agg["group_label"] = mix_agg[group_col].astype(str)
+        mix_agg["subgroup_label"] = mix_agg[group_col2].astype(str)
+        mix_chart = (
+            alt.Chart(mix_agg)
+            .mark_bar()
+            .encode(
+                y=alt.Y("group_label:N", sort="-x", title=None, axis=alt.Axis(labelLimit=240)),
+                x=alt.X("pct:Q", stack="zero", title="Udział %", scale=alt.Scale(domain=[0, 100])),
+                color=alt.Color("subgroup_label:N", title=str(group_col2)),
+                tooltip=[
+                    alt.Tooltip("group_label:N", title="Grupa"),
+                    alt.Tooltip("subgroup_label:N", title=str(group_col2)),
+                    alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
+                    alt.Tooltip("pct:Q", format=".1f", title="Udział w grupie %"),
+                    alt.Tooltip("area_share_pct:Q", format=".1f", title="Wkład do totalu %"),
+                ],
+            )
+            .properties(height=min(520, max(320, 70 + 28 * int(mix_agg[group_col].nunique()))))
+        )
+        altair_chart_stretch(st, mix_chart, width="stretch")
+    else:
+        st.info("Włącz Kategorię 2 w sidebarze, aby zobaczyć mix.")
+    _safe_exec("mix", {"metric": value_col, "cat1": group_col, "cat2": group_col2, "top_n": int(top_n)})
+    _safe_guidance(
+        "Porównuje struktury wewnętrzne między segmentami.",
+        "Różne proporcje składników oznaczają różne profile kategorii.",
+        "Ogranicz składniki do Top-7 + Other, aby wykres był czytelny.",
+    )
+    st.divider()
+
+    # 6. Marimekko equivalent
+    st.markdown("### Marimekko (PRO): skala x struktura")
+    st.caption("Wersja Altair pokazuje wkład komórki grupa x składnik do totalu.")
+    if group_col2 and group_col2 in df.columns and group_col2 != group_col and not mix_agg.empty:
+        mm_chart = (
+            alt.Chart(mix_agg)
+            .mark_rect()
+            .encode(
+                x=alt.X("group_label:N", sort="-y", title=str(group_col), axis=alt.Axis(labelAngle=-30, labelLimit=140)),
+                y=alt.Y("subgroup_label:N", title=str(group_col2), axis=alt.Axis(labelLimit=180)),
+                color=alt.Color("area_share_pct:Q", title="Wkład do totalu %", scale=alt.Scale(scheme="blues")),
+                tooltip=[
+                    alt.Tooltip("group_label:N", title="Grupa"),
+                    alt.Tooltip("subgroup_label:N", title=str(group_col2)),
+                    alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
+                    alt.Tooltip("group_share_pct:Q", format=".1f", title="Udział grupy w totalu %"),
+                    alt.Tooltip("pct:Q", format=".1f", title="Udział składnika w grupie %"),
+                    alt.Tooltip("area_share_pct:Q", format=".1f", title="Wkład komórki do totalu %"),
+                ],
+            )
+            .properties(height=min(520, max(320, 42 * int(mix_agg[group_col2].nunique()))))
+        )
+        altair_chart_stretch(st, mm_chart, width="stretch")
+    else:
+        st.info("Wybierz Kategorię 2, aby zbudować widok Marimekko.")
+    _safe_exec("marimekko", {"metric": value_col, "cat1": group_col, "cat2": group_col2, "top_n": int(top_n)})
+    _safe_guidance(
+        "Pokazuje jednocześnie skalę segmentu i jego strukturę.",
+        "Najciemniejsze komórki wskazują największy wkład kombinacji grupa x składnik.",
+        "Ogranicz liczbę segmentów i składników, aby wykres był czytelny.",
+    )
+
+    return {
+        "chart_meta": {"kind": "composition_static", "plotly_available": False, "altair_full_fallback": True},
+        "chart_context": {
+            "group_col": group_col,
+            "group_col2": group_col2,
+            "value_col": value_col,
+            "price_col": price_col,
+            "stats_payload": stats_payload if isinstance(stats_payload, dict) else {},
+        },
+    }
 
 
 def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
@@ -1937,8 +2315,8 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
 
                     if not agg.empty:
                         if px is None:
-                            st.info("Treemapa wymaga biblioteki Plotly. Pokazuje tabele agregacji.")
-                            st.dataframe(agg.head(50), width="stretch")
+                            record_debug_checkpoint("cs.overview.plotly_express_missing")
+                            _render_altair_overview_composition(agg, use_two_levels=use_two_levels)
                         else:
                             path = ["group", "subgroup"] if use_two_levels else ["group"]
                             fig = px.treemap(agg, path=path, values="value")
@@ -2057,6 +2435,28 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             import plotly.graph_objects as go  # type: ignore
         except Exception as exc:
             record_debug_checkpoint("cs.plotly_missing", error=f"{type(exc).__name__}: {exc}")
+            def _altair_guidance(sens: str, interp: str, best: str) -> None:
+                render_guidance(
+                    sens=sens,
+                    interp=interp,
+                    best=best,
+                    title="Guidance",
+                    expanded=False,
+                )
+
+            return _render_altair_composition_static_insights(
+                df=df,
+                stats_payload=stats_payload if isinstance(stats_payload, dict) else {},
+                group_col=group_col,
+                group_col2=group_col2,
+                value_col=value_col,
+                price_col=price_col,
+                top_n=top_n,
+                cutoff=cutoff,
+                mix_exec_frame=_mix_exec_frame,
+                exec_takeaway_fn=_exec_takeaway,
+                guidance_fn=_altair_guidance,
+            )
             if group_col and value_col and group_col in df.columns and value_col in df.columns:
                 try:
                     fallback_agg = (
