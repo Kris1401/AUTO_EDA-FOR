@@ -143,6 +143,63 @@ def _openai_error_message(response: requests.Response) -> str:
         return f"OpenAI zwrocil 404: sprawdz nazwe modelu. {msg}"
     return f"OpenAI HTTP {response.status_code}: {msg}"
 
+
+def _openai_chat_text(
+    *,
+    messages: list[dict[str, str]],
+    model: str | None = None,
+    temperature: float = 0.2,
+    response_format: dict[str, Any] | None = None,
+) -> str:
+    api_key = _get_env_or_secret("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Brak OPENAI_API_KEY w .env albo Streamlit Secrets.")
+
+    chat_model = model or _get_env_or_secret("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+    errors: list[str] = []
+
+    if OpenAI is not None:
+        try:
+            client = OpenAI(api_key=api_key)
+            kwargs: dict[str, Any] = {
+                "model": chat_model,
+                "temperature": temperature,
+                "messages": messages,
+            }
+            if response_format is not None:
+                kwargs["response_format"] = response_format
+            resp = client.chat.completions.create(**kwargs)
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as exc:
+            errors.append(f"OpenAI SDK: {exc}")
+    else:
+        errors.append("pakiet openai nie jest dostepny")
+
+    try:
+        body: dict[str, Any] = {
+            "model": chat_model,
+            "temperature": temperature,
+            "messages": messages,
+        }
+        if response_format is not None:
+            body["response_format"] = response_format
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=90,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(_openai_error_message(response))
+        data = response.json()
+        return str(data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+    except Exception as exc:
+        errors.append(f"OpenAI REST: {exc}")
+        raise RuntimeError("; ".join(errors)) from exc
+
 # Optional: Stage 3 disk-based fallback (survives server restart).
 try:
     from core.config import load_config, resolve_artifacts_dir  # type: ignore
@@ -330,22 +387,7 @@ def _dc_register_exec_takeaway_llm_callable() -> None:
     status["configured"] = False
     status["reason"] = "init"
 
-    # OpenAI import check
-    if OpenAI is None:
-        ss.pop("dc_llm_text", None)
-        status["configured"] = False
-        status["reason"] = "openai_import_error"
-        ss["dc_llm_status_v1"] = status
-        return
-
-    # API key (env or secrets)
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        try:
-            api_key = st.secrets.get("OPENAI_API_KEY")  # type: ignore[attr-defined]
-        except Exception:
-            api_key = None
-
+    api_key = _get_env_or_secret("OPENAI_API_KEY")
     if not api_key:
         ss.pop("dc_llm_text", None)
         status["configured"] = False
@@ -355,12 +397,9 @@ def _dc_register_exec_takeaway_llm_callable() -> None:
 
     model = status.get("model") or "gpt-4o-mini"
 
-    # create client once per run
-    client = OpenAI(api_key=api_key)
-
     def _llm_text(prompt: str) -> str:
         # PL-only hard requirement enforced here
-        resp = client.chat.completions.create(
+        return _openai_chat_text(
             model=model,
             temperature=0.2,
             messages=[
@@ -368,8 +407,6 @@ def _dc_register_exec_takeaway_llm_callable() -> None:
                 {"role": "user", "content": prompt},
             ],
         )
-        out = (resp.choices[0].message.content or "")
-        return out
 
     ss["dc_llm_text"] = _llm_text
     status["configured"] = True
@@ -396,32 +433,19 @@ def _dc_register_dc_llm_text_callable() -> None:
         status = {}
         ss["dc_llm_status_v1"] = status
 
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if (not api_key) or (OpenAI is None):
+    api_key = _get_env_or_secret("OPENAI_API_KEY")
+    if not api_key:
         # leave explicit status for debug panel
         status.update({
             "configured": False,
             "provider": "openai_chat_completions",
             "model": None,
-            "reason": "missing_api_key_or_openai_lib",
+            "reason": "missing_api_key",
         })
         ss.pop("dc_llm_text", None)
         return
 
-    chat_model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-
-    # Create client once per run
-    try:
-        client = OpenAI(api_key=api_key)
-    except Exception as e:
-        status.update({
-            "configured": False,
-            "provider": "openai_chat_completions",
-            "model": chat_model,
-            "reason": f"client_init_failed: {type(e).__name__}: {e}",
-        })
-        ss.pop("dc_llm_text", None)
-        return
+    chat_model = _get_env_or_secret("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
     sys_prompt = (
         "Jesteś asystentem analitycznym. Odpowiadasz WYŁĄCZNIE po polsku. "
@@ -429,7 +453,7 @@ def _dc_register_dc_llm_text_callable() -> None:
     )
 
     def _llm_text(prompt: str) -> str:
-        resp = client.chat.completions.create(
+        return _openai_chat_text(
             model=chat_model,
             temperature=0.2,
             messages=[
@@ -437,7 +461,6 @@ def _dc_register_dc_llm_text_callable() -> None:
                 {"role": "user", "content": str(prompt or "")},
             ],
         )
-        return (resp.choices[0].message.content or "")
 
     ss["dc_llm_text"] = _llm_text
     status.update({
@@ -1215,18 +1238,17 @@ def _dc_llm_generate_cs_interpretation(
         "used_fallback": False, "model": None, "error": None,
     }
 
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key or OpenAI is None:
-        debug["error"] = "Brak OPENAI_API_KEY lub biblioteki openai — fallback deterministyczny."
+    api_key = _get_env_or_secret("OPENAI_API_KEY")
+    if not api_key:
+        debug["error"] = "Brak OPENAI_API_KEY w .env albo Streamlit Secrets."
         debug["used_fallback"] = True
         return None, debug
 
-    chat_model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+    chat_model = _get_env_or_secret("OPENAI_CHAT_MODEL", "gpt-4o-mini")
     debug["model"] = chat_model
 
     try:
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
+        raw = _openai_chat_text(
             model=chat_model,
             temperature=0.2,
             messages=[
@@ -1234,12 +1256,6 @@ def _dc_llm_generate_cs_interpretation(
                 {"role": "user",   "content": _dc_cs_user_prompt(stats_payload, question)},
             ],
         )
-        raw = ""
-        try:
-            raw = (resp.choices[0].message.content or "").strip()
-        except Exception:
-            raw = str(resp)
-
         debug["raw_text"] = raw
         obj = _dc_parse_llm_json(raw)
         if obj is None:
@@ -1272,13 +1288,13 @@ def _dc_llm_generate_cs_takeaways(
         "used_fallback": False, "model": None, "error": None,
     }
 
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key or OpenAI is None:
-        debug["error"] = "Brak OPENAI_API_KEY lub biblioteki openai."
+    api_key = _get_env_or_secret("OPENAI_API_KEY")
+    if not api_key:
+        debug["error"] = "Brak OPENAI_API_KEY w .env albo Streamlit Secrets."
         debug["used_fallback"] = True
         return None, debug
 
-    chat_model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+    chat_model = _get_env_or_secret("OPENAI_CHAT_MODEL", "gpt-4o-mini")
     debug["model"] = chat_model
 
     sys = (
@@ -1318,8 +1334,7 @@ def _dc_llm_generate_cs_takeaways(
     }
 
     try:
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
+        txt = _openai_chat_text(
             model=chat_model,
             temperature=0.2,
             messages=[
@@ -1327,7 +1342,6 @@ def _dc_llm_generate_cs_takeaways(
                 {"role":"user","content":json.dumps(user, ensure_ascii=False)}
             ],
         )
-        txt = (resp.choices[0].message.content or "").strip()
         debug["raw_text"] = txt
         obj = _dc_parse_llm_json(txt)
 
@@ -1658,19 +1672,18 @@ def _dc_llm_generate_interpretation_json(
         "error": None,
     }
 
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key or OpenAI is None:
-        debug["error"] = "Brak OPENAI_API_KEY lub biblioteki openai — fallback deterministyczny."
+    api_key = _get_env_or_secret("OPENAI_API_KEY")
+    if not api_key:
+        debug["error"] = "Brak OPENAI_API_KEY w .env albo Streamlit Secrets."
         debug["used_fallback"] = True
         return None, debug
 
     # Model do czatu (nie TTS/STT)
-    chat_model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+    chat_model = _get_env_or_secret("OPENAI_CHAT_MODEL", "gpt-4o-mini")
     debug["model"] = chat_model
 
     try:
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
+        raw = _openai_chat_text(
             model=chat_model,
             temperature=0.2,
             messages=[
@@ -1678,12 +1691,6 @@ def _dc_llm_generate_interpretation_json(
                 {"role": "user", "content": _dc_interp_user_prompt(stats_payload, question)},
             ],
         )
-        raw = ""
-        try:
-            raw = (resp.choices[0].message.content or "").strip()
-        except Exception:
-            raw = str(resp)
-
         debug["raw_text"] = raw
         obj = _dc_parse_llm_json(raw)
         if obj is None:
@@ -3950,7 +3957,14 @@ def main() -> None:
                 try:
                     _dd = st.session_state.get("dc_interp_debug") or {}
                     _ld = (_dd.get("llm_debug") or {}) if isinstance(_dd, dict) else {}
-                    if isinstance(_ld, dict) and bool(_ld.get("used_fallback", False)):
+                    if (
+                        isinstance(_ld, dict)
+                        and bool(_ld.get("used_fallback", False))
+                        and bool(
+                            st.session_state.get("dist_debug_show_fallbacks", False)
+                            or st.session_state.get("dc_debug", False)
+                        )
+                    ):
                         _err = str(_ld.get("error") or "").strip()
                         _reasons = _ld.get("gate_reasons") or []
                         _reason_txt = ""
