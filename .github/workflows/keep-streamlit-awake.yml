@@ -73,7 +73,7 @@ jobs:
 
             echo "curl exit: ${curl_exit}; HTTP status: ${status}"
 
-            if [ "${curl_exit}" -eq 0 ] && [ "${status}" -ge 200 ] && [ "${status}" -lt 500 ]; then
+            if [ "${curl_exit}" -eq 0 ] && [ "${status}" -ge 200 ] && [ "${status}" -lt 400 ]; then
               echo "Keep-awake ping completed."
               exit 0
             fi
