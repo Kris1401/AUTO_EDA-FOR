@@ -2130,7 +2130,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
     # ── CS sidebar params (source of truth) ──────────────────────────────────
     group_col_sel  = ctx.get("cs_group_col")   # Kategoria 1 (selected)
     group_col2_sel = ctx.get("cs_group_col2")  # Kategoria 2 (selected)
-    top_n          = int(ctx.get("cs_top_n") or 10)
+    top_n          = min(max(5, int(ctx.get("cs_top_n") or 10)), 50)
     cutoff         = float(ctx.get("cs_cutoff") or 0.80)
     price_col_sel  = ctx.get("cs_price_col")   # optional (price corridor)
     runtime_signature = _make_cs_runtime_signature(df, filters_signature)
@@ -2613,13 +2613,14 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                                 color_discrete_sequence=px.colors.qualitative.Pastel,
                             )
                             fig.update_traces(
+                                sort=False,
                                 textinfo="label+percent root",
-                                textposition="middle center",
+                                textposition="top left",
                                 textfont=dict(color="#111827", size=14),
                                 insidetextfont=dict(color="#111827", size=14),
                                 outsidetextfont=dict(color="#111827", size=14),
                                 marker=dict(line=dict(color="#ffffff", width=2)),
-                                tiling=dict(packing="squarify", flip="y"),
+                                tiling=dict(packing="squarify"),
                                 hovertemplate="<b>%{label}</b><br>Wartość: %{value:,.0f}<br>Udział: %{percentRoot:.1%}<extra></extra>",
                             )
                             fig.update_layout(
@@ -3039,9 +3040,20 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             decreasing={"marker": {"color": "#D64550"}},
         ))
 
+        for _wf_label in y:
+            fig_wf.add_annotation(
+                x=0,
+                y=_wf_label,
+                text=str(_wf_label),
+                showarrow=False,
+                xanchor="right",
+                xshift=-10,
+                font=dict(size=12, color="#374151"),
+            )
+
         fig_wf.update_layout(
             height=430,
-            margin=dict(l=190, r=45, t=10, b=45),
+            margin=dict(l=260, r=85, t=10, b=45),
             xaxis_title="Wkład do totalu",
             yaxis_title=None,
             yaxis=dict(
