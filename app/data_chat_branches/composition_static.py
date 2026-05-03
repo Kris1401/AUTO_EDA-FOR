@@ -571,6 +571,21 @@ def resolve_grouping_selection(
     group_col = selected_group or _infer_best_group_col(df, exclude={price_col} if price_col else None)
     groupable_group2 = get_groupable_columns(df, exclude={group_col} if group_col else None)
     group_col2 = selected_group2 if selected_group2 in groupable_group2 else None
+    if group_col2 is None and selected_group2 and selected_group2 != group_col:
+        try:
+            sample = _cs_schema_series_sample(df[selected_group2])
+            nuniq = int(sample.nunique(dropna=True))
+            is_bad_numeric = pd.api.types.is_numeric_dtype(df[selected_group2]) and _is_numeric_continuous(sample)
+            if (
+                2 <= nuniq <= 2_000
+                and not is_bad_numeric
+                and not _is_generated_helper_col(selected_group2)
+                and not _is_time_like(selected_group2)
+                and not _is_id_like(selected_group2)
+            ):
+                group_col2 = selected_group2
+        except Exception:
+            group_col2 = None
 
     return {
         "group_col": group_col,
@@ -1258,7 +1273,15 @@ def _render_altair_overview_composition(agg: pd.DataFrame, *, use_two_levels: bo
     )
     labels = (
         alt.Chart(rects[rects["display_label"].astype(str) != ""])
-        .mark_text(align="left", baseline="top", dx=2, dy=2, color="white", fontSize=12, fontWeight="bold")
+        .mark_text(
+            align="left",
+            baseline="top",
+            dx=2,
+            dy=2,
+            color="#111827",
+            fontSize=12,
+            fontWeight="bold",
+        )
         .encode(
             x=alt.X("label_x:Q", scale=alt.Scale(domain=[0, 100]), axis=None),
             y=alt.Y("label_y:Q", scale=alt.Scale(domain=[0, 100]), axis=None),
@@ -2571,10 +2594,32 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                             record_debug_checkpoint("cs.overview.plotly_express_missing")
                             _render_altair_overview_composition(agg, use_two_levels=use_two_levels)
                         else:
+                            if use_two_levels and "subgroup" in agg.columns:
+                                agg = agg.copy()
+                                agg["_group_total"] = agg.groupby("group", dropna=False)["value"].transform("sum")
+                                agg = (
+                                    agg.sort_values(["_group_total", "value"], ascending=[False, False])
+                                    .drop(columns=["_group_total"])
+                                    .reset_index(drop=True)
+                                )
+                            else:
+                                agg = agg.sort_values("value", ascending=False).reset_index(drop=True)
                             path = ["group", "subgroup"] if use_two_levels else ["group"]
-                            fig = px.treemap(agg, path=path, values="value")
+                            fig = px.treemap(
+                                agg,
+                                path=path,
+                                values="value",
+                                color="group",
+                                color_discrete_sequence=px.colors.qualitative.Pastel,
+                            )
                             fig.update_traces(
                                 textinfo="label+percent root",
+                                textposition="middle center",
+                                textfont=dict(color="#111827", size=14),
+                                insidetextfont=dict(color="#111827", size=14),
+                                outsidetextfont=dict(color="#111827", size=14),
+                                marker=dict(line=dict(color="#ffffff", width=2)),
+                                tiling=dict(packing="squarify", flip="y"),
                                 hovertemplate="<b>%{label}</b><br>Wartość: %{value:,.0f}<br>Udział: %{percentRoot:.1%}<extra></extra>",
                             )
                             fig.update_layout(
@@ -2996,10 +3041,20 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
 
         fig_wf.update_layout(
             height=430,
-            margin=dict(l=20, r=20, t=10, b=30),
+            margin=dict(l=190, r=45, t=10, b=45),
             xaxis_title="Wkład do totalu",
             yaxis_title=None,
-            yaxis=dict(autorange="reversed", categoryorder="array", categoryarray=y),
+            yaxis=dict(
+                autorange="reversed",
+                categoryorder="array",
+                categoryarray=y,
+                tickmode="array",
+                tickvals=y,
+                ticktext=y,
+                showticklabels=True,
+                automargin=True,
+                tickfont=dict(size=12, color="#374151"),
+            ),
             showlegend=False,
         )
         st.plotly_chart(fig_wf, width="stretch", config={"displayModeBar": False})
@@ -3330,13 +3385,29 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         st.markdown("### Jak wygląda mix w ramach grup?")
         st.caption("100% stacked pokazuje udział składników w ramach każdego segmentu (bez wpływu skali totalu).")
 
-        mix_agg = None
+        mix_agg = pd.DataFrame()
         if group_col2 and group_col2 in df.columns and group_col2 != group_col:
             try:
                 mix_agg = _mix_exec_frame.copy() if isinstance(_mix_exec_frame, pd.DataFrame) else pd.DataFrame()
                 if mix_agg.empty:
+                    mix_agg = _build_mix_exec_frame(
+                        df=df,
+                        group_col=group_col,
+                        group_col2=group_col2,
+                        value_col=value_col,
+                        top_n=top_n,
+                        top_k=7,
+                    )
+                if mix_agg.empty:
                     raise ValueError("empty_mix_frame")
 
+                group_order = (
+                    mix_agg[[group_col, "group_total"]]
+                    .drop_duplicates()
+                    .sort_values("group_total", ascending=False)[group_col]
+                    .astype(str)
+                    .tolist()
+                )
                 fig_mix = go.Figure()
                 sub_labels = sorted(mix_agg[group_col2].unique(), key=lambda s: ("ogon" in str(s).lower(), str(s)))
                 for sublab in sub_labels:
@@ -3359,10 +3430,16 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 fig_mix.update_layout(
                     barmode="stack",
                     xaxis=dict(title="Udział %", range=[0, 105]),
-                    yaxis=dict(title=None),
+                    yaxis=dict(
+                        title=None,
+                        categoryorder="array",
+                        categoryarray=group_order[::-1],
+                        automargin=True,
+                        tickfont=dict(size=12, color="#374151"),
+                    ),
                     legend=dict(orientation="h", yanchor="bottom", y=-0.28, title=str(group_col2)),
-                    margin=dict(l=20, r=20, t=30, b=70),
-                    height=450,
+                    margin=dict(l=160, r=20, t=30, b=70),
+                    height=max(360, min(560, 120 + 34 * max(1, len(group_order)))),
                 )
 
                 # ✅ zapisz dokładnie to, czego używa MIX (żeby Marimekko było 1:1)
@@ -3376,7 +3453,8 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 st.plotly_chart(fig_mix, width="stretch", config={"displayModeBar": False})
                 
             except Exception as e:
-                st.warning(f"Mix error: {e}")
+                record_debug_checkpoint("cs.mix_plotly_failed", error=f"{type(e).__name__}: {e}")
+                st.info("Brak dodatnich wartości dla wybranej pary kategorii — wybierz inną Kategorię 2 albo miarę.")
         else:
             st.info("Włącz **Kategorię 2** w sidebarze (kategoryczną / low‑card), aby zobaczyć mix.")
 
