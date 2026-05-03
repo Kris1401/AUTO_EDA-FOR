@@ -1,0 +1,62 @@
+name: Keep Streamlit Awake
+
+on:
+  schedule:
+    # Streamlit Community Cloud hibernates apps after 12h without traffic.
+    # Ping every 6h to keep a comfortable buffer.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keep-streamlit-awake
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      APP_URL: ${{ vars.STREAMLIT_APP_URL || secrets.STREAMLIT_APP_URL }}
+
+    steps:
+      - name: Validate URL
+        shell: bash
+        run: |
+          if [ -z "${APP_URL}" ]; then
+            echo "::error::Set STREAMLIT_APP_URL as a repository variable or secret in GitHub Actions."
+            exit 1
+          fi
+
+          if [[ "${APP_URL}" != http://* && "${APP_URL}" != https://* ]]; then
+            APP_URL="https://${APP_URL}"
+          fi
+
+          echo "APP_URL=${APP_URL}" >> "${GITHUB_ENV}"
+          echo "Will ping: ${APP_URL}"
+
+      - name: Ping Streamlit app
+        shell: bash
+        run: |
+          status="$(curl \
+            --location \
+            --silent \
+            --show-error \
+            --output /tmp/streamlit-keep-awake.html \
+            --write-out "%{http_code}" \
+            --connect-timeout 20 \
+            --max-time 120 \
+            --retry 2 \
+            --retry-delay 10 \
+            "${APP_URL}")"
+
+          echo "HTTP status: ${status}"
+
+          if [ "${status}" -lt 200 ] || [ "${status}" -ge 500 ]; then
+            echo "::error::Keep-awake ping failed with HTTP ${status}."
+            exit 1
+          fi
+
+          echo "Keep-awake ping completed."
