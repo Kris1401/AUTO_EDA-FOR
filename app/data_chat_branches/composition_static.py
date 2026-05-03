@@ -1094,6 +1094,129 @@ def _build_treemap_frame(
     return agg.reset_index(drop=True), use_two_levels
 
 
+def _binary_treemap_layout(
+    rows: list[dict[str, Any]],
+    *,
+    x0: float = 0.0,
+    y0: float = 0.0,
+    x1: float = 100.0,
+    y1: float = 100.0,
+) -> list[dict[str, Any]]:
+    """Small dependency-free binary treemap layout in percent coordinates."""
+    clean = [dict(r) for r in rows if float(r.get("value") or 0.0) > 0]
+    if not clean:
+        return []
+    if len(clean) == 1:
+        r = dict(clean[0])
+        r.update({"x0": float(x0), "x1": float(x1), "y0": float(y0), "y1": float(y1)})
+        return [r]
+
+    clean.sort(key=lambda r: float(r.get("value") or 0.0), reverse=True)
+    total = float(sum(float(r.get("value") or 0.0) for r in clean) or 0.0)
+    if total <= 0:
+        return []
+
+    running = 0.0
+    split_idx = 1
+    half = total / 2.0
+    for i, r in enumerate(clean, 1):
+        running += float(r.get("value") or 0.0)
+        split_idx = i
+        if running >= half:
+            break
+
+    left = clean[:split_idx]
+    right = clean[split_idx:]
+    if not right:
+        left = clean[:-1]
+        right = clean[-1:]
+    left_sum = float(sum(float(r.get("value") or 0.0) for r in left) or 0.0)
+    frac = left_sum / total if total else 0.5
+
+    width = float(x1 - x0)
+    height = float(y1 - y0)
+    if width >= height:
+        xm = x0 + width * frac
+        return (
+            _binary_treemap_layout(left, x0=x0, y0=y0, x1=xm, y1=y1)
+            + _binary_treemap_layout(right, x0=xm, y0=y0, x1=x1, y1=y1)
+        )
+    ym = y0 + height * frac
+    return (
+        _binary_treemap_layout(left, x0=x0, y0=y0, x1=x1, y1=ym)
+        + _binary_treemap_layout(right, x0=x0, y0=ym, x1=x1, y1=y1)
+    )
+
+
+def _build_treemap_rects(agg: pd.DataFrame, *, use_two_levels: bool) -> pd.DataFrame:
+    if not isinstance(agg, pd.DataFrame) or agg.empty:
+        return pd.DataFrame()
+
+    src = agg.copy()
+    src["value"] = pd.to_numeric(src.get("value"), errors="coerce").fillna(0.0).clip(lower=0.0)
+    src = src[src["value"] > 0].copy()
+    if src.empty:
+        return pd.DataFrame()
+
+    total = float(src["value"].sum() or 0.0)
+    group_rows = (
+        src.groupby("group", dropna=False, sort=False)["value"]
+        .sum()
+        .reset_index()
+        .rename(columns={"group": "label"})
+        .to_dict("records")
+    )
+    group_rects = _binary_treemap_layout(group_rows)
+
+    out: list[dict[str, Any]] = []
+    if use_two_levels and "subgroup" in src.columns:
+        for gr in group_rects:
+            g = str(gr.get("label"))
+            part = src[src["group"].astype(str) == g].copy()
+            sub_rows = (
+                part.groupby("subgroup", dropna=False, sort=False)["value"]
+                .sum()
+                .reset_index()
+                .rename(columns={"subgroup": "label"})
+                .to_dict("records")
+            )
+            sub_rects = _binary_treemap_layout(
+                sub_rows,
+                x0=float(gr["x0"]),
+                y0=float(gr["y0"]),
+                x1=float(gr["x1"]),
+                y1=float(gr["y1"]),
+            )
+            for sr in sub_rects:
+                val = float(sr.get("value") or 0.0)
+                area = abs(float(sr["x1"]) - float(sr["x0"])) * abs(float(sr["y1"]) - float(sr["y0"]))
+                out.append({
+                    **sr,
+                    "group_label": g,
+                    "subgroup_label": str(sr.get("label")),
+                    "display_label": str(sr.get("label")) if area >= 85 else "",
+                    "share": val / total if total else 0.0,
+                })
+    else:
+        for gr in group_rects:
+            val = float(gr.get("value") or 0.0)
+            area = abs(float(gr["x1"]) - float(gr["x0"])) * abs(float(gr["y1"]) - float(gr["y0"]))
+            out.append({
+                **gr,
+                "group_label": str(gr.get("label")),
+                "subgroup_label": "",
+                "display_label": str(gr.get("label")) if area >= 85 else "",
+                "share": val / total if total else 0.0,
+            })
+
+    rects = pd.DataFrame(out)
+    if rects.empty:
+        return rects
+    rects["label_x"] = rects["x0"].astype(float) + 0.8
+    rects["label_y"] = rects["y0"].astype(float) + 3.0
+    return rects
+
+
 def _render_altair_overview_composition(agg: pd.DataFrame, *, use_two_levels: bool) -> None:
     """Render an overview chart when Plotly treemap is not available."""
     if not isinstance(agg, pd.DataFrame) or agg.empty:
@@ -1107,45 +1230,159 @@ def _render_altair_overview_composition(agg: pd.DataFrame, *, use_two_levels: bo
         st.info("Brak dodatnich wartości do wizualizacji struktury.")
         return
 
-    chart_df["group_label"] = chart_df["group"].astype(str)
-    total = float(chart_df["value"].sum() or 0.0)
-    chart_df["share"] = chart_df["value"] / total if total else 0.0
-    height = min(620, max(320, 70 + 28 * int(chart_df["group_label"].nunique())))
+    rects = _build_treemap_rects(chart_df, use_two_levels=use_two_levels)
+    if rects.empty:
+        st.info("Brak dodatnich wartości do wizualizacji struktury.")
+        return
 
-    if use_two_levels and "subgroup" in chart_df.columns:
-        chart_df["subgroup_label"] = chart_df["subgroup"].astype(str)
-        chart = (
-            alt.Chart(chart_df)
-            .mark_bar()
-            .encode(
-                y=alt.Y("group_label:N", sort="-x", title=None, axis=alt.Axis(labelLimit=260)),
-                x=alt.X("value:Q", stack="zero", title="Wartość"),
-                color=alt.Color("subgroup_label:N", title="Podkategoria"),
-                tooltip=[
-                    alt.Tooltip("group_label:N", title="Kategoria"),
-                    alt.Tooltip("subgroup_label:N", title="Podkategoria"),
-                    alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
-                    alt.Tooltip("share:Q", format=".1%", title="Udział w całości"),
-                ],
-            )
-            .properties(height=height)
+    base = (
+        alt.Chart(rects)
+        .mark_rect(stroke="white", strokeWidth=1.5)
+        .encode(
+            x=alt.X("x0:Q", title=None, scale=alt.Scale(domain=[0, 100]), axis=None),
+            x2="x1:Q",
+            y=alt.Y("y0:Q", title=None, scale=alt.Scale(domain=[0, 100]), axis=None),
+            y2="y1:Q",
+            color=alt.Color(
+                "group_label:N" if use_two_levels else "group_label:N",
+                title="Kategoria",
+                legend=None if not use_two_levels else alt.Legend(orient="bottom", columns=4),
+            ),
+            tooltip=[
+                alt.Tooltip("group_label:N", title="Kategoria"),
+                alt.Tooltip("subgroup_label:N", title="Podkategoria"),
+                alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
+                alt.Tooltip("share:Q", format=".1%", title="Udział w całości"),
+            ],
         )
-    else:
-        chart = (
-            alt.Chart(chart_df.sort_values("value", ascending=False))
-            .mark_bar()
-            .encode(
-                y=alt.Y("group_label:N", sort="-x", title=None, axis=alt.Axis(labelLimit=260)),
-                x=alt.X("value:Q", title="Wartość"),
-                tooltip=[
-                    alt.Tooltip("group_label:N", title="Kategoria"),
-                    alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
-                    alt.Tooltip("share:Q", format=".1%", title="Udział w całości"),
-                ],
-            )
-            .properties(height=height)
+    )
+    labels = (
+        alt.Chart(rects[rects["display_label"].astype(str) != ""])
+        .mark_text(align="left", baseline="top", dx=2, dy=2, color="white", fontSize=12, fontWeight="bold")
+        .encode(
+            x=alt.X("label_x:Q", scale=alt.Scale(domain=[0, 100]), axis=None),
+            y=alt.Y("label_y:Q", scale=alt.Scale(domain=[0, 100]), axis=None),
+            text="display_label:N",
         )
-    altair_chart_stretch(st, chart, width="stretch")
+    )
+    altair_chart_stretch(st, (base + labels).properties(height=520).configure_view(strokeOpacity=0), width="stretch")
+
+
+def _build_altair_waterfall_chart(wf: pd.DataFrame, *, synthetic_group_tail: str) -> alt.Chart:
+    wf2 = wf.copy()
+    wf2["label"] = wf2["label"].astype(str)
+    wf2["value"] = pd.to_numeric(wf2["value"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    wf2 = wf2[wf2["value"] > 0].copy()
+    total_value = float(wf2["value"].sum() or 0.0)
+
+    rows: list[dict[str, Any]] = []
+    cumulative = 0.0
+    for _, r in wf2.iterrows():
+        value = float(r["value"])
+        label = str(r["label"])
+        rows.append({
+            "label": label,
+            "x_start": cumulative,
+            "x_end": cumulative + value,
+            "value": value,
+            "kind": "Other" if label == synthetic_group_tail else "Wkład",
+            "text_x": cumulative + value,
+        })
+        cumulative += value
+    rows.append({
+        "label": "TOTAL",
+        "x_start": 0.0,
+        "x_end": total_value,
+        "value": total_value,
+        "kind": "TOTAL",
+        "text_x": total_value,
+    })
+    plot = pd.DataFrame(rows)
+    order = plot["label"].tolist()
+    height = min(520, max(320, 70 + 28 * int(plot.shape[0])))
+
+    bars = (
+        alt.Chart(plot)
+        .mark_bar(cornerRadius=1)
+        .encode(
+            y=alt.Y("label:N", sort=order, title=None, axis=alt.Axis(labelLimit=260)),
+            x=alt.X("x_start:Q", title="Narastający wkład do totalu"),
+            x2="x_end:Q",
+            color=alt.Color(
+                "kind:N",
+                title="",
+                scale=alt.Scale(domain=["Wkład", "Other", "TOTAL"], range=["#2AAE6A", "#d9d9d9", "#2D6CDF"]),
+                legend=None,
+            ),
+            tooltip=[
+                alt.Tooltip("label:N", title="Segment"),
+                alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
+                alt.Tooltip("x_end:Q", format=",.0f", title="Wkład narastająco"),
+            ],
+        )
+    )
+    labels = (
+        alt.Chart(plot)
+        .mark_text(align="left", dx=6, fontSize=11, color="#374151")
+        .encode(
+            y=alt.Y("label:N", sort=order, axis=None),
+            x=alt.X("text_x:Q"),
+            text=alt.Text("value:Q", format=",.0f"),
+        )
+    )
+    return (bars + labels).properties(height=height).configure_view(strokeOpacity=0)
+
+
+def _build_marimekko_rects(mix_agg: pd.DataFrame, group_col: str, group_col2: str) -> pd.DataFrame:
+    if not isinstance(mix_agg, pd.DataFrame) or mix_agg.empty:
+        return pd.DataFrame()
+    required = {group_col, group_col2, "value", "group_total", "pct", "group_share_pct", "area_share_pct"}
+    if not required.issubset(set(mix_agg.columns)):
+        return pd.DataFrame()
+
+    mm = mix_agg.copy()
+    mm["value"] = pd.to_numeric(mm["value"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    mm["pct"] = pd.to_numeric(mm["pct"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    mm["group_share_pct"] = pd.to_numeric(mm["group_share_pct"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    mm["area_share_pct"] = pd.to_numeric(mm["area_share_pct"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    mm = mm[mm["value"] > 0].copy()
+    if mm.empty:
+        return pd.DataFrame()
+
+    group_totals = (
+        mm[[group_col, "group_total", "group_share_pct"]]
+        .drop_duplicates()
+        .sort_values("group_total", ascending=False)
+        .reset_index(drop=True)
+    )
+    rows: list[dict[str, Any]] = []
+    x0 = 0.0
+    for _, g_row in group_totals.iterrows():
+        group = str(g_row[group_col])
+        width = float(g_row["group_share_pct"])
+        y0 = 0.0
+        part = mm[mm[group_col].astype(str) == group].sort_values(["pct", "value"], ascending=[False, False])
+        for _, r in part.iterrows():
+            height = float(r["pct"])
+            area = float(r["area_share_pct"])
+            rows.append({
+                "group_label": group,
+                "subgroup_label": str(r[group_col2]),
+                "x0": x0,
+                "x1": x0 + width,
+                "y0": y0,
+                "y1": y0 + height,
+                "value": float(r["value"]),
+                "width_pct": width,
+                "height_pct": height,
+                "area_share_pct": area,
+                "display_label": str(r[group_col2]) if width >= 5 and height >= 5 and (width * height) >= 1.0 else "",
+                "label_x": x0 + width / 2.0,
+                "label_y": y0 + height / 2.0,
+            })
+            y0 += height
+        x0 += width
+    return pd.DataFrame(rows)
 
 
 def _build_mix_exec_frame(
@@ -1621,21 +1858,7 @@ def _render_altair_composition_static_insights(
     )
     wf_total = float(wf["value"].sum() or 0.0)
     wf["share"] = wf["value"] / wf_total if wf_total else 0.0
-    wf_chart = (
-        alt.Chart(wf)
-        .mark_bar()
-        .encode(
-            y=alt.Y("label:N", sort="-x", title=None, axis=alt.Axis(labelLimit=240)),
-            x=alt.X("value:Q", title="Wkład do totalu"),
-            color=alt.condition(alt.datum.label == synthetic_group_tail, alt.value("#d9d9d9"), alt.value("#2AAE6A")),
-            tooltip=[
-                alt.Tooltip("label:N", title="Segment"),
-                alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
-                alt.Tooltip("share:Q", format=".1%", title="Udział"),
-            ],
-        )
-        .properties(height=min(500, max(300, 70 + 28 * int(wf.shape[0]))))
-    )
+    wf_chart = _build_altair_waterfall_chart(wf, synthetic_group_tail=synthetic_group_tail)
     altair_chart_stretch(st, wf_chart, width="stretch")
     _safe_exec(
         "waterfall",
@@ -1770,6 +1993,22 @@ def _render_altair_composition_static_insights(
     st.markdown("### Jak wygląda mix w ramach grup?")
     st.caption("100% stacked pokazuje udział składników w ramach każdego segmentu.")
     mix_agg = mix_exec_frame.copy() if isinstance(mix_exec_frame, pd.DataFrame) else pd.DataFrame()
+    if (
+        mix_agg.empty
+        and group_col2
+        and group_col2 in df.columns
+        and group_col2 != group_col
+        and group_col in df.columns
+        and value_col in df.columns
+    ):
+        mix_agg = _build_mix_exec_frame(
+            df=df,
+            group_col=group_col,
+            group_col2=group_col2,
+            value_col=value_col,
+            top_n=top_n,
+            top_k=7,
+        )
     if group_col2 and group_col2 in df.columns and group_col2 != group_col and not mix_agg.empty:
         mix_agg["group_label"] = mix_agg[group_col].astype(str)
         mix_agg["subgroup_label"] = mix_agg[group_col2].astype(str)
@@ -1792,7 +2031,7 @@ def _render_altair_composition_static_insights(
         )
         altair_chart_stretch(st, mix_chart, width="stretch")
     else:
-        st.info("Włącz Kategorię 2 w sidebarze, aby zobaczyć mix.")
+        st.info("Włącz Kategorię 2 w sidebarze albo wybierz parę kategorii z dodatnimi wartościami, aby zobaczyć mix.")
     _safe_exec("mix", {"metric": value_col, "cat1": group_col, "cat2": group_col2, "top_n": int(top_n)})
     _safe_guidance(
         "Porównuje struktury wewnętrzne między segmentami.",
@@ -1803,29 +2042,43 @@ def _render_altair_composition_static_insights(
 
     # 6. Marimekko equivalent
     st.markdown("### Marimekko (PRO): skala x struktura")
-    st.caption("Wersja Altair pokazuje wkład komórki grupa x składnik do totalu.")
+    st.caption("Szerokość segmentu = udział grupy w totalu, wysokość koloru = udział składnika w grupie.")
     if group_col2 and group_col2 in df.columns and group_col2 != group_col and not mix_agg.empty:
-        mm_chart = (
-            alt.Chart(mix_agg)
-            .mark_rect()
-            .encode(
-                x=alt.X("group_label:N", sort="-y", title=str(group_col), axis=alt.Axis(labelAngle=-30, labelLimit=140)),
-                y=alt.Y("subgroup_label:N", title=str(group_col2), axis=alt.Axis(labelLimit=180)),
-                color=alt.Color("area_share_pct:Q", title="Wkład do totalu %", scale=alt.Scale(scheme="blues")),
-                tooltip=[
-                    alt.Tooltip("group_label:N", title="Grupa"),
-                    alt.Tooltip("subgroup_label:N", title=str(group_col2)),
-                    alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
-                    alt.Tooltip("group_share_pct:Q", format=".1f", title="Udział grupy w totalu %"),
-                    alt.Tooltip("pct:Q", format=".1f", title="Udział składnika w grupie %"),
-                    alt.Tooltip("area_share_pct:Q", format=".1f", title="Wkład komórki do totalu %"),
-                ],
+        mm_rects = _build_marimekko_rects(mix_agg, group_col, group_col2)
+        if mm_rects.empty:
+            st.info("Brak dodatnich wartości do zbudowania Marimekko.")
+        else:
+            mm_base = (
+                alt.Chart(mm_rects)
+                .mark_rect(stroke="white", strokeWidth=1)
+                .encode(
+                    x=alt.X("x0:Q", title="Udział grupy w totalu (%)", scale=alt.Scale(domain=[0, 100]), axis=alt.Axis(format=".0f")),
+                    x2="x1:Q",
+                    y=alt.Y("y0:Q", title="Struktura w grupie (%)", scale=alt.Scale(domain=[0, 100]), axis=alt.Axis(format=".0f")),
+                    y2="y1:Q",
+                    color=alt.Color("subgroup_label:N", title=str(group_col2), legend=alt.Legend(orient="bottom", columns=4)),
+                    tooltip=[
+                        alt.Tooltip("group_label:N", title="Grupa"),
+                        alt.Tooltip("subgroup_label:N", title=str(group_col2)),
+                        alt.Tooltip("value:Q", format=",.0f", title="Wartość"),
+                        alt.Tooltip("width_pct:Q", format=".1f", title="Udział grupy w totalu %"),
+                        alt.Tooltip("height_pct:Q", format=".1f", title="Udział składnika w grupie %"),
+                        alt.Tooltip("area_share_pct:Q", format=".1f", title="Wkład komórki do totalu %"),
+                    ],
+                )
             )
-            .properties(height=min(520, max(320, 42 * int(mix_agg[group_col2].nunique()))))
-        )
-        altair_chart_stretch(st, mm_chart, width="stretch")
+            mm_labels = (
+                alt.Chart(mm_rects[mm_rects["display_label"].astype(str) != ""])
+                .mark_text(color="white", fontSize=11, fontWeight="bold")
+                .encode(
+                    x=alt.X("label_x:Q", scale=alt.Scale(domain=[0, 100]), axis=None),
+                    y=alt.Y("label_y:Q", scale=alt.Scale(domain=[0, 100]), axis=None),
+                    text="display_label:N",
+                )
+            )
+            altair_chart_stretch(st, (mm_base + mm_labels).properties(height=430).configure_view(strokeOpacity=0), width="stretch")
     else:
-        st.info("Wybierz Kategorię 2, aby zbudować widok Marimekko.")
+        st.info("Wybierz Kategorię 2 albo parę kategorii z dodatnimi wartościami, aby zbudować widok Marimekko.")
     _safe_exec("marimekko", {"metric": value_col, "cat1": group_col, "cat2": group_col2, "top_n": int(top_n)})
     _safe_guidance(
         "Pokazuje jednocześnie skalę segmentu i jego strukturę.",
