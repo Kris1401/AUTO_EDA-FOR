@@ -89,14 +89,14 @@ st.set_page_config(
 import streamlit.components.v1 as components
 
 try:
-    from audio_recorder_streamlit import audio_recorder
-except Exception:
-    audio_recorder = None
-
-try:
     from streamlit_mic_recorder import mic_recorder
 except Exception:
     mic_recorder = None
+
+try:
+    from audio_recorder_streamlit import audio_recorder
+except Exception:
+    audio_recorder = None
 
 
 def _get_env_or_secret(name: str, default: str = "") -> str:
@@ -2930,21 +2930,6 @@ def _render_datachat_audio_recorder() -> tuple[bytes | None, str, str]:
     provider = ""
     errors: list[str] = []
 
-    if audio_recorder is not None:
-        try:
-            audio_bytes = audio_recorder(
-                text="Kliknij:",
-                recording_color="#ff4b4b",
-                neutral_color="#dddddd",
-                icon_name="microphone",
-                icon_size="4x",
-            )
-            if audio_bytes:
-                return bytes(audio_bytes), "audio/wav", "audio_recorder_streamlit"
-            return None, "audio/wav", "audio_recorder_streamlit"
-        except Exception as exc:
-            errors.append(f"audio_recorder_streamlit: {type(exc).__name__}")
-
     if mic_recorder is not None:
         try:
             recorded = mic_recorder(
@@ -2964,6 +2949,21 @@ def _render_datachat_audio_recorder() -> tuple[bytes | None, str, str]:
             return None, "audio/wav", "streamlit_mic_recorder"
         except Exception as exc:
             errors.append(f"streamlit_mic_recorder: {type(exc).__name__}")
+
+    if audio_recorder is not None:
+        try:
+            audio_bytes = audio_recorder(
+                text="Kliknij:",
+                recording_color="#ff4b4b",
+                neutral_color="#dddddd",
+                icon_name="microphone",
+                icon_size="4x",
+            )
+            if audio_bytes:
+                return bytes(audio_bytes), "audio/wav", "audio_recorder_streamlit"
+            return None, "audio/wav", "audio_recorder_streamlit"
+        except Exception as exc:
+            errors.append(f"audio_recorder_streamlit: {type(exc).__name__}")
 
     audio_input = getattr(st, "audio_input", None)
     if callable(audio_input):
@@ -2993,7 +2993,7 @@ def _render_datachat_audio_recorder() -> tuple[bytes | None, str, str]:
             errors.append(f"st.audio_input: {type(exc).__name__}")
 
     if not provider:
-        st.caption("Brak komponentu nagrywania audio. Sprawdz instalacje: audio-recorder-streamlit lub streamlit-mic-recorder.")
+        st.caption("Brak komponentu nagrywania audio. Sprawdz instalacje: streamlit-mic-recorder.")
     elif errors:
         st.caption("Nagrywanie audio jest chwilowo niedostepne: " + "; ".join(errors[:2]))
 
