@@ -19,14 +19,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      APP_URL: ${{ vars.STREAMLIT_APP_URL || secrets.STREAMLIT_APP_URL }}
+      APP_URL: https://auto-eda-for.streamlit.app
 
     steps:
       - name: Validate URL
         shell: bash
         run: |
           if [ -z "${APP_URL}" ]; then
-            echo "::error::Set STREAMLIT_APP_URL as a repository variable or secret in GitHub Actions."
+            echo "::error::Set APP_URL in this workflow."
             exit 1
           fi
 
