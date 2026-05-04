@@ -1013,6 +1013,7 @@ def _build_price_corridor_from_stats(
 
 def _make_cs_runtime_signature(df: pd.DataFrame, filters: Dict[str, Any] | None = None) -> str:
     payload = {
+        "renderer_version": "composition_static_charts_v6",
         "rows": int(len(df) if isinstance(df, pd.DataFrame) else 0),
         "columns": [str(c) for c in (df.columns if isinstance(df, pd.DataFrame) else [])],
         "dtypes": [str(t) for t in (df.dtypes if isinstance(df, pd.DataFrame) else [])],
@@ -1161,9 +1162,12 @@ def _binary_treemap_layout(
             + _binary_treemap_layout(right, x0=xm, y0=y0, x1=x1, y1=y1)
         )
     ym = y0 + height * frac
+    # Plotly uses a visually reversed y-axis for this treemap. Put the larger
+    # slice above and keep the residual/smaller slice on the lower edge so the
+    # smallest categories settle toward the bottom-right corner.
     return (
-        _binary_treemap_layout(left, x0=x0, y0=y0, x1=x1, y1=ym)
-        + _binary_treemap_layout(right, x0=x0, y0=ym, x1=x1, y1=y1)
+        _binary_treemap_layout(left, x0=x0, y0=ym, x1=x1, y1=y1)
+        + _binary_treemap_layout(right, x0=x0, y0=y0, x1=x1, y1=ym)
     )
 
 
@@ -1232,7 +1236,7 @@ def _build_treemap_rects(agg: pd.DataFrame, *, use_two_levels: bool) -> pd.DataF
     if rects.empty:
         return rects
     rects["label_x"] = rects["x0"].astype(float) + 0.8
-    rects["label_y"] = rects["y0"].astype(float) + 3.0
+    rects["label_y"] = rects["y1"].astype(float) - 3.0
     return rects
 
 
@@ -1295,7 +1299,7 @@ def _render_controlled_treemap(agg: pd.DataFrame, *, use_two_levels: bool) -> bo
         if float(r.get("area") or 0.0) >= 65:
             fig.add_annotation(
                 x=x0 + 0.8,
-                y=y0 + 2.2,
+                y=y1 - 2.2,
                 text=f"<b>{label}</b>",
                 showarrow=False,
                 xanchor="left",
@@ -3256,6 +3260,40 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             increasing={"marker": {"color": "#2AAE6A"}},
             decreasing={"marker": {"color": "#D64550"}},
         ))
+
+        wf_cumulative = 0.0
+        wf_label_pad = max(total_value * 0.006, 1.0)
+        for _wf_label, _wf_value in zip(wf_labels, wf_values):
+            fig_wf.add_annotation(
+                x=wf_cumulative + wf_label_pad,
+                xref="x",
+                y=_wf_label,
+                yref="y",
+                text=f"<b>{_wf_label}</b>",
+                showarrow=False,
+                xanchor="left",
+                yanchor="middle",
+                align="left",
+                font=dict(size=12, color="#111827"),
+                bgcolor="rgba(255,255,255,0.78)",
+                bordercolor="rgba(255,255,255,0)",
+                borderpad=2,
+            )
+            wf_cumulative += float(_wf_value)
+        fig_wf.add_annotation(
+            x=wf_label_pad,
+            xref="x",
+            y="TOTAL",
+            yref="y",
+            text="<b>TOTAL</b>",
+            showarrow=False,
+            xanchor="left",
+            yanchor="middle",
+            font=dict(size=12, color="#111827"),
+            bgcolor="rgba(255,255,255,0.78)",
+            bordercolor="rgba(255,255,255,0)",
+            borderpad=2,
+        )
 
         for _wf_label in y:
             fig_wf.add_annotation(

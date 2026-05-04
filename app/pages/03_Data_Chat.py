@@ -3487,6 +3487,22 @@ def main() -> None:
             active_filters = copy.deepcopy(_filters_live)
         else:
             active_filters = copy.deepcopy(committed_filters or _filters_live)
+            if current_intent in ("composition", "composition_static", "composition_over_time", "cot"):
+                # Composition sidebar controls are chart controls, not only run-time
+                # inputs. Keep them live on every rerun so changing Top-N/category
+                # immediately rebuilds Treemap/Waterfall/Mix/Marimekko.
+                for _live_key in (
+                    "cs_group_col",
+                    "cs_group_col2",
+                    "cs_top_n",
+                    "cs_cutoff",
+                    "cs_price_col",
+                    "cot_cat_col",
+                    "cot_top_n",
+                    "cot_include_other",
+                ):
+                    if _live_key in _filters_live:
+                        active_filters[_live_key] = copy.deepcopy(_filters_live.get(_live_key))
 
     st.session_state["datachat_active_filters"] = active_filters
     df = _apply_df_filters(df_source, active_filters)
