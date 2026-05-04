@@ -14,6 +14,10 @@ try:
     import plotly.express as px  # type: ignore
 except Exception:
     px = None
+try:
+    import plotly.graph_objects as go  # type: ignore
+except Exception:
+    go = None
 import streamlit as st
 from core.ui_safe import altair_chart_stretch
 from data_chat_core.ui_contract import render_exec_takeaway, render_guidance
@@ -1232,6 +1236,105 @@ def _build_treemap_rects(agg: pd.DataFrame, *, use_two_levels: bool) -> pd.DataF
     return rects
 
 
+def _render_controlled_treemap(agg: pd.DataFrame, *, use_two_levels: bool) -> bool:
+    """Render deterministic treemap rectangles with labels in each top-left corner."""
+    if go is None or not isinstance(agg, pd.DataFrame) or agg.empty:
+        return False
+
+    src = agg.copy()
+    src["value"] = pd.to_numeric(src.get("value"), errors="coerce").fillna(0.0).clip(lower=0.0)
+    src = src[src["value"] > 0].copy()
+    if src.empty or "group" not in src.columns:
+        return False
+
+    group_df = (
+        src.groupby("group", dropna=False, sort=False)["value"]
+        .sum()
+        .reset_index()
+        .rename(columns={"group": "label"})
+        .sort_values("value", ascending=False)
+        .reset_index(drop=True)
+    )
+    rows = group_df.to_dict("records")
+    rects = pd.DataFrame(_binary_treemap_layout(rows))
+    if rects.empty:
+        return False
+
+    total = float(rects["value"].sum() or 0.0)
+    rects["share"] = np.where(total > 0, rects["value"] / total, 0.0)
+    rects["area"] = (rects["x1"].astype(float) - rects["x0"].astype(float)).abs() * (
+        rects["y1"].astype(float) - rects["y0"].astype(float)
+    ).abs()
+
+    palette = [
+        "#FFD166", "#2CB1A1", "#0B70C9", "#76E39B", "#FF9EA5",
+        "#FF8700", "#D1D5DB", "#7EC5F4", "#FF2D2D", "#6F42C1",
+        "#9CA3AF", "#F59E0B", "#10B981", "#3B82F6", "#EF4444",
+    ]
+    fig = go.Figure()
+    hover_x: list[float] = []
+    hover_y: list[float] = []
+    hover_cd: list[list[Any]] = []
+
+    for i, r in rects.iterrows():
+        x0, x1 = float(r["x0"]), float(r["x1"])
+        y0, y1 = float(r["y0"]), float(r["y1"])
+        label = str(r.get("label") or "")
+        value = float(r.get("value") or 0.0)
+        share = float(r.get("share") or 0.0)
+        fill = palette[int(i) % len(palette)]
+        fig.add_shape(
+            type="rect",
+            x0=x0,
+            x1=x1,
+            y0=y0,
+            y1=y1,
+            line=dict(color="#ffffff", width=1.5),
+            fillcolor=fill,
+        )
+        if float(r.get("area") or 0.0) >= 65:
+            fig.add_annotation(
+                x=x0 + 0.8,
+                y=y0 + 2.2,
+                text=f"<b>{label}</b>",
+                showarrow=False,
+                xanchor="left",
+                yanchor="top",
+                align="left",
+                font=dict(size=12, color="#111827"),
+            )
+        hover_x.append(x0 + (x1 - x0) / 2.0)
+        hover_y.append(y0 + (y1 - y0) / 2.0)
+        hover_cd.append([label, value, share])
+
+    fig.add_trace(
+        go.Scatter(
+            x=hover_x,
+            y=hover_y,
+            mode="markers",
+            marker=dict(size=18, opacity=0),
+            customdata=hover_cd,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Wartosc: %{customdata[1]:,.0f}<br>"
+                "Udzial: %{customdata[2]:.1%}<extra></extra>"
+            ),
+            showlegend=False,
+        )
+    )
+    fig.update_layout(
+        height=520,
+        margin=dict(l=0, r=0, t=0, b=0),
+        xaxis=dict(range=[0, 100], visible=False, fixedrange=True),
+        yaxis=dict(range=[100, 0], visible=False, fixedrange=True),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        showlegend=False,
+    )
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    return True
+
+
 def _render_altair_overview_composition(agg: pd.DataFrame, *, use_two_levels: bool) -> None:
     """Render an overview chart when Plotly treemap is not available."""
     if not isinstance(agg, pd.DataFrame) or agg.empty:
@@ -2029,7 +2132,7 @@ def _render_altair_composition_static_insights(
             group_col=group_col,
             group_col2=group_col2,
             value_col=value_col,
-            top_n=top_n,
+            top_n=topn,
             top_k=7,
         )
     if group_col2 and group_col2 in df.columns and group_col2 != group_col and not mix_agg.empty:
@@ -2590,7 +2693,9 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                         )
 
                     if not agg.empty:
-                        if px is None:
+                        if _render_controlled_treemap(agg, use_two_levels=use_two_levels):
+                            pass
+                        elif px is None:
                             record_debug_checkpoint("cs.overview.plotly_express_missing")
                             _render_altair_overview_composition(agg, use_two_levels=use_two_levels)
                         else:
@@ -3043,17 +3148,19 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         for _wf_label in y:
             fig_wf.add_annotation(
                 x=0,
+                xref="paper",
                 y=_wf_label,
+                yref="y",
                 text=str(_wf_label),
                 showarrow=False,
                 xanchor="right",
-                xshift=-10,
+                xshift=-18,
                 font=dict(size=12, color="#374151"),
             )
 
         fig_wf.update_layout(
             height=430,
-            margin=dict(l=260, r=85, t=10, b=45),
+            margin=dict(l=340, r=85, t=10, b=45),
             xaxis_title="Wkład do totalu",
             yaxis_title=None,
             yaxis=dict(

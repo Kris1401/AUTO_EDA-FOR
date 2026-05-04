@@ -2283,7 +2283,8 @@ def _render_sidebar_filters(df: pd.DataFrame, schema_ctx: Dict[str, Any]) -> Dic
         date_range = None
         cs_group_col = None
         cs_group_col2 = "(brak)"
-        cs_top_n = min(max(5, int(st.session_state.get("cs__top_n", 10))), 50)
+        _raw_cs_top_n = st.session_state.get("cs__top_n_v2", st.session_state.get("cs__top_n", 10))
+        cs_top_n = min(max(5, int(_raw_cs_top_n)), 50)
         st.session_state["cs__top_n"] = cs_top_n
         cs_cutoff = float(st.session_state.get("cs__cutoff", 0.80))
         cs_price_col = st.session_state.get("cs__price_col", "(auto)")
@@ -2556,16 +2557,18 @@ def _render_sidebar_filters(df: pd.DataFrame, schema_ctx: Dict[str, Any]) -> Dic
                 )
 
                 # ── TOP-N
-                _cs_top_n_value = min(max(5, int(st.session_state.get("cs__top_n", 10))), 50)
-                st.session_state["cs__top_n"] = _cs_top_n_value
+                _raw_cs_top_n = st.session_state.get("cs__top_n_v2", st.session_state.get("cs__top_n", 10))
+                _cs_top_n_value = min(max(5, int(_raw_cs_top_n)), 50)
+                st.session_state["cs__top_n_v2"] = _cs_top_n_value
                 cs_top_n = st.slider(
                     "TOP-N (Treemap / Pareto / Mix)",
                     min_value=5,
                     max_value=50,
                     value=_cs_top_n_value,
                     step=1,
-                    key="cs__top_n",
+                    key="cs__top_n_v2",
                 )
+                st.session_state["cs__top_n"] = cs_top_n
 
                 # ── Pareto cutoff
                 cs_cutoff = st.slider(
@@ -2697,7 +2700,9 @@ def _render_sidebar_filters(df: pd.DataFrame, schema_ctx: Dict[str, Any]) -> Dic
     if _active_intent == "distribution":
         cs_group_col    = st.session_state.get("cs__group_col")
         cs_group_col2   = st.session_state.get("cs__group_col2", "(brak)")
-        cs_top_n        = min(max(5, int(st.session_state.get("cs__top_n", 10))), 50)
+        _raw_cs_top_n   = st.session_state.get("cs__top_n_v2", st.session_state.get("cs__top_n", 10))
+        cs_top_n        = min(max(5, int(_raw_cs_top_n)), 50)
+        st.session_state["cs__top_n"] = cs_top_n
         cs_cutoff       = float(st.session_state.get("cs__cutoff", 0.80))
 
     return {
