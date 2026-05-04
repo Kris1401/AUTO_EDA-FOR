@@ -86,6 +86,39 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+
+def _inject_datachat_sidebar_css() -> None:
+    st.markdown(
+        """
+        <style>
+        section[data-testid="stSidebar"] .stSlider,
+        section[data-testid="stSidebar"] .stSlider * {
+            overflow: visible !important;
+            word-break: normal !important;
+            overflow-wrap: normal !important;
+        }
+        section[data-testid="stSidebar"] .stSlider [data-testid="stThumbValue"],
+        section[data-testid="stSidebar"] .stSlider [data-testid="stThumbValue"] p {
+            min-width: 2.6rem !important;
+            width: max-content !important;
+            white-space: nowrap !important;
+            text-align: center !important;
+            line-height: 1.1 !important;
+        }
+        section[data-testid="stSidebar"] .stSlider [data-testid="stTickBarMin"],
+        section[data-testid="stSidebar"] .stSlider [data-testid="stTickBarMax"],
+        section[data-testid="stSidebar"] .stSlider [data-testid="stTickBarMin"] p,
+        section[data-testid="stSidebar"] .stSlider [data-testid="stTickBarMax"] p {
+            min-width: 2.8rem !important;
+            white-space: nowrap !important;
+            text-align: center !important;
+            line-height: 1.1 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 import streamlit.components.v1 as components
 
 try:
@@ -2481,6 +2514,7 @@ def _render_sidebar_filters(df: pd.DataFrame, schema_ctx: Dict[str, Any]) -> Dic
                     max_value=20,
                     value=int(st.session_state.get("cot__top_n", 10)),
                     step=1,
+                    format="%d",
                     key="cot__top_n",
                 )
 
@@ -2566,6 +2600,7 @@ def _render_sidebar_filters(df: pd.DataFrame, schema_ctx: Dict[str, Any]) -> Dic
                     max_value=50,
                     value=_cs_top_n_value,
                     step=1,
+                    format="%d",
                     key="cs__top_n_v2",
                 )
                 st.session_state["cs__top_n"] = cs_top_n
@@ -2577,6 +2612,7 @@ def _render_sidebar_filters(df: pd.DataFrame, schema_ctx: Dict[str, Any]) -> Dic
                     max_value=0.95,
                     value=float(st.session_state.get("cs__cutoff", 0.80)),
                     step=0.05,
+                    format="%.2f",
                     key="cs__cutoff",
                 )
 
@@ -3076,6 +3112,7 @@ def _deterministic_questions(has_time: bool) -> list[str]:
 
 
 def main() -> None:
+    _inject_datachat_sidebar_css()
     # --- Nawigacja jak w Etapie 1/2 (góra) ---
     hide_default_multipage_nav()
     render_flow_nav(current_id="03_Data_Chat", key_prefix="flow_top")

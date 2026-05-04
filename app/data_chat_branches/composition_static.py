@@ -1013,7 +1013,7 @@ def _build_price_corridor_from_stats(
 
 def _make_cs_runtime_signature(df: pd.DataFrame, filters: Dict[str, Any] | None = None) -> str:
     payload = {
-        "renderer_version": "composition_static_charts_v6",
+        "renderer_version": "composition_static_charts_v7",
         "rows": int(len(df) if isinstance(df, pd.DataFrame) else 0),
         "columns": [str(c) for c in (df.columns if isinstance(df, pd.DataFrame) else [])],
         "dtypes": [str(t) for t in (df.dtypes if isinstance(df, pd.DataFrame) else [])],
@@ -1162,9 +1162,6 @@ def _binary_treemap_layout(
             + _binary_treemap_layout(right, x0=xm, y0=y0, x1=x1, y1=y1)
         )
     ym = y0 + height * frac
-    # Plotly uses a visually reversed y-axis for this treemap. Put the larger
-    # slice above and keep the residual/smaller slice on the lower edge so the
-    # smallest categories settle toward the bottom-right corner.
     return (
         _binary_treemap_layout(left, x0=x0, y0=ym, x1=x1, y1=y1)
         + _binary_treemap_layout(right, x0=x0, y0=y0, x1=x1, y1=ym)
@@ -1242,7 +1239,11 @@ def _build_treemap_rects(agg: pd.DataFrame, *, use_two_levels: bool) -> pd.DataF
 
 def _render_controlled_treemap(agg: pd.DataFrame, *, use_two_levels: bool) -> bool:
     """Render deterministic treemap rectangles with labels in each top-left corner."""
-    if go is None or not isinstance(agg, pd.DataFrame) or agg.empty:
+    try:
+        import plotly.graph_objects as go_mod  # type: ignore
+    except Exception:
+        go_mod = go
+    if go_mod is None or not isinstance(agg, pd.DataFrame) or agg.empty:
         return False
 
     src = agg.copy()
@@ -1251,6 +1252,10 @@ def _render_controlled_treemap(agg: pd.DataFrame, *, use_two_levels: bool) -> bo
     if src.empty or "group" not in src.columns:
         return False
 
+    # The overview treemap must explain the primary business segments first.
+    # Kategoria 2 powers Mix/Marimekko, but here it made the treemap label
+    # countries instead of categories, so the overview intentionally stays
+    # at the category level.
     group_df = (
         src.groupby("group", dropna=False, sort=False)["value"]
         .sum()
@@ -1275,7 +1280,7 @@ def _render_controlled_treemap(agg: pd.DataFrame, *, use_two_levels: bool) -> bo
         "#FF8700", "#D1D5DB", "#7EC5F4", "#FF2D2D", "#6F42C1",
         "#9CA3AF", "#F59E0B", "#10B981", "#3B82F6", "#EF4444",
     ]
-    fig = go.Figure()
+    fig = go_mod.Figure()
     hover_x: list[float] = []
     hover_y: list[float] = []
     hover_cd: list[list[Any]] = []
@@ -1306,13 +1311,16 @@ def _render_controlled_treemap(agg: pd.DataFrame, *, use_two_levels: bool) -> bo
                 yanchor="top",
                 align="left",
                 font=dict(size=12, color="#111827"),
+                bgcolor="rgba(255,255,255,0.72)",
+                bordercolor="rgba(255,255,255,0)",
+                borderpad=2,
             )
         hover_x.append(x0 + (x1 - x0) / 2.0)
         hover_y.append(y0 + (y1 - y0) / 2.0)
         hover_cd.append([label, value, share])
 
     fig.add_trace(
-        go.Scatter(
+        go_mod.Scatter(
             x=hover_x,
             y=hover_y,
             mode="markers",
@@ -1330,7 +1338,7 @@ def _render_controlled_treemap(agg: pd.DataFrame, *, use_two_levels: bool) -> bo
         height=520,
         margin=dict(l=0, r=0, t=0, b=0),
         xaxis=dict(range=[0, 100], visible=False, fixedrange=True),
-        yaxis=dict(range=[100, 0], visible=False, fixedrange=True),
+        yaxis=dict(range=[0, 100], visible=False, fixedrange=True),
         plot_bgcolor="white",
         paper_bgcolor="white",
         showlegend=False,
@@ -2806,17 +2814,14 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                             record_debug_checkpoint("cs.overview.plotly_express_missing")
                             _render_altair_overview_composition(agg, use_two_levels=use_two_levels)
                         else:
-                            if use_two_levels and "subgroup" in agg.columns:
-                                agg = agg.copy()
-                                agg["_group_total"] = agg.groupby("group", dropna=False)["value"].transform("sum")
-                                agg = (
-                                    agg.sort_values(["_group_total", "value"], ascending=[False, False])
-                                    .drop(columns=["_group_total"])
-                                    .reset_index(drop=True)
-                                )
-                            else:
-                                agg = agg.sort_values("value", ascending=False).reset_index(drop=True)
-                            path = ["group", "subgroup"] if use_two_levels else ["group"]
+                            agg = (
+                                agg.groupby("group", dropna=False, sort=False)["value"]
+                                .sum()
+                                .reset_index()
+                                .sort_values("value", ascending=False)
+                                .reset_index(drop=True)
+                            )
+                            path = ["group"]
                             fig = px.treemap(
                                 agg,
                                 path=path,
@@ -3308,9 +3313,27 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 font=dict(size=12, color="#374151"),
             )
 
+        wf_label_xs: list[float] = []
+        _wf_acc = 0.0
+        _wf_pad = max(total_value * 0.008, 1.0)
+        for _wf_value in wf_values:
+            wf_label_xs.append(_wf_acc + _wf_pad)
+            _wf_acc += float(_wf_value)
+        wf_label_xs.append(_wf_pad)
+        fig_wf.add_trace(go.Scatter(
+            x=wf_label_xs,
+            y=y,
+            mode="text",
+            text=[str(v) for v in y],
+            textposition="middle right",
+            textfont=dict(size=13, color="#111827", family="Arial, sans-serif"),
+            hoverinfo="skip",
+            showlegend=False,
+        ))
+
         fig_wf.update_layout(
             height=430,
-            margin=dict(l=340, r=85, t=10, b=45),
+            margin=dict(l=280, r=110, t=10, b=45),
             xaxis_title="Wkład do totalu",
             yaxis_title=None,
             yaxis=dict(
@@ -3324,6 +3347,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 automargin=True,
                 tickfont=dict(size=12, color="#374151"),
             ),
+            xaxis=dict(range=[0, max(total_value * 1.10, 1.0)]),
             showlegend=False,
         )
         st.plotly_chart(fig_wf, width="stretch", config={"displayModeBar": False})
@@ -3895,11 +3919,23 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                                     y=y0 + h / 2,
                                     text=comp,
                                     showarrow=False,
-                                    font=dict(size=11, color=_text_color(fill)),
+                                    font=dict(size=11, color="#111827"),
+                                    bgcolor="rgba(255,255,255,0.72)",
+                                    bordercolor="rgba(255,255,255,0)",
+                                    borderpad=2,
                                 )
                             y0 += h
                         # group label
-                        fig_mm.add_annotation(x=x0 + w/2, y=102, text=str(g), showarrow=False, font=dict(size=10))
+                        fig_mm.add_annotation(
+                            x=x0 + w/2,
+                            y=102,
+                            text=str(g),
+                            showarrow=False,
+                            font=dict(size=10, color="#111827"),
+                            bgcolor="rgba(255,255,255,0.80)",
+                            bordercolor="rgba(255,255,255,0)",
+                            borderpad=1,
+                        )
                         x0 += w
 
                     # Tooltip trace (po shapes)
