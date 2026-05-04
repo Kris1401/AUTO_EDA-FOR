@@ -1359,7 +1359,7 @@ def _render_altair_overview_composition(agg: pd.DataFrame, *, use_two_levels: bo
         .encode(
             x=alt.X("x0:Q", title=None, scale=alt.Scale(domain=[0, 100]), axis=None),
             x2="x1:Q",
-            y=alt.Y("y0:Q", title=None, scale=alt.Scale(domain=[0, 100]), axis=None),
+            y=alt.Y("y0:Q", title=None, scale=alt.Scale(domain=[100, 0]), axis=None),
             y2="y1:Q",
             color=alt.Color(
                 "group_label:N" if use_two_levels else "group_label:N",
@@ -1387,7 +1387,7 @@ def _render_altair_overview_composition(agg: pd.DataFrame, *, use_two_levels: bo
         )
         .encode(
             x=alt.X("label_x:Q", scale=alt.Scale(domain=[0, 100]), axis=None),
-            y=alt.Y("label_y:Q", scale=alt.Scale(domain=[0, 100]), axis=None),
+            y=alt.Y("label_y:Q", scale=alt.Scale(domain=[100, 0]), axis=None),
             text="display_label:N",
         )
     )
@@ -1425,6 +1425,8 @@ def _build_altair_waterfall_chart(wf: pd.DataFrame, *, synthetic_group_tail: str
     })
     plot = pd.DataFrame(rows)
     order = plot["label"].tolist()
+    total_axis = float(plot["x_end"].max() or total_value or 1.0)
+    label_pad = total_axis * 0.008
     height = min(520, max(320, 70 + 28 * int(plot.shape[0])))
 
     bars = (
@@ -1456,7 +1458,18 @@ def _build_altair_waterfall_chart(wf: pd.DataFrame, *, synthetic_group_tail: str
             text=alt.Text("value:Q", format=",.0f"),
         )
     )
-    return (bars + labels).properties(height=height).configure_view(strokeOpacity=0)
+    cat_labels_df = plot.copy()
+    cat_labels_df["label_x"] = cat_labels_df["x_start"] + label_pad
+    cat_labels = (
+        alt.Chart(cat_labels_df)
+        .mark_text(align="left", baseline="middle", fontSize=12, fontWeight="bold", color="#111827")
+        .encode(
+            y=alt.Y("label:N", sort=order, axis=None),
+            x=alt.X("label_x:Q"),
+            text="label:N",
+        )
+    )
+    return (bars + cat_labels + labels).properties(height=height).configure_view(strokeOpacity=0)
 
 
 def _build_marimekko_rects(mix_agg: pd.DataFrame, group_col: str, group_col2: str) -> pd.DataFrame:
@@ -1594,6 +1607,83 @@ def _build_mix_exec_frame(
         return pd.DataFrame(columns=[group_col or "group", group_col2 or "subgroup", "value", "group_total", "pct", "group_share_pct", "area_share_pct"])
 
 
+def _build_resilient_mix_frame(
+    df: pd.DataFrame,
+    group_col: str | None,
+    group_col2: str | None,
+    value_col: str | None,
+    top_n: int = 10,
+    top_k: int = 7,
+) -> pd.DataFrame:
+    """Forgiving Mix/Marimekko source used when strict frame creation returns empty."""
+    empty_cols = [group_col or "group", group_col2 or "subgroup", "value", "group_total", "pct", "group_share_pct", "area_share_pct"]
+    if (
+        not isinstance(df, pd.DataFrame)
+        or df.empty
+        or not group_col
+        or not group_col2
+        or group_col == group_col2
+        or group_col not in df.columns
+        or group_col2 not in df.columns
+    ):
+        return pd.DataFrame(columns=empty_cols)
+
+    try:
+        sub = pd.DataFrame({
+            group_col: df[group_col].astype("string").fillna("(brak)"),
+            group_col2: df[group_col2].astype("string").fillna("(brak)"),
+        })
+        if value_col and value_col in df.columns:
+            sub["value"] = _coerce_numeric_series(df[value_col]).fillna(0.0).clip(lower=0.0)
+        else:
+            sub["value"] = 1.0
+        sub = sub[(sub[group_col].astype(str).str.strip() != "") & (sub[group_col2].astype(str).str.strip() != "")]
+        sub = sub[sub["value"] > 0]
+        if sub.empty:
+            return pd.DataFrame(columns=empty_cols)
+
+        mix = sub.groupby([group_col, group_col2], dropna=False, sort=False)["value"].sum().reset_index()
+        if mix.empty:
+            return pd.DataFrame(columns=empty_cols)
+
+        full_total = float(mix["value"].sum() or 0.0)
+        if full_total <= 0:
+            return pd.DataFrame(columns=empty_cols)
+
+        top_groups = (
+            mix.groupby(group_col, sort=False)["value"]
+            .sum()
+            .nlargest(min(50, max(5, int(top_n or 10))))
+            .index
+            .tolist()
+        )
+        mix = mix[mix[group_col].isin(top_groups)].copy()
+        if mix.empty:
+            return pd.DataFrame(columns=empty_cols)
+
+        top_subs = (
+            mix.groupby(group_col2, sort=False)["value"]
+            .sum()
+            .nlargest(max(2, int(top_k or 7)))
+            .index
+            .tolist()
+        )
+        tail_label = f"Pozostale (poza Top-{max(2, int(top_k or 7))})"
+        if tail_label in set(mix[group_col2].astype(str).tolist()):
+            tail_label = f"{tail_label} [ogon]"
+        mix[group_col2] = mix[group_col2].where(mix[group_col2].isin(top_subs), tail_label)
+        mix = mix.groupby([group_col, group_col2], dropna=False, sort=False)["value"].sum().reset_index()
+
+        totals = mix.groupby(group_col, sort=False)["value"].sum().rename("group_total").reset_index()
+        mix = mix.merge(totals, on=group_col, how="left")
+        mix["pct"] = np.where(mix["group_total"] > 0, mix["value"] / mix["group_total"] * 100.0, 0.0)
+        mix["group_share_pct"] = np.where(full_total > 0, mix["group_total"] / full_total * 100.0, 0.0)
+        mix["area_share_pct"] = np.where(full_total > 0, mix["value"] / full_total * 100.0, 0.0)
+        return mix.sort_values(["group_total", "pct", "value"], ascending=[False, False, False]).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(columns=empty_cols)
+
+
 def _build_mix_exec_stats(
     df: pd.DataFrame,
     group_col: str | None,
@@ -1602,6 +1692,8 @@ def _build_mix_exec_stats(
     top_n: int = 10,
 ) -> Dict[str, Any]:
     mix_agg = _build_mix_exec_frame(df, group_col, group_col2, value_col, top_n=top_n, top_k=7)
+    if mix_agg.empty:
+        mix_agg = _build_resilient_mix_frame(df, group_col, group_col2, value_col, top_n=top_n, top_k=7)
     return _build_mix_exec_stats_from_frame(mix_agg, group_col, group_col2)
 
 
@@ -1680,6 +1772,8 @@ def _build_marimekko_exec_stats(
     top_n: int = 10,
 ) -> Dict[str, Any]:
     mix_agg = _build_mix_exec_frame(df, group_col, group_col2, value_col, top_n=top_n, top_k=7)
+    if mix_agg.empty:
+        mix_agg = _build_resilient_mix_frame(df, group_col, group_col2, value_col, top_n=top_n, top_k=7)
     return _build_marimekko_exec_stats_from_frame(mix_agg, group_col, group_col2)
 
 
@@ -2135,6 +2229,15 @@ def _render_altair_composition_static_insights(
             top_n=topn,
             top_k=7,
         )
+        if mix_agg.empty:
+            mix_agg = _build_resilient_mix_frame(
+                df=df,
+                group_col=group_col,
+                group_col2=group_col2,
+                value_col=value_col,
+                top_n=topn,
+                top_k=7,
+            )
     if group_col2 and group_col2 in df.columns and group_col2 != group_col and not mix_agg.empty:
         mix_agg["group_label"] = mix_agg[group_col].astype(str)
         mix_agg["subgroup_label"] = mix_agg[group_col2].astype(str)
@@ -2824,6 +2927,15 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 top_n=top_n,
                 top_k=7,
             )
+            if _mix_exec_frame.empty:
+                _mix_exec_frame = _build_resilient_mix_frame(
+                    df=df,
+                    group_col=group_col,
+                    group_col2=group_col2,
+                    value_col=value_col,
+                    top_n=top_n,
+                    top_k=7,
+                )
             _cs_cache_put("cs_mix_exec_frame_cache", mix_cache_key, _mix_exec_frame)
 
     # Batch ET only when the user enters Kluczowe insighty.
@@ -3510,6 +3622,15 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 mix_agg = _mix_exec_frame.copy() if isinstance(_mix_exec_frame, pd.DataFrame) else pd.DataFrame()
                 if mix_agg.empty:
                     mix_agg = _build_mix_exec_frame(
+                        df=df,
+                        group_col=group_col,
+                        group_col2=group_col2,
+                        value_col=value_col,
+                        top_n=top_n,
+                        top_k=7,
+                    )
+                if mix_agg.empty:
+                    mix_agg = _build_resilient_mix_frame(
                         df=df,
                         group_col=group_col,
                         group_col2=group_col2,
