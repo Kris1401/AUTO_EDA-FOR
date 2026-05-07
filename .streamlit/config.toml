@@ -9,5 +9,7 @@ runOnSave = false
 fileWatcherType = "none"
 
 headless = true
-enableCORS = true
-
+enableCORS = false
+enableXsrfProtection = false
+maxUploadSize = 512
+maxMessageSize = 512

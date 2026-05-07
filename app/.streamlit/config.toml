@@ -3,4 +3,8 @@ base="light"
 
 [server]
 headless = true
-enableCORS = true
+enableCORS = false
+enableXsrfProtection = false
+maxUploadSize = 512
+maxMessageSize = 512
+fileWatcherType = "none"
