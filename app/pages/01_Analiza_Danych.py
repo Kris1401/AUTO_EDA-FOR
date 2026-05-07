@@ -1218,9 +1218,12 @@ if not is_demo:
     if "upload_rev" not in st.session_state:
         st.session_state.upload_rev = 0
 
+    upload_state_key = "uploaded_file_state"
+
     def _clear_upload():
         """Czyści wgrany plik przez zmianę key uploadera."""
         st.session_state.upload_rev += 1
+        st.session_state.pop(upload_state_key, None)
 
     rev = st.session_state.upload_rev
     upload_key = f"file_uploader_main_{rev}"
@@ -1236,9 +1239,31 @@ if not is_demo:
             label_visibility="collapsed",
         )
 
+    if uploaded is not None:
+        uploaded_bytes = uploaded.getvalue()
+        st.session_state[upload_state_key] = {
+            "name": uploaded.name,
+            "bytes": uploaded_bytes,
+            "size_mb": round(len(uploaded_bytes) / (1024 ** 2), 2),
+        }
+
+    uploaded_state = st.session_state.get(upload_state_key)
+    has_active_upload = uploaded is not None or uploaded_state is not None
+    active_file_name = (
+        uploaded.name
+        if uploaded is not None
+        else str(uploaded_state.get("name", "")) if uploaded_state else ""
+    )
+    active_file_bytes = (
+        uploaded.getvalue()
+        if uploaded is not None
+        else bytes(uploaded_state.get("bytes", b"")) if uploaded_state else b""
+    )
+    active_size_mb = round(len(active_file_bytes) / (1024 ** 2), 2) if active_file_bytes else 0.0
+
     with col_clear:
         box = st.container()
-        if uploaded is None:
+        if not has_active_upload:
             # pusty panel – zarezerwowane miejsce
             box.markdown(
                 """
@@ -1257,7 +1282,7 @@ if not is_demo:
                 unsafe_allow_html=True,
             )
         else:
-            size_mb_panel = len(uploaded.getvalue()) / (1024 ** 2)
+            cached_label = "" if uploaded is not None else "<br><em>Uzywam zapamietanego pliku po rerunie.</em>"
             box.markdown(
                 f"""
 <div style="
@@ -1270,7 +1295,7 @@ if not is_demo:
     margin-bottom:0.35rem;
 ">
   <strong>Nie ten plik? Skasuj ładowanie</strong><br>
-  {uploaded.name} · {size_mb_panel:.2f} MB
+  {active_file_name} - {active_size_mb:.2f} MB{cached_label}
 </div>
                 """,
                 unsafe_allow_html=True,
@@ -1284,7 +1309,7 @@ if not is_demo:
             )
 
     # jeśli pliku brak – komunikat + stop (jak wcześniej)
-    if not uploaded:
+    if not has_active_upload:
         st.info(
             "Wgraj plik, aby rozpocząć. Obsługujemy: CSV, XLSX, PDF (tabele) "
             "oraz Parquet. Jeśli chcesz tylko przetestować działanie, "
@@ -1293,10 +1318,10 @@ if not is_demo:
         st.stop()
 
     # --- mamy plik: przygotowanie do wczytania podglądu ---
-    file_bytes = uploaded.getvalue()
-    name_lower = uploaded.name.lower()
-    size_mb = round(len(file_bytes) / (1024 ** 2), 2)
-    base_name = os.path.splitext(os.path.basename(uploaded.name))[0]
+    file_bytes = active_file_bytes
+    name_lower = active_file_name.lower()
+    size_mb = active_size_mb
+    base_name = os.path.splitext(os.path.basename(active_file_name))[0]
 
     if size_mb > MAX_MB:
         st.error(f"Plik ma {size_mb} MB, a limit to {MAX_MB} MB.")
@@ -1338,7 +1363,7 @@ if not is_demo:
         try:
             df_preview, meta = load_any(
                 file_bytes,
-                uploaded.name,
+                active_file_name,
                 preview_limit=preview_rows,
                 csv_sep=csv_sep,
                 xlsx_sheet=xlsx_sheet,
@@ -1616,7 +1641,7 @@ if clicked:
             try:
                 df_full, meta_full = load_any(
                     file_bytes,
-                    uploaded.name,
+                    active_file_name,
                     preview_limit=None,
                     csv_sep=csv_sep,
                     xlsx_sheet=xlsx_sheet,
