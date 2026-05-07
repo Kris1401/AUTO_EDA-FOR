@@ -1013,7 +1013,7 @@ def _build_price_corridor_from_stats(
 
 def _make_cs_runtime_signature(df: pd.DataFrame, filters: Dict[str, Any] | None = None) -> str:
     payload = {
-        "renderer_version": "composition_static_charts_v7",
+        "renderer_version": "composition_static_charts_v8",
         "rows": int(len(df) if isinstance(df, pd.DataFrame) else 0),
         "columns": [str(c) for c in (df.columns if isinstance(df, pd.DataFrame) else [])],
         "dtypes": [str(t) for t in (df.dtypes if isinstance(df, pd.DataFrame) else [])],
@@ -1371,7 +1371,7 @@ def _render_altair_overview_composition(agg: pd.DataFrame, *, use_two_levels: bo
         .encode(
             x=alt.X("x0:Q", title=None, scale=alt.Scale(domain=[0, 100]), axis=None),
             x2="x1:Q",
-            y=alt.Y("y0:Q", title=None, scale=alt.Scale(domain=[100, 0]), axis=None),
+            y=alt.Y("y0:Q", title=None, scale=alt.Scale(domain=[0, 100]), axis=None),
             y2="y1:Q",
             color=alt.Color(
                 "group_label:N" if use_two_levels else "group_label:N",
@@ -1399,7 +1399,7 @@ def _render_altair_overview_composition(agg: pd.DataFrame, *, use_two_levels: bo
         )
         .encode(
             x=alt.X("label_x:Q", scale=alt.Scale(domain=[0, 100]), axis=None),
-            y=alt.Y("label_y:Q", scale=alt.Scale(domain=[100, 0]), axis=None),
+            y=alt.Y("label_y:Q", scale=alt.Scale(domain=[0, 100]), axis=None),
             text="display_label:N",
         )
     )
@@ -2310,7 +2310,7 @@ def _render_altair_composition_static_insights(
             )
             mm_labels = (
                 alt.Chart(mm_rects[mm_rects["display_label"].astype(str) != ""])
-                .mark_text(color="white", fontSize=11, fontWeight="bold")
+                .mark_text(color="#111827", fontSize=11, fontWeight="bold")
                 .encode(
                     x=alt.X("label_x:Q", scale=alt.Scale(domain=[0, 100]), axis=None),
                     y=alt.Y("label_y:Q", scale=alt.Scale(domain=[0, 100]), axis=None),
@@ -3266,74 +3266,23 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             decreasing={"marker": {"color": "#D64550"}},
         ))
 
-        wf_cumulative = 0.0
-        wf_label_pad = max(total_value * 0.006, 1.0)
-        for _wf_label, _wf_value in zip(wf_labels, wf_values):
+        for _wf_label in y:
             fig_wf.add_annotation(
-                x=wf_cumulative + wf_label_pad,
-                xref="x",
+                x=-0.012,
+                xref="paper",
                 y=_wf_label,
                 yref="y",
                 text=f"<b>{_wf_label}</b>",
                 showarrow=False,
-                xanchor="left",
-                yanchor="middle",
-                align="left",
-                font=dict(size=12, color="#111827"),
-                bgcolor="rgba(255,255,255,0.78)",
-                bordercolor="rgba(255,255,255,0)",
-                borderpad=2,
-            )
-            wf_cumulative += float(_wf_value)
-        fig_wf.add_annotation(
-            x=wf_label_pad,
-            xref="x",
-            y="TOTAL",
-            yref="y",
-            text="<b>TOTAL</b>",
-            showarrow=False,
-            xanchor="left",
-            yanchor="middle",
-            font=dict(size=12, color="#111827"),
-            bgcolor="rgba(255,255,255,0.78)",
-            bordercolor="rgba(255,255,255,0)",
-            borderpad=2,
-        )
-
-        for _wf_label in y:
-            fig_wf.add_annotation(
-                x=0,
-                xref="paper",
-                y=_wf_label,
-                yref="y",
-                text=str(_wf_label),
-                showarrow=False,
                 xanchor="right",
-                xshift=-18,
-                font=dict(size=12, color="#374151"),
+                yanchor="middle",
+                align="right",
+                font=dict(size=12, color="#111827"),
             )
-
-        wf_label_xs: list[float] = []
-        _wf_acc = 0.0
-        _wf_pad = max(total_value * 0.008, 1.0)
-        for _wf_value in wf_values:
-            wf_label_xs.append(_wf_acc + _wf_pad)
-            _wf_acc += float(_wf_value)
-        wf_label_xs.append(_wf_pad)
-        fig_wf.add_trace(go.Scatter(
-            x=wf_label_xs,
-            y=y,
-            mode="text",
-            text=[str(v) for v in y],
-            textposition="middle right",
-            textfont=dict(size=13, color="#111827", family="Arial, sans-serif"),
-            hoverinfo="skip",
-            showlegend=False,
-        ))
 
         fig_wf.update_layout(
             height=430,
-            margin=dict(l=280, r=110, t=10, b=45),
+            margin=dict(l=320, r=120, t=10, b=45),
             xaxis_title="Wkład do totalu",
             yaxis_title=None,
             yaxis=dict(
@@ -3343,7 +3292,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 tickmode="array",
                 tickvals=y,
                 ticktext=y,
-                showticklabels=True,
+                showticklabels=False,
                 automargin=True,
                 tickfont=dict(size=12, color="#374151"),
             ),
