@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import io
 import json
+import hashlib
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -1165,6 +1166,68 @@ MAX_MB, WARN_ROWS, SAMPLE_ROWS = cfg.max_file_mb, cfg.warn_rows, cfg.sample_rows
 # (nie zmieniamy configu globalnego, tylko to co widzi ta strona)
 MAX_MB = max(MAX_MB, 200)
 
+def _upload_cache_dir() -> Path:
+    path = resolve_artifacts_dir(cfg) / "upload_cache"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _safe_upload_name(name: str) -> str:
+    import re
+
+    safe = os.path.basename(name or "uploaded_file").strip().replace(" ", "_")
+    safe = re.sub(r"[^0-9A-Za-z._-]+", "_", safe)
+    return safe[:120] or "uploaded_file"
+
+
+def _persist_upload_to_disk(name: str, data: bytes) -> dict:
+    root = _upload_cache_dir()
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    safe_name = _safe_upload_name(name)
+    path = root / f"{digest}__{safe_name}"
+    if not path.exists():
+        path.write_bytes(data)
+
+    state = {
+        "name": name,
+        "path": str(path),
+        "size_mb": round(len(data) / (1024 ** 2), 2),
+        "sha256": digest,
+    }
+    (root / "latest_upload.json").write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return state
+
+
+def _restore_upload_from_disk() -> dict | None:
+    latest = _upload_cache_dir() / "latest_upload.json"
+    if not latest.exists():
+        return None
+    try:
+        state = json.loads(latest.read_text(encoding="utf-8"))
+        path = Path(str(state.get("path", "")))
+        if path.exists() and path.is_file():
+            return state
+    except Exception:
+        return None
+    return None
+
+
+def _clear_persisted_upload() -> None:
+    root = _upload_cache_dir()
+    latest = root / "latest_upload.json"
+    if latest.exists():
+        try:
+            state = json.loads(latest.read_text(encoding="utf-8"))
+            path = Path(str(state.get("path", "")))
+            if path.exists() and path.is_file() and path.parent == root:
+                path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        latest.unlink(missing_ok=True)
+
 # ---------------- Sidebar: wspólne ustawienia ----------------
 with st.sidebar:
     st.subheader("Import — ustawienia")
@@ -1224,6 +1287,7 @@ if not is_demo:
         """Czyści wgrany plik przez zmianę key uploadera."""
         st.session_state.upload_rev += 1
         st.session_state.pop(upload_state_key, None)
+        _clear_persisted_upload()
 
     rev = st.session_state.upload_rev
     upload_key = f"file_uploader_main_{rev}"
@@ -1241,24 +1305,22 @@ if not is_demo:
 
     if uploaded is not None:
         uploaded_bytes = uploaded.getvalue()
-        st.session_state[upload_state_key] = {
-            "name": uploaded.name,
-            "bytes": uploaded_bytes,
-            "size_mb": round(len(uploaded_bytes) / (1024 ** 2), 2),
-        }
+        st.session_state[upload_state_key] = _persist_upload_to_disk(
+            uploaded.name,
+            uploaded_bytes,
+        )
 
-    uploaded_state = st.session_state.get(upload_state_key)
+    uploaded_state = st.session_state.get(upload_state_key) or _restore_upload_from_disk()
+    if uploaded_state is not None:
+        st.session_state[upload_state_key] = uploaded_state
     has_active_upload = uploaded is not None or uploaded_state is not None
     active_file_name = (
         uploaded.name
         if uploaded is not None
         else str(uploaded_state.get("name", "")) if uploaded_state else ""
     )
-    active_file_bytes = (
-        uploaded.getvalue()
-        if uploaded is not None
-        else bytes(uploaded_state.get("bytes", b"")) if uploaded_state else b""
-    )
+    active_file_path = Path(str(uploaded_state.get("path", ""))) if uploaded_state else None
+    active_file_bytes = active_file_path.read_bytes() if active_file_path and active_file_path.exists() else b""
     active_size_mb = round(len(active_file_bytes) / (1024 ** 2), 2) if active_file_bytes else 0.0
 
     with col_clear:
@@ -1318,6 +1380,10 @@ if not is_demo:
         st.stop()
 
     # --- mamy plik: przygotowanie do wczytania podglądu ---
+    if not active_file_bytes:
+        st.warning("Nie moge odtworzyc pliku z uploadu. Wgraj plik ponownie.")
+        st.stop()
+
     file_bytes = active_file_bytes
     name_lower = active_file_name.lower()
     size_mb = active_size_mb
@@ -1614,14 +1680,19 @@ tooltip_text = (
     "'Trenowanie Modelu' bez ponownego wgrywania pliku."
 )
 
+def _request_full_run():
+    st.session_state["full_run_requested"] = True
+
+
 clicked = st.button(
     "🔄 Przelicz teraz (pełny zbiór)",
     key="full_run_button",
     type="primary",
     help=tooltip_text,
+    on_click=_request_full_run,
 )
 
-if clicked:
+if st.session_state.get("full_run_requested", False):
     # Pasek statusu obejmuje CAŁY pipeline:
     # 1/3 – wczytywanie pełnego zbioru
     # 2/3 – maskowanie PII
@@ -1655,6 +1726,7 @@ if clicked:
                     state="error",
                 )
                 st.exception(e)
+                st.session_state["full_run_requested"] = False
                 st.stop()
 
         status.update(
@@ -1668,9 +1740,18 @@ if clicked:
         else:
             status.write("2/3 – Pomijanie maskowania PII (opcja wyłączona)…")
 
-        df_full_masked, pii_report_full = (
-            mask_dataframe(df_full) if mask_pii else (df_full, {})
-        )
+        try:
+            df_full_masked, pii_report_full = (
+                mask_dataframe(df_full) if mask_pii else (df_full, {})
+            )
+        except Exception as e:
+            status.update(
+                label="Blad podczas maskowania PII",
+                state="error",
+            )
+            st.exception(e)
+            st.session_state["full_run_requested"] = False
+            st.stop()
 
         status.write("✔ 2/3 – Etap maskowania PII zakończony.")
 
@@ -1750,6 +1831,9 @@ if clicked:
     )
 
 # --- Powtórzony potok na dole strony ---
+if st.session_state.get("full_run_requested", False):
+    st.session_state["full_run_requested"] = False
+
 render_flow_nav(current_id="01_Analiza_Danych", key_prefix="flow_bottom")
 st.markdown("---")
 
