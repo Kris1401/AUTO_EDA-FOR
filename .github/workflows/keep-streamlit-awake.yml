@@ -12,12 +12,12 @@ permissions:
 
 concurrency:
   group: keep-streamlit-awake
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     env:
       APP_URL: https://auto-eda-for.streamlit.app
 
@@ -43,8 +43,10 @@ jobs:
           cookie_jar="$(mktemp)"
           trap 'rm -f "${cookie_jar}"' EXIT
 
-          ping_url="${APP_URL%/}/_stcore/health"
-          echo "Health URL: ${ping_url}"
+          health_url="${APP_URL%/}/_stcore/health"
+          root_url="${APP_URL%/}/"
+          echo "Health URL: ${health_url}"
+          echo "Root URL: ${root_url}"
 
           status=""
           curl_exit=0
@@ -53,33 +55,42 @@ jobs:
             echo "Ping attempt ${attempt}/6"
 
             set +e
-            status="$(curl \
-              --location \
-              --max-redirs 10 \
-              --cookie-jar "${cookie_jar}" \
-              --cookie "${cookie_jar}" \
-              --user-agent "Mozilla/5.0 (GitHub Actions Streamlit keep-awake)" \
-              --silent \
-              --show-error \
-              --output /tmp/streamlit-keep-awake.html \
-              --write-out "%{http_code}" \
-              --connect-timeout 20 \
-              --max-time 60 \
-              --retry 2 \
-              --retry-delay 10 \
-              "${ping_url}")"
-            curl_exit="$?"
+            for ping_url in "${health_url}" "${root_url}"; do
+              echo "Trying: ${ping_url}"
+              status="$(curl \
+                --location \
+                --max-redirs 10 \
+                --cookie-jar "${cookie_jar}" \
+                --cookie "${cookie_jar}" \
+                --user-agent "Mozilla/5.0 (GitHub Actions Streamlit keep-awake)" \
+                --silent \
+                --show-error \
+                --output /tmp/streamlit-keep-awake.html \
+                --write-out "%{http_code}" \
+                --connect-timeout 20 \
+                --max-time 90 \
+                --retry 2 \
+                --retry-delay 10 \
+                "${ping_url}")"
+              curl_exit="$?"
+
+              echo "curl exit: ${curl_exit}; HTTP status: ${status}"
+
+              if [ "${curl_exit}" -eq 0 ] && [ "${status}" -ge 200 ] && [ "${status}" -lt 400 ]; then
+                echo "Keep-awake ping completed."
+                exit 0
+              fi
+            done
             set -e
-
-            echo "curl exit: ${curl_exit}; HTTP status: ${status}"
-
-            if [ "${curl_exit}" -eq 0 ] && [ "${status}" -ge 200 ] && [ "${status}" -lt 400 ]; then
-              echo "Keep-awake ping completed."
-              exit 0
-            fi
 
             sleep 30
           done
 
-          echo "::error::Keep-awake ping failed after retries. curl exit ${curl_exit}, HTTP ${status}."
+          message="Keep-awake ping failed after retries. curl exit ${curl_exit}, HTTP ${status}."
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            echo "::warning::${message} Scheduled keep-awake is best-effort; the next run will try again."
+            exit 0
+          fi
+
+          echo "::error::${message}"
           exit 1
