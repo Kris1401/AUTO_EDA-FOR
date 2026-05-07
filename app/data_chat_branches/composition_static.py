@@ -19,7 +19,7 @@ try:
 except Exception:
     go = None
 import streamlit as st
-from core.ui_safe import altair_chart_stretch
+from core.ui_safe import altair_chart_stretch, plotly_chart_stretch
 from data_chat_core.ui_contract import render_exec_takeaway, render_guidance
 from data_chat_core.exec_takeaway import get_exec_takeaway
 from data_chat_core.exec_takeaway_llm import get_exec_takeaways_llm
@@ -1013,7 +1013,7 @@ def _build_price_corridor_from_stats(
 
 def _make_cs_runtime_signature(df: pd.DataFrame, filters: Dict[str, Any] | None = None) -> str:
     payload = {
-        "renderer_version": "composition_static_charts_v8",
+        "renderer_version": "composition_static_charts_v9",
         "rows": int(len(df) if isinstance(df, pd.DataFrame) else 0),
         "columns": [str(c) for c in (df.columns if isinstance(df, pd.DataFrame) else [])],
         "dtypes": [str(t) for t in (df.dtypes if isinstance(df, pd.DataFrame) else [])],
@@ -1343,11 +1343,11 @@ def _render_controlled_treemap(agg: pd.DataFrame, *, use_two_levels: bool) -> bo
         paper_bgcolor="white",
         showlegend=False,
     )
-    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    plotly_chart_stretch(st, fig, config={"displayModeBar": False})
     return True
 
 
-def _render_altair_overview_composition(agg: pd.DataFrame, *, use_two_levels: bool) -> None:
+def _render_altair_overview_composition(agg: pd.DataFrame, *, use_two_levels: bool, legend_title: str = "Kategoria") -> None:
     """Render an overview chart when Plotly treemap is not available."""
     if not isinstance(agg, pd.DataFrame) or agg.empty:
         st.info("Brak danych do wizualizacji struktury.")
@@ -1375,7 +1375,7 @@ def _render_altair_overview_composition(agg: pd.DataFrame, *, use_two_levels: bo
             y2="y1:Q",
             color=alt.Color(
                 "group_label:N" if use_two_levels else "group_label:N",
-                title="Kategoria",
+                title=str(legend_title or "Kategoria"),
                 legend=None if not use_two_levels else alt.Legend(orient="bottom", columns=4),
             ),
             tooltip=[
@@ -2812,7 +2812,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                             pass
                         elif px is None:
                             record_debug_checkpoint("cs.overview.plotly_express_missing")
-                            _render_altair_overview_composition(agg, use_two_levels=use_two_levels)
+                            _render_altair_overview_composition(agg, use_two_levels=use_two_levels, legend_title=str(group_col or "Kategoria"))
                         else:
                             agg = (
                                 agg.groupby("group", dropna=False, sort=False)["value"]
@@ -2845,7 +2845,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                                 height=520,
                                 uniformtext=dict(minsize=10, mode="hide"),
                             )
-                            st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+                            plotly_chart_stretch(st, fig, config={"displayModeBar": False})
                 except Exception:
                     st.warning("Nie udało się wyrenderować treemapy dla wybranych ustawień.")
             else:
@@ -3266,20 +3266,6 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             decreasing={"marker": {"color": "#D64550"}},
         ))
 
-        for _wf_label in y:
-            fig_wf.add_annotation(
-                x=-0.012,
-                xref="paper",
-                y=_wf_label,
-                yref="y",
-                text=f"<b>{_wf_label}</b>",
-                showarrow=False,
-                xanchor="right",
-                yanchor="middle",
-                align="right",
-                font=dict(size=12, color="#111827"),
-            )
-
         fig_wf.update_layout(
             height=430,
             margin=dict(l=320, r=120, t=10, b=45),
@@ -3292,14 +3278,15 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 tickmode="array",
                 tickvals=y,
                 ticktext=y,
-                showticklabels=False,
+                showticklabels=True,
+                ticklabelposition="outside",
                 automargin=True,
                 tickfont=dict(size=12, color="#374151"),
             ),
             xaxis=dict(range=[0, max(total_value * 1.10, 1.0)]),
             showlegend=False,
         )
-        st.plotly_chart(fig_wf, width="stretch", config={"displayModeBar": False})
+        plotly_chart_stretch(st, fig_wf, config={"displayModeBar": False})
 
         _exec_takeaway(
             "waterfall",
@@ -3337,9 +3324,13 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             rest_row["share_full"] = rest_val / total_full
             pareto_vis = pd.concat([pareto_vis, rest_row.rename(columns={"group": "group_label"})], ignore_index=True)
         pareto_vis["cum"] = (pareto_vis["value"] / float(pareto_vis["value"].sum() or 1.0)).cumsum()
+        cutoff_ratio = float(cutoff or 0.80)
+        cutoff_ratio = cutoff_ratio / 100.0 if cutoff_ratio > 1.0 else cutoff_ratio
+        cutoff_ratio = min(max(cutoff_ratio, 0.0), 1.0)
+        cutoff_pct = cutoff_ratio * 100.0
 
         # number of segments to reach cutoff
-        p_n = int((pareto_vis['cum'] >= cutoff).idxmax() + 1) if (pareto_vis['cum'] >= cutoff).any() else int(pareto_vis.shape[0])
+        p_n = int((pareto_vis["cum"] >= cutoff_ratio).idxmax() + 1) if (pareto_vis["cum"] >= cutoff_ratio).any() else int(pareto_vis.shape[0])
 
         # Plotly combo
         fig_p = go.Figure()
@@ -3354,10 +3345,10 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
 
         bar_colors = []
         for i in range(len(x_labels)):
-            if p_n and i >= p_n:
-                bar_colors.append("#d9d9d9")  # tail beyond 80% -> grey
-            else:
+            if p_n and i <= (p_n - 1):
                 bar_colors.append("#1f77b4")  # main bars -> Plotly default-ish blue
+            else:
+                bar_colors.append("#d9d9d9")  # tail beyond 80% -> grey
 
         fig_p.add_trace(go.Bar(
             x=x_labels,
@@ -3405,13 +3396,18 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             legend=dict(orientation="h", yanchor="bottom", y=-0.35),
         )
 
-        # --- 80% horizontal line (red dotted, on y2)
-        fig_p.add_hline(
-            y=cutoff * 100,
-            line_dash="dot",
-            line_width=1,
-            line_color="red",
-            yref="y2",
+        # --- 80% horizontal line (red dotted, explicitly on y2)
+        fig_p.add_trace(
+            go.Scatter(
+                x=x_labels,
+                y=[cutoff_pct] * len(x_labels),
+                name=f"próg {int(round(cutoff_pct))}%",
+                yaxis="y2",
+                mode="lines",
+                line=dict(color="red", width=1, dash="dot"),
+                hoverinfo="skip",
+                showlegend=False,
+            )
         )
 
         # --- vertical line at crossing + label "próg 80%"
@@ -3444,14 +3440,14 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 bgcolor="rgba(255,255,255,0.0)",
             )
 
-        st.plotly_chart(fig_p, width="stretch", config={"displayModeBar": False})
+        plotly_chart_stretch(st, fig_p, config={"displayModeBar": False})
 
         _exec_takeaway(
             "pareto",
             anchors={
                 "metric": value_col,
                 "cat1": group_col,
-                "cutoff_pct": float(cutoff) * 100.0 if "cutoff" in locals() else None,
+                "cutoff_pct": float(cutoff_pct) if "cutoff_pct" in locals() else None,
                 "p_n": int(p_n) if "p_n" in locals() else None,
                 "n_segments": int(pareto_vis.shape[0]) if "pareto_vis" in locals() else None,
                 "top_share_pct": float(pareto_vis.iloc[p_n - 1]["cum"]*100.0) if "pareto_vis" in locals() and "p_n" in locals() and p_n and p_n > 0 and (p_n-1) < len(pareto_vis) else None,
@@ -3584,7 +3580,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                     ),
                 )
                 fig.update_xaxes(tickmode="array", tickvals=corr["x_i"], ticktext=corr["price_bin"])
-                st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+                plotly_chart_stretch(st, fig, config={"displayModeBar": False})
 
                 if not str(_tw.get("price_corridor", "")).strip():
                     if (lo_edge is not None) and (hi_edge is not None) and (p80_price is not None):
@@ -3701,7 +3697,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-                st.plotly_chart(fig_mix, width="stretch", config={"displayModeBar": False})
+                plotly_chart_stretch(st, fig_mix, config={"displayModeBar": False})
                 
             except Exception as e:
                 record_debug_checkpoint("cs.mix_plotly_failed", error=f"{type(e).__name__}: {e}")
@@ -3914,7 +3910,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                         yaxis=dict(title="Struktura (%)", range=[0, 100], showgrid=False, zeroline=False),
                         showlegend=False,
                     )
-                    st.plotly_chart(fig_mm, width="stretch", config={"displayModeBar": False})
+                    plotly_chart_stretch(st, fig_mm, config={"displayModeBar": False})
                 except Exception:
                     st.info("Nie udało się wyrenderować Marimekko dla tych danych — użyj wykresu Mix.")
 
