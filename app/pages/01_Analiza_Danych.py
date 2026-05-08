@@ -1578,6 +1578,8 @@ st.success(
 
 _show_kpi_block(df_masked_preview, mask_pii=mask_pii, meta_obj=meta)
 
+full_run_pending = bool(st.session_state.get("full_run_requested", False))
+
 # ---------------- 3. PODGLĄD DANYCH ----------------
 st.header("3. Podgląd danych (próbka)")
 st.caption(
@@ -1586,18 +1588,24 @@ st.caption(
     "👉 **Przelicz na całości i zapisz artefakty**."
 )
 
-mode = st.radio(
-    "Tryb podglądu tabeli",
-    ["Przewijalna (szybka)", "Paginacja + wyszukiwarka (itables)"],
-    index=0,
-    horizontal=True,
-    help=(
-        "Przewijalna (st.dataframe) ma sticky header i spójny font. "
-        "Tryb itables daje paginację i wyszukiwarkę."
-    ),
-)
+if full_run_pending:
+    st.info("Pełne przeliczenie jest w toku — pomijam renderowanie podglądu, żeby odciążyć serwer.")
+    mode = "Przewijalna (szybka)"
+else:
+    mode = st.radio(
+        "Tryb podglądu tabeli",
+        ["Przewijalna (szybka)", "Paginacja + wyszukiwarka (itables)"],
+        index=0,
+        horizontal=True,
+        help=(
+            "Przewijalna (st.dataframe) ma sticky header i spójny font. "
+            "Tryb itables daje paginację i wyszukiwarkę."
+        ),
+    )
 
-if mode.startswith("Przewijalna"):
+if full_run_pending:
+    pass
+elif mode.startswith("Przewijalna"):
     _preview_download_buttons(df_masked_preview)
 
     height = st.slider(
@@ -1672,16 +1680,17 @@ else:
         unsafe_allow_html=True,
     )
 
-st.download_button(
-    "📦 Pobierz artefakty podglądu (ZIP)",
-    data=_zip_bytes(df_masked_preview, meta, base_name),
-    file_name="ingest_preview.zip",
-    mime="application/zip",
-    help=(
-        "ZIP zawiera: preview_masked.csv (po maskowaniu PII) i meta.json "
-        "z informacjami o źródle."
-    ),
-)
+if not full_run_pending:
+    st.download_button(
+        "📦 Pobierz artefakty podglądu (ZIP)",
+        data=_zip_bytes(df_masked_preview, meta, base_name),
+        file_name="ingest_preview.zip",
+        mime="application/zip",
+        help=(
+            "ZIP zawiera: preview_masked.csv (po maskowaniu PII) i meta.json "
+            "z informacjami o źródle."
+        ),
+    )
 
 st.write("---")
 
