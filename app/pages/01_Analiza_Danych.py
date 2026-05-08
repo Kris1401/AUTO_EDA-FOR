@@ -1742,7 +1742,7 @@ if st.session_state.get("full_run_requested", False):
 
         try:
             df_full_masked, pii_report_full = (
-                mask_dataframe(df_full) if mask_pii else (df_full, {})
+                mask_dataframe(df_full, scan_text=False) if mask_pii else (df_full, {})
             )
         except Exception as e:
             status.update(
@@ -1788,7 +1788,10 @@ if st.session_state.get("full_run_requested", False):
         meta_path = run_dir / f"{safe_base}__meta.json"
 
         status.write("3/3 – Zapis pełnego zbioru do PARQUET (snappy)…")
-        df_full_masked = _optimize_dtypes_for_storage(df_full_masked)
+        if len(df_full_masked) <= 300_000:
+            df_full_masked = _optimize_dtypes_for_storage(df_full_masked)
+        else:
+            status.write("Pomijam dodatkowa optymalizacje typow dla duzego pliku, zeby ograniczyc RAM.")
         _df_to_parquet(df_full_masked, parquet_path)
 
         meta_dump = meta_full.__dict__ | {

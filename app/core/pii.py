@@ -33,15 +33,26 @@ def _mask_cell(val):
         return val
     return _mask_text(str(val))
 
-def mask_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str,int]]:
+def mask_dataframe(
+    df: pd.DataFrame,
+    *,
+    scan_text: bool = True,
+    max_text_rows: int | None = None,
+) -> Tuple[pd.DataFrame, Dict[str,int]]:
     """Zwraca (df_masked, raport_liczników)."""
-    masked = df.copy()
+    masked = df.copy(deep=False)
     report: Dict[str,int] = {}
     # 1) maskowanie po nazwach kolumn
     for c in masked.columns:
         if str(c).strip().lower() in PII_COL_GUESSES:
             report[c] = masked[c].notna().sum()
             masked[c] = masked[c].map(_mask_cell)
+    if not scan_text:
+        report["__text_scan_skipped__"] = int(len(masked))
+        return masked, report
+    if max_text_rows is not None and len(masked) > max_text_rows:
+        report["__text_scan_skipped__"] = int(len(masked))
+        return masked, report
     # 2) skan tekstowy reszty (delikatnie – tylko object/string)
     for c in masked.select_dtypes(include=["object","string"]).columns:
         before = masked[c].copy()
