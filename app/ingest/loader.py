@@ -169,36 +169,46 @@ def load_parquet_smart(
     file_name: str,
     preview_limit: int | None = None,
 ) -> tuple[pd.DataFrame, LoadMeta]:
-    """Wczytanie pliku .parquet z próbkowaniem jak w CSV/XLSX."""
+    """Read Parquet preview without materializing the whole file."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 
-    # 1. Wczytujemy pełny plik do DataFrame
     buffer = io.BytesIO(file_bytes)
-    df_full = pd.read_parquet(buffer, engine="pyarrow")
+    parquet_file = pq.ParquetFile(buffer)
+    n_full_rows = int(parquet_file.metadata.num_rows)
+    n_cols = len(parquet_file.schema_arrow.names)
 
-    n_full_rows, n_cols = df_full.shape
-
-    # 2. Przygotowujemy podgląd (tak jak w CSV/XLSX)
     if preview_limit is not None and n_full_rows > preview_limit:
-        df_preview = df_full.head(preview_limit).copy()
-        n_prev_rows = preview_limit
+        batches = []
+        rows_left = int(preview_limit)
+        batch_size = max(1, min(rows_left, 10_000))
+        for batch in parquet_file.iter_batches(batch_size=batch_size):
+            if rows_left <= 0:
+                break
+            if batch.num_rows > rows_left:
+                batch = batch.slice(0, rows_left)
+            batches.append(batch)
+            rows_left -= batch.num_rows
+        table = pa.Table.from_batches(batches, schema=parquet_file.schema_arrow)
         sample_used = True
     else:
-        df_preview = df_full.copy()
-        n_prev_rows = n_full_rows
+        table = parquet_file.read()
         sample_used = False
 
-    # 3. Meta dane
+    df_preview = table.to_pandas()
+    n_prev_rows = int(df_preview.shape[0])
+
     base_name = os.path.basename(file_name)
     size_mb = round(len(file_bytes) / (1024 ** 2), 2)
 
     meta = LoadMeta(
-        n_rows=n_prev_rows,
+        n_rows=n_full_rows,
         n_cols=n_cols,
         source_name=base_name,
         engine="parquet_pyarrow",
         encoding=None,
         notes="Plik Parquet (PyArrow)",
-        preview_rows=n_prev_rows,   # <<--- NAZWA ZGODNA Z KLASĄ
+        preview_rows=n_prev_rows,
         file_size_mb=size_mb,
         sample_used=sample_used,
     )

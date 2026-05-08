@@ -1566,10 +1566,12 @@ with st.spinner("Przygotowywanie podglądu (maskowanie PII)…"):
         mask_dataframe(df_preview) if mask_pii else (df_preview, {})
     )
 
+preview_n_rows = int(getattr(meta, "preview_rows", None) or df_masked_preview.shape[0])
+
 st.success(
     f"Wczytano: **{meta.source_name}**"
     + (f" · {size_mb} MB" if size_mb is not None else "")
-    + f" · podgląd: {meta.n_rows}×{meta.n_cols} · silnik: {meta.engine}"
+    + f" · podgląd: {preview_n_rows}×{meta.n_cols} · silnik: {meta.engine}"
     + (f" · kodowanie: {meta.encoding}" if getattr(meta, "encoding", None) else "")
     + (f" · notatki: {meta.notes}" if getattr(meta, "notes", None) else "")
 )
