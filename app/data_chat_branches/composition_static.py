@@ -1237,7 +1237,7 @@ def _build_treemap_rects(agg: pd.DataFrame, *, use_two_levels: bool) -> pd.DataF
     return rects
 
 
-def _render_controlled_treemap(agg: pd.DataFrame, *, use_two_levels: bool) -> bool:
+def _render_controlled_treemap(agg: pd.DataFrame, *, use_two_levels: bool, legend_title: str = "Kategoria") -> bool:
     """Render deterministic treemap rectangles with labels in each top-left corner."""
     try:
         import plotly.graph_objects as go_mod  # type: ignore
@@ -1252,25 +1252,12 @@ def _render_controlled_treemap(agg: pd.DataFrame, *, use_two_levels: bool) -> bo
     if src.empty or "group" not in src.columns:
         return False
 
-    # The overview treemap must explain the primary business segments first.
-    # Kategoria 2 powers Mix/Marimekko, but here it made the treemap label
-    # countries instead of categories, so the overview intentionally stays
-    # at the category level.
-    group_df = (
-        src.groupby("group", dropna=False, sort=False)["value"]
-        .sum()
-        .reset_index()
-        .rename(columns={"group": "label"})
-        .sort_values("value", ascending=False)
-        .reset_index(drop=True)
-    )
-    rows = group_df.to_dict("records")
-    rects = pd.DataFrame(_binary_treemap_layout(rows))
+    # Respect Kategoria 2 from the sidebar when it is available. Colors still
+    # encode Kategoria 1, while the nested rectangles show Kategoria 2.
+    rects = _build_treemap_rects(src, use_two_levels=use_two_levels)
     if rects.empty:
         return False
 
-    total = float(rects["value"].sum() or 0.0)
-    rects["share"] = np.where(total > 0, rects["value"] / total, 0.0)
     rects["area"] = (rects["x1"].astype(float) - rects["x0"].astype(float)).abs() * (
         rects["y1"].astype(float) - rects["y0"].astype(float)
     ).abs()
@@ -1284,14 +1271,18 @@ def _render_controlled_treemap(agg: pd.DataFrame, *, use_two_levels: bool) -> bo
     hover_x: list[float] = []
     hover_y: list[float] = []
     hover_cd: list[list[Any]] = []
+    group_labels = rects["group_label"].astype(str).drop_duplicates().tolist()
+    color_map = {g: palette[i % len(palette)] for i, g in enumerate(group_labels)}
 
     for i, r in rects.iterrows():
         x0, x1 = float(r["x0"]), float(r["x1"])
         y0, y1 = float(r["y0"]), float(r["y1"])
-        label = str(r.get("label") or "")
+        group_label = str(r.get("group_label") or r.get("label") or "")
+        subgroup_label = str(r.get("subgroup_label") or "")
+        label = f"{group_label}<br><span style='font-size:10px'>{subgroup_label}</span>" if (use_two_levels and subgroup_label) else group_label
         value = float(r.get("value") or 0.0)
         share = float(r.get("share") or 0.0)
-        fill = palette[int(i) % len(palette)]
+        fill = color_map.get(group_label, palette[int(i) % len(palette)])
         fig.add_shape(
             type="rect",
             x0=x0,
@@ -1317,7 +1308,20 @@ def _render_controlled_treemap(agg: pd.DataFrame, *, use_two_levels: bool) -> bo
             )
         hover_x.append(x0 + (x1 - x0) / 2.0)
         hover_y.append(y0 + (y1 - y0) / 2.0)
-        hover_cd.append([label, value, share])
+        hover_cd.append([group_label, subgroup_label, value, share])
+
+    for group_label, color in color_map.items():
+        fig.add_trace(
+            go_mod.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                marker=dict(size=9, color=color, symbol="square"),
+                name=str(group_label),
+                hoverinfo="skip",
+                showlegend=True,
+            )
+        )
 
     fig.add_trace(
         go_mod.Scatter(
@@ -1328,20 +1332,30 @@ def _render_controlled_treemap(agg: pd.DataFrame, *, use_two_levels: bool) -> bo
             customdata=hover_cd,
             hovertemplate=(
                 "<b>%{customdata[0]}</b><br>"
-                "Wartosc: %{customdata[1]:,.0f}<br>"
-                "Udzial: %{customdata[2]:.1%}<extra></extra>"
+                "Kategoria 2: %{customdata[1]}<br>"
+                "Wartosc: %{customdata[2]:,.0f}<br>"
+                "Udzial: %{customdata[3]:.1%}<extra></extra>"
             ),
             showlegend=False,
         )
     )
     fig.update_layout(
         height=520,
-        margin=dict(l=0, r=0, t=0, b=0),
+        margin=dict(l=0, r=0, t=0, b=68 if use_two_levels else 0),
         xaxis=dict(range=[0, 100], visible=False, fixedrange=True),
         yaxis=dict(range=[0, 100], visible=False, fixedrange=True),
         plot_bgcolor="white",
         paper_bgcolor="white",
-        showlegend=False,
+        showlegend=bool(use_two_levels),
+        legend=dict(
+            title=str(legend_title or "Kategoria"),
+            orientation="h",
+            yanchor="top",
+            y=-0.08,
+            xanchor="left",
+            x=0,
+            font=dict(size=11, color="#64748B"),
+        ),
     )
     plotly_chart_stretch(st, fig, config={"displayModeBar": False})
     return True
@@ -2808,7 +2822,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                         )
 
                     if not agg.empty:
-                        if _render_controlled_treemap(agg, use_two_levels=use_two_levels):
+                        if _render_controlled_treemap(agg, use_two_levels=use_two_levels, legend_title=str(group_col or "Kategoria")):
                             pass
                         elif px is None:
                             record_debug_checkpoint("cs.overview.plotly_express_missing")
@@ -3267,8 +3281,8 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         ))
 
         fig_wf.update_layout(
-            height=430,
-            margin=dict(l=320, r=120, t=10, b=45),
+            height=470,
+            margin=dict(l=185, r=35, t=10, b=45),
             xaxis_title="Wkład do totalu",
             yaxis_title=None,
             yaxis=dict(
@@ -3283,7 +3297,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 automargin=True,
                 tickfont=dict(size=12, color="#374151"),
             ),
-            xaxis=dict(range=[0, max(total_value * 1.10, 1.0)]),
+            xaxis=dict(range=[0, max(total_value * 1.04, 1.0)], automargin=True),
             showlegend=False,
         )
         plotly_chart_stretch(st, fig_wf, config={"displayModeBar": False})
@@ -3870,14 +3884,17 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                                     borderpad=2,
                                 )
                             y0 += h
-                        # group label
+                        # Group label (Kategoria 1) must be visible without hovering.
                         fig_mm.add_annotation(
-                            x=x0 + w/2,
-                            y=102,
-                            text=str(g),
+                            x=x0 + min(max(w * 0.02, 0.25), 1.2),
+                            y=98.5,
+                            text=f"<b>{str(g)}</b>",
                             showarrow=False,
-                            font=dict(size=10, color="#111827"),
-                            bgcolor="rgba(255,255,255,0.80)",
+                            xanchor="left",
+                            yanchor="top",
+                            align="left",
+                            font=dict(size=11, color="#111827"),
+                            bgcolor="rgba(255,255,255,0.82)",
                             bordercolor="rgba(255,255,255,0)",
                             borderpad=1,
                         )

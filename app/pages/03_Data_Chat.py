@@ -254,6 +254,23 @@ def _is_ready_for_training_parquet(p: str | Path) -> bool:
     except Exception:
         return False
 
+def _is_stage3_analysis_parquet(p: str | Path) -> bool:
+    """Full analysis dataset for Data Chat.
+
+    Stage 3 must report true totals, so it should prefer the full masked
+    dataset from Stage 1. ready_for_training.parquet can be based on a fast EDA
+    sample and is only a fallback.
+    """
+    try:
+        pp = Path(p)
+        if pp.suffix.lower() != ".parquet":
+            return False
+        if pp.name.lower() == "ready_for_training.parquet":
+            return False
+        return pp.exists()
+    except Exception:
+        return False
+
 def _safe_mtime(p: str | Path) -> float:
     try:
         return Path(p).stat().st_mtime
@@ -326,29 +343,113 @@ def _discover_latest_stage2_ready_parquet(ingest_root: str | Path | None = None)
     except Exception:
         return None
 
+
+def _restore_stage3_latest_artifacts_from_disk() -> dict | None:
+    """Recover the latest Stage 1 full-data artifact after a rerun/reconnect."""
+    if load_config is None or resolve_artifacts_dir is None:
+        return None
+    try:
+        cfg, _ = load_config()
+        ingest_root = resolve_artifacts_dir(cfg) / "ingest"
+    except Exception:
+        return None
+
+    pointer = ingest_root / "latest_artifacts.json"
+    if pointer.exists():
+        info = _read_latest_handoff_json(pointer)
+        if isinstance(info, dict):
+            p = info.get("parquet_path") or info.get("parquet_path_full") or info.get("full_parquet_path")
+            if isinstance(p, str) and _is_stage3_analysis_parquet(p):
+                st.session_state["latest_artifacts"] = info
+                return info
+
+    try:
+        run_dirs = [p for p in ingest_root.iterdir() if p.is_dir()]
+    except Exception:
+        run_dirs = []
+    run_dirs.sort(key=lambda p: _safe_mtime(p), reverse=True)
+
+    for run_dir in run_dirs:
+        try:
+            parquet_files = sorted(
+                run_dir.glob("*__full_masked.parquet"),
+                key=lambda p: _safe_mtime(p),
+                reverse=True,
+            )
+            if not parquet_files:
+                continue
+            parquet_path = parquet_files[0]
+            meta_files = sorted(
+                run_dir.glob("*__meta.json"),
+                key=lambda p: _safe_mtime(p),
+                reverse=True,
+            )
+            meta_json: dict[str, Any] = {}
+            if meta_files:
+                meta = _read_latest_handoff_json(meta_files[0])
+                if isinstance(meta, dict):
+                    meta_json = meta
+            info = {
+                "parquet_path": str(parquet_path),
+                "meta_path": str(meta_files[0]) if meta_files else "",
+                "run_dir": str(run_dir),
+                "ingest_root": str(ingest_root),
+                "n_rows": int(meta_json.get("n_rows") or 0),
+                "n_cols": int(meta_json.get("n_cols") or 0),
+                "source_name": meta_json.get("source_name") or parquet_path.name,
+                "source_kind": meta_json.get("source_kind") or "uploaded",
+            }
+            st.session_state["latest_artifacts"] = info
+            try:
+                pointer.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+            return info
+        except Exception:
+            continue
+    return None
+
+
 def _resolve_stage3_parquet_path() -> Dict[str, Any]:
-    """Pick the freshest ready_for_training.parquet from:
+    """Pick the best dataset for Stage 3.
+
+    Prefer the full Stage 1 analysis parquet so KPI/charts are computed on the
+    complete dataset. The Stage 2 ready parquet is only a fallback because it may
+    intentionally be sample-sized on small DigitalOcean containers.
+
+    Sources:
     - datachat_handoff (session_state)
     - latest_artifacts (session_state)
     - ingest/_latest_handoff.json (disk pointer)
-    - fallback scan ingest
+    - fallback scan ingest for ready_for_training.parquet
     """
-    candidates: list[tuple[str, str]] = []
+    analysis_candidates: list[tuple[str, str]] = []
+    ready_candidates: list[tuple[str, str]] = []
+
+    def _add_analysis(src: str, p: Any) -> None:
+        if isinstance(p, str) and _is_stage3_analysis_parquet(p):
+            analysis_candidates.append((src, p))
+
+    def _add_ready(src: str, p: Any) -> None:
+        if isinstance(p, str) and _is_ready_for_training_parquet(p):
+            ready_candidates.append((src, p))
 
     # 1) datachat_handoff
     handoff = st.session_state.get("datachat_handoff") or {}
     if isinstance(handoff, dict):
-        p = handoff.get("ready_parquet_path")
-        if isinstance(p, str) and _is_ready_for_training_parquet(p):
-            candidates.append(("datachat_handoff", p))
+        _add_analysis("datachat_handoff:parquet_path_full", handoff.get("parquet_path_full"))
+        _add_analysis("datachat_handoff:parquet_path", handoff.get("parquet_path"))
+        _add_ready("datachat_handoff:ready_parquet_path", handoff.get("ready_parquet_path"))
 
     # 2) latest_artifacts
     latest = st.session_state.get("latest_artifacts") or {}
+    if not isinstance(latest, dict) or not latest:
+        latest = _restore_stage3_latest_artifacts_from_disk() or {}
     if isinstance(latest, dict):
+        for k in ("parquet_path", "parquet_path_full", "full_parquet_path"):
+            _add_analysis(f"latest_artifacts:{k}", latest.get(k))
         for k in ("stage2_ready_parquet_path", "ready_parquet_path"):
-            p = latest.get(k)
-            if isinstance(p, str) and _is_ready_for_training_parquet(p):
-                candidates.append((f"latest_artifacts:{k}", p))
+            _add_ready(f"latest_artifacts:{k}", latest.get(k))
 
     # 3) disk pointer: ingest/_latest_handoff.json (best effort)
     ingest_root = None
@@ -356,9 +457,10 @@ def _resolve_stage3_parquet_path() -> Dict[str, Any]:
         ingest_root = latest.get("ingest_root") if isinstance(latest.get("ingest_root"), str) else None
 
     # infer ingest_root from any candidate
-    if ingest_root is None and candidates:
+    all_candidates = analysis_candidates + ready_candidates
+    if ingest_root is None and all_candidates:
         try:
-            ingest_root = str(Path(candidates[0][1]).parent.parent)
+            ingest_root = str(Path(all_candidates[0][1]).parent.parent)
         except Exception:
             ingest_root = None
 
@@ -366,11 +468,21 @@ def _resolve_stage3_parquet_path() -> Dict[str, Any]:
     if pointer_path is not None:
         v = _read_latest_handoff_json(pointer_path)
         if isinstance(v, dict):
-            p = v.get("ready_parquet_path")
-            if isinstance(p, str) and _is_ready_for_training_parquet(p):
-                candidates.append(("latest_handoff_json", p))
+            for k in ("analysis_parquet_path", "parquet_path_full", "parquet_path"):
+                _add_analysis(f"latest_handoff_json:{k}", v.get(k))
+            handoff_path = v.get("datachat_handoff_path")
+            if isinstance(handoff_path, str) and os.path.exists(handoff_path):
+                h = _read_latest_handoff_json(Path(handoff_path))
+                if isinstance(h, dict):
+                    _add_analysis("datachat_handoff_json:parquet_path_full", h.get("parquet_path_full"))
+                    _add_analysis("datachat_handoff_json:parquet_path", h.get("parquet_path"))
+                    _add_ready("datachat_handoff_json:ready_parquet_path", h.get("ready_parquet_path"))
+            _add_ready("latest_handoff_json:ready_parquet_path", v.get("ready_parquet_path"))
 
-    # choose freshest by mtime
+    # Prefer full analysis data. Only if unavailable, fall back to Stage 2 ready data.
+    candidates = analysis_candidates or ready_candidates
+
+    # choose freshest by mtime within the chosen tier
     best_src = None
     best_p = None
     best_m = 0.0
@@ -389,7 +501,13 @@ def _resolve_stage3_parquet_path() -> Dict[str, Any]:
             best_p = str(disk)
             best_m = _safe_mtime(disk)
 
-    return {"source": best_src, "path": best_p, "mtime": best_m, "ingest_root": ingest_root}
+    return {
+        "source": best_src,
+        "path": best_p,
+        "mtime": best_m,
+        "ingest_root": ingest_root,
+        "dataset_tier": "full_analysis" if analysis_candidates and best_p else "ready_fallback",
+    }
 
 
 try:
@@ -1857,11 +1975,13 @@ def _datachat_tts_generate_mp3(
 def _data_source_info() -> Dict[str, Any]:
     """Ustala źródło danych dla Data Chat (Stage3) w sposób stabilny i deterministyczny.
 
-    Zasada: zawsze wybieramy NAJŚWIEŻSZY `ready_for_training.parquet` (nigdy *_full_masked.parquet).
+    Zasada: metryki i wykresy w Etapie 3 liczymy z pełnego artefaktu
+    analitycznego z Etapu 1. `ready_for_training.parquet` jest tylko fallbackiem,
+    bo na małych kontenerach może być próbką EDA.
     Priorytety:
     - session_state: datachat_handoff / latest_artifacts
     - ingest/_latest_handoff.json
-    - fallback: skan ingest po */ready_for_training.parquet
+    - fallback: skan ingest po */ready_for_training.parquet, jeśli brak pełnego pliku
     """
     info = _resolve_stage3_parquet_path()
     p = info.get("path")
@@ -1871,8 +1991,9 @@ def _data_source_info() -> Dict[str, Any]:
             "path": p,
             "mtime": info.get("mtime"),
             "ingest_root": info.get("ingest_root"),
+            "dataset_tier": info.get("dataset_tier"),
         }
-    return {"source": None, "path": None, "ingest_root": info.get("ingest_root")}
+    return {"source": None, "path": None, "ingest_root": info.get("ingest_root"), "dataset_tier": info.get("dataset_tier")}
 
 def _get_df_from_session(max_rows: int | None = None) -> pd.DataFrame | None:
     """Adapter Etap 2 -> Data Chat (Parquet only).
@@ -3316,6 +3437,10 @@ def main() -> None:
 
     with col_b:
         st.caption(f"Źródło: **{src['source']}**")
+        if src.get("dataset_tier") == "full_analysis":
+            st.caption("Tryb danych: **pełny zbiór analityczny**")
+        elif src.get("dataset_tier") == "ready_fallback":
+            st.caption("Tryb danych: **fallback ready_for_training**")
         if src.get("path"):
             st.caption(f"Plik: `{src['path']}`")
 
