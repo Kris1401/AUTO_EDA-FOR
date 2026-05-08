@@ -69,6 +69,7 @@ from core.top_nav import (
     render_flow_nav,
     render_sidebar_links,
 )
+from core.config import load_config, resolve_artifacts_dir
 
 
 # --- wspólna paleta barw ---
@@ -1740,9 +1741,100 @@ def _make_eda_summary_text(
 
 # =====================  UTILITIES  =======================
 
+def _valid_latest_artifacts(info: dict | None) -> dict | None:
+    if not isinstance(info, dict):
+        return None
+    parquet_path = info.get("parquet_path") or info.get("csv_path")
+    if parquet_path and os.path.exists(str(parquet_path)):
+        return info
+    return None
+
+
+def _restore_latest_artifacts_from_disk() -> dict | None:
+    """Recover Stage 1 artifacts after Streamlit reruns/reconnects."""
+    try:
+        cfg, _ = load_config()
+        ingest_root = resolve_artifacts_dir(cfg) / "ingest"
+    except Exception:
+        return None
+
+    pointer = ingest_root / "latest_artifacts.json"
+    if pointer.exists():
+        try:
+            info = json.loads(pointer.read_text(encoding="utf-8"))
+            valid = _valid_latest_artifacts(info)
+            if valid:
+                st.session_state["latest_artifacts"] = valid
+                return valid
+        except Exception:
+            pass
+
+    try:
+        run_dirs = [p for p in ingest_root.iterdir() if p.is_dir()]
+    except Exception:
+        run_dirs = []
+    run_dirs.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+
+    for run_dir in run_dirs:
+        try:
+            parquet_files = sorted(
+                run_dir.glob("*__full_masked.parquet"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if not parquet_files:
+                parquet_files = sorted(
+                    run_dir.glob("*.parquet"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+            if not parquet_files:
+                continue
+
+            meta_files = sorted(
+                run_dir.glob("*__meta.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            parquet_path = parquet_files[0]
+            meta_path = meta_files[0] if meta_files else None
+            meta_json: dict[str, Any] = {}
+            if meta_path and meta_path.exists():
+                try:
+                    meta_json = json.loads(meta_path.read_text(encoding="utf-8"))
+                except Exception:
+                    meta_json = {}
+
+            info = {
+                "parquet_path": str(parquet_path),
+                "meta_path": str(meta_path) if meta_path else "",
+                "run_dir": str(run_dir),
+                "n_rows": int(meta_json.get("n_rows") or 0),
+                "n_cols": int(meta_json.get("n_cols") or 0),
+                "pii_masked": bool(meta_json.get("pii_masked", True)),
+                "source_name": meta_json.get("source_name") or parquet_path.name,
+                "source_kind": meta_json.get("source_kind") or "uploaded",
+                "timestamp": meta_json.get("timestamp") or "",
+            }
+            valid = _valid_latest_artifacts(info)
+            if valid:
+                st.session_state["latest_artifacts"] = valid
+                try:
+                    ingest_root.mkdir(parents=True, exist_ok=True)
+                    pointer.write_text(json.dumps(valid, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+                return valid
+        except Exception:
+            continue
+    return None
+
+
 def _load_latest_dataset() -> Tuple[pd.DataFrame | None, dict | None, str | None]:
     """Wczytuje zbiór z poprzedniego kroku (PARQUET only)."""
-    latest_info = st.session_state.get("latest_artifacts")
+    latest_info = _valid_latest_artifacts(st.session_state.get("latest_artifacts"))
+    if latest_info is None:
+        latest_info = _restore_latest_artifacts_from_disk()
     if latest_info is None:
         return None, None, (
             "Brak gotowych danych w pamięci aplikacji. "

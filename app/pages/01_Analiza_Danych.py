@@ -1251,6 +1251,18 @@ def _parquet_metadata_for_passthrough(path: Path, source_name: str) -> tuple[Sim
     except Exception:
         return None, []
 
+
+def _write_latest_artifacts_pointer(payload: dict, run_dir: Path) -> None:
+    """Persist latest ingest pointers so later stages survive Streamlit reruns/reconnects."""
+    try:
+        ingest_root = resolve_artifacts_dir(cfg) / "ingest"
+        ingest_root.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        (ingest_root / "latest_artifacts.json").write_text(text, encoding="utf-8")
+        (run_dir / "latest_artifacts.json").write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
 # ---------------- Sidebar: wspólne ustawienia ----------------
 with st.sidebar:
     st.subheader("Import — ustawienia")
@@ -1886,7 +1898,7 @@ if st.session_state.get("full_run_requested", False):
             encoding="utf-8",
         )
 
-        st.session_state["latest_artifacts"] = {
+        latest_payload = {
             "parquet_path": str(parquet_path),
             "meta_path": str(meta_path),
             "run_dir": str(run_dir),
@@ -1897,6 +1909,8 @@ if st.session_state.get("full_run_requested", False):
             "timestamp": ts,
             "source_kind": "demo" if is_demo else "uploaded",
         }
+        st.session_state["latest_artifacts"] = latest_payload
+        _write_latest_artifacts_pointer(latest_payload, run_dir)
 
         status.write("✔ 3/3 – Artefakty zapisane. Dane są gotowe do trenowania modelu.")
         status.update(
