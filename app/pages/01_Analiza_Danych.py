@@ -5,6 +5,7 @@ import os
 import io
 import json
 import hashlib
+import shutil
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -61,7 +62,7 @@ from pandas.api.types import is_datetime64_any_dtype
 
 from core.i18n import t
 from core.config import load_config, resolve_artifacts_dir
-from core.pii import mask_dataframe
+from core.pii import PII_COL_GUESSES, mask_dataframe
 from ingest import load_any, excel_sheet_names
 from core.top_nav import (
     hide_default_multipage_nav,
@@ -1228,6 +1229,28 @@ def _clear_persisted_upload() -> None:
             pass
         latest.unlink(missing_ok=True)
 
+
+def _parquet_metadata_for_passthrough(path: Path, source_name: str) -> tuple[SimpleNamespace | None, list[str]]:
+    """Read only Parquet footer metadata, without loading rows into RAM."""
+    try:
+        import pyarrow.parquet as pq
+
+        parquet_file = pq.ParquetFile(path)
+        columns = [field.name for field in parquet_file.schema_arrow]
+        metadata = parquet_file.metadata
+        meta = SimpleNamespace(
+            source_name=os.path.basename(source_name),
+            n_rows=int(metadata.num_rows),
+            n_cols=len(columns),
+            engine="parquet_passthrough",
+            encoding=None,
+            notes="Plik Parquet skopiowany bez pelnego wczytywania do RAM.",
+            task=None,
+        )
+        return meta, columns
+    except Exception:
+        return None, []
+
 # ---------------- Sidebar: wspólne ustawienia ----------------
 with st.sidebar:
     st.subheader("Import — ustawienia")
@@ -1704,30 +1727,63 @@ if st.session_state.get("full_run_requested", False):
         # ------------------ Krok 1/3: wczytywanie pełnego zbioru ------------------
         status.write("1/3 – Wczytywanie pełnego zbioru do pamięci…")
 
+        passthrough_source_path: Path | None = None
+        full_n_rows: int | None = None
+        full_n_cols: int | None = None
+
         if is_demo:
             df_full = df_full_demo.copy()
             meta_full = meta_full_demo
             status.write("✔ 1/3 – Wczytywanie pełnego zbioru zakończone (demo).")
         else:
-            try:
-                df_full, meta_full = load_any(
-                    file_bytes,
+            df_full = None
+            meta_full = None
+            parquet_columns: list[str] = []
+            can_passthrough_parquet = (
+                name_lower.endswith(".parquet")
+                and active_file_path is not None
+                and active_file_path.exists()
+            )
+
+            if can_passthrough_parquet:
+                meta_candidate, parquet_columns = _parquet_metadata_for_passthrough(
+                    active_file_path,
                     active_file_name,
-                    preview_limit=None,
-                    csv_sep=csv_sep,
-                    xlsx_sheet=xlsx_sheet,
-                    pdf_pages=pdf_pages,
-                    pdf_flavor=pdf_flavor,
                 )
-                status.write("✔ 1/3 – Wczytywanie pełnego zbioru zakończone (plik użytkownika).")
-            except Exception as e:
-                status.update(
-                    label="❌ Błąd podczas wczytywania pełnego zbioru",
-                    state="error",
-                )
-                st.exception(e)
-                st.session_state["full_run_requested"] = False
-                st.stop()
+                pii_name_hits = [
+                    col for col in parquet_columns if str(col).strip().lower() in PII_COL_GUESSES
+                ]
+                if meta_candidate is not None and (not mask_pii or not pii_name_hits):
+                    meta_full = meta_candidate
+                    passthrough_source_path = active_file_path
+                    status.write(
+                        "Parquet: kopiuję pełny plik do artefaktów bez odczytu wszystkich wierszy do RAM."
+                    )
+                elif pii_name_hits:
+                    status.write(
+                        "Parquet zawiera kolumny o nazwach PII; używam standardowego trybu maskowania."
+                    )
+
+            if passthrough_source_path is None:
+                try:
+                    df_full, meta_full = load_any(
+                        file_bytes,
+                        active_file_name,
+                        preview_limit=None,
+                        csv_sep=csv_sep,
+                        xlsx_sheet=xlsx_sheet,
+                        pdf_pages=pdf_pages,
+                        pdf_flavor=pdf_flavor,
+                    )
+                    status.write("✔ 1/3 – Wczytywanie pełnego zbioru zakończone (plik użytkownika).")
+                except Exception as e:
+                    status.update(
+                        label="❌ Błąd podczas wczytywania pełnego zbioru",
+                        state="error",
+                    )
+                    st.exception(e)
+                    st.session_state["full_run_requested"] = False
+                    st.stop()
 
         status.update(
             label="2/3 – Maskowanie PII…",
@@ -1740,18 +1796,25 @@ if st.session_state.get("full_run_requested", False):
         else:
             status.write("2/3 – Pomijanie maskowania PII (opcja wyłączona)…")
 
-        try:
-            df_full_masked, pii_report_full = (
-                mask_dataframe(df_full, scan_text=False) if mask_pii else (df_full, {})
-            )
-        except Exception as e:
-            status.update(
-                label="Blad podczas maskowania PII",
-                state="error",
-            )
-            st.exception(e)
-            st.session_state["full_run_requested"] = False
-            st.stop()
+        if passthrough_source_path is not None:
+            df_full_masked = None
+            pii_report_full = {"__parquet_passthrough__": int(getattr(meta_full, "n_rows", 0) or 0)}
+            if mask_pii:
+                pii_report_full["__text_scan_skipped__"] = int(getattr(meta_full, "n_rows", 0) or 0)
+            status.write("Parquet: pomijam pełne maskowanie w RAM; preview pozostaje maskowany.")
+        else:
+            try:
+                df_full_masked, pii_report_full = (
+                    mask_dataframe(df_full, scan_text=False) if mask_pii else (df_full, {})
+                )
+            except Exception as e:
+                status.update(
+                    label="Blad podczas maskowania PII",
+                    state="error",
+                )
+                st.exception(e)
+                st.session_state["full_run_requested"] = False
+                st.stop()
 
         status.write("✔ 2/3 – Etap maskowania PII zakończony.")
 
@@ -1788,11 +1851,19 @@ if st.session_state.get("full_run_requested", False):
         meta_path = run_dir / f"{safe_base}__meta.json"
 
         status.write("3/3 – Zapis pełnego zbioru do PARQUET (snappy)…")
-        if len(df_full_masked) <= 300_000:
-            df_full_masked = _optimize_dtypes_for_storage(df_full_masked)
+        if passthrough_source_path is not None:
+            shutil.copyfile(passthrough_source_path, parquet_path)
+            full_n_rows = int(getattr(meta_full, "n_rows", 0) or 0)
+            full_n_cols = int(getattr(meta_full, "n_cols", 0) or 0)
+            status.write("Parquet: pełny plik skopiowany do artefaktów bez ponownego zapisu DataFrame.")
         else:
-            status.write("Pomijam dodatkowa optymalizacje typow dla duzego pliku, zeby ograniczyc RAM.")
-        _df_to_parquet(df_full_masked, parquet_path)
+            if len(df_full_masked) <= 300_000:
+                df_full_masked = _optimize_dtypes_for_storage(df_full_masked)
+            else:
+                status.write("Pomijam dodatkowa optymalizacje typow dla duzego pliku, zeby ograniczyc RAM.")
+            _df_to_parquet(df_full_masked, parquet_path)
+            full_n_rows = int(df_full_masked.shape[0])
+            full_n_cols = int(df_full_masked.shape[1])
 
         meta_dump = meta_full.__dict__ | {
             "pii_masked": bool(mask_pii),
@@ -1808,8 +1879,8 @@ if st.session_state.get("full_run_requested", False):
             "parquet_path": str(parquet_path),
             "meta_path": str(meta_path),
             "run_dir": str(run_dir),
-            "n_rows": int(df_full_masked.shape[0]),
-            "n_cols": int(df_full_masked.shape[1]),
+            "n_rows": int(full_n_rows or 0),
+            "n_cols": int(full_n_cols or 0),
             "pii_masked": bool(mask_pii),
             "source_name": meta_full.source_name,
             "timestamp": ts,
@@ -1827,8 +1898,8 @@ if st.session_state.get("full_run_requested", False):
         "✅ Dane przygotowane do trenowania modelu.\n\n"
         f"- Pełny zbiór (po maskowaniu PII): `{parquet_path}`  \n"
         f"- Meta-informacje: `{meta_path}`  \n"
-        f"- Rozmiar danych: {df_full_masked.shape[0]} wierszy × "
-        f"{df_full_masked.shape[1]} kolumn\n\n"
+        f"- Rozmiar danych: {int(full_n_rows or 0)} wierszy × "
+        f"{int(full_n_cols or 0)} kolumn\n\n"
         "Możesz teraz przejść do zakładki **Trenowanie Modelu** — "
         "aplikacja automatycznie użyje tych danych (`latest_artifacts`)."
     )
