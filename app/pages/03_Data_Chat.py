@@ -57,21 +57,33 @@ def _df_from_parquet(path: Path, max_rows: int | None = None) -> pd.DataFrame:
     try:
         import pyarrow.parquet as pq
         pf = pq.ParquetFile(path)
+        def _to_pandas(table: Any) -> pd.DataFrame:
+            try:
+                return table.to_pandas(
+                    types_mapper=pd.ArrowDtype,
+                    split_blocks=True,
+                    self_destruct=True,
+                )
+            except TypeError:
+                return table.to_pandas(types_mapper=pd.ArrowDtype)
+            except Exception:
+                return table.to_pandas()
+
         if not max_rows:
-            return pf.read().to_pandas()
+            return _to_pandas(pf.read())
         out = []
         remaining = int(max_rows)
         for rg in range(pf.num_row_groups):
             if remaining <= 0:
                 break
             tbl = pf.read_row_group(rg)
-            df_rg = tbl.to_pandas()
+            df_rg = _to_pandas(tbl)
             if len(df_rg) > remaining:
                 df_rg = df_rg.iloc[:remaining].copy()
             out.append(df_rg)
             remaining -= len(df_rg)
         if not out:
-            return pf.read_row_group(0).to_pandas().head(max_rows)
+            return _to_pandas(pf.read_row_group(0)).head(max_rows)
         return pd.concat(out, ignore_index=True)
     except Exception:
         # fallback: pandas may still read full file
@@ -288,10 +300,34 @@ def _read_latest_handoff_json(pointer_path: Path) -> dict | None:
     return None
 
 
+def _stage3_full_load_blocked(p: str | Path) -> bool:
+    """Avoid repeatedly trying a full parquet that already failed in this session."""
+    try:
+        failed = st.session_state.get("datachat_failed_full_load_paths_v1")
+        if not isinstance(failed, dict):
+            return False
+        key = str(Path(p))
+        return float(failed.get(key, -1.0)) == float(_safe_mtime(p))
+    except Exception:
+        return False
+
+
+def _mark_stage3_full_load_failed(p: str | Path) -> None:
+    try:
+        failed = st.session_state.get("datachat_failed_full_load_paths_v1")
+        if not isinstance(failed, dict):
+            failed = {}
+        failed[str(Path(p))] = float(_safe_mtime(p))
+        st.session_state["datachat_failed_full_load_paths_v1"] = failed
+    except Exception:
+        pass
+
+
 def _load_df_from_parquet_cached(path: str | Path, max_rows: int | None = None) -> pd.DataFrame | None:
     try:
         pp = Path(path)
         if not pp.exists():
+            st.session_state["datachat_last_load_error"] = f"Plik nie istnieje: {pp}"
             return None
         cache = st.session_state.get("datachat_df_cache_v2")
         if not isinstance(cache, dict):
@@ -314,7 +350,10 @@ def _load_df_from_parquet_cached(path: str | Path, max_rows: int | None = None) 
             if max_rows is None:
                 st.session_state["df_ready_for_training"] = loaded
         return loaded
-    except Exception:
+    except Exception as exc:
+        st.session_state["datachat_last_load_error"] = (
+            f"{type(exc).__name__}: {exc} | path={path} | max_rows={max_rows}"
+        )
         return None
 
 def _discover_latest_stage2_ready_parquet(ingest_root: str | Path | None = None) -> Path | None:
@@ -324,6 +363,12 @@ def _discover_latest_stage2_ready_parquet(ingest_root: str | Path | None = None)
     """
     try:
         root = Path(ingest_root) if ingest_root else None
+        if root is None and load_config is not None and resolve_artifacts_dir is not None:
+            try:
+                cfg, _ = load_config()
+                root = resolve_artifacts_dir(cfg) / "ingest"
+            except Exception:
+                root = None
         if root is None or not root.exists():
             return None
         # Only direct subfolders (runs) to keep it fast
@@ -399,6 +444,10 @@ def _restore_stage3_latest_artifacts_from_disk() -> dict | None:
                 "source_name": meta_json.get("source_name") or parquet_path.name,
                 "source_kind": meta_json.get("source_kind") or "uploaded",
             }
+            ready_path = run_dir / "ready_for_training.parquet"
+            if ready_path.exists():
+                info["ready_parquet_path"] = str(ready_path)
+                info["stage2_ready_parquet_path"] = str(ready_path)
             st.session_state["latest_artifacts"] = info
             try:
                 pointer.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -427,7 +476,7 @@ def _resolve_stage3_parquet_path() -> Dict[str, Any]:
     ready_candidates: list[tuple[str, str]] = []
 
     def _add_analysis(src: str, p: Any) -> None:
-        if isinstance(p, str) and _is_stage3_analysis_parquet(p):
+        if isinstance(p, str) and _is_stage3_analysis_parquet(p) and not _stage3_full_load_blocked(p):
             analysis_candidates.append((src, p))
 
     def _add_ready(src: str, p: Any) -> None:
@@ -461,6 +510,13 @@ def _resolve_stage3_parquet_path() -> Dict[str, Any]:
     if ingest_root is None and all_candidates:
         try:
             ingest_root = str(Path(all_candidates[0][1]).parent.parent)
+        except Exception:
+            ingest_root = None
+
+    if ingest_root is None and load_config is not None and resolve_artifacts_dir is not None:
+        try:
+            cfg, _ = load_config()
+            ingest_root = str(resolve_artifacts_dir(cfg) / "ingest")
         except Exception:
             ingest_root = None
 
@@ -2020,7 +2076,10 @@ def _get_df_from_session(max_rows: int | None = None) -> pd.DataFrame | None:
         st.session_state["datachat_ready_path"] = p
         loaded = _load_df_from_parquet_cached(p, max_rows=max_rows)
         if isinstance(loaded, pd.DataFrame) and not loaded.empty:
+            st.session_state["datachat_loaded_source_info"] = src_info
             return loaded
+        if src_info.get("dataset_tier") == "full_analysis":
+            _mark_stage3_full_load_failed(p)
 
     # fallback:
 
@@ -2028,6 +2087,11 @@ def _get_df_from_session(max_rows: int | None = None) -> pd.DataFrame | None:
     df_ready_key = st.session_state.get("df_ready_key") or "df_ready_for_training"
     df_ready = st.session_state.get(df_ready_key)
     if isinstance(df_ready, pd.DataFrame) and not df_ready.empty:
+        st.session_state["datachat_loaded_source_info"] = {
+            "source": f"session_state:{df_ready_key}",
+            "path": None,
+            "dataset_tier": "session_dataframe",
+        }
         return df_ready if max_rows is None else df_ready.head(max_rows)
 
     # Fallback 2: latest_artifacts pointers (Etap 1/2)
@@ -2038,19 +2102,38 @@ def _get_df_from_session(max_rows: int | None = None) -> pd.DataFrame | None:
             "ready_parquet_path",
             "parquet_path",
             "parquet_path_full",
+            "full_parquet_path",
         ):
             p = latest.get(key)
             if isinstance(p, str) and p and os.path.exists(p):
+                if key in ("parquet_path", "parquet_path_full", "full_parquet_path") and _stage3_full_load_blocked(p):
+                    continue
                 st.session_state["datachat_ready_path"] = p
                 loaded = _load_df_from_parquet_cached(p, max_rows=max_rows)
                 if isinstance(loaded, pd.DataFrame) and not loaded.empty:
+                    st.session_state["datachat_loaded_source_info"] = {
+                        "source": f"latest_artifacts:{key}",
+                        "path": p,
+                        "mtime": _safe_mtime(p),
+                        "ingest_root": latest.get("ingest_root"),
+                        "dataset_tier": "full_analysis" if key in ("parquet_path", "parquet_path_full", "full_parquet_path") else "ready_fallback",
+                    }
                     return loaded
+                if key in ("parquet_path", "parquet_path_full", "full_parquet_path"):
+                    _mark_stage3_full_load_failed(p)
 
     # 4) As a last resort, discover latest Stage 2 artifacts on disk.
     disk_path = _discover_latest_stage2_ready_parquet()
     if disk_path is not None:
         loaded = _load_df_from_parquet_cached(disk_path, max_rows=max_rows)
         if isinstance(loaded, pd.DataFrame) and not loaded.empty:
+            st.session_state["datachat_loaded_source_info"] = {
+                "source": "fallback_scan_ingest",
+                "path": str(disk_path),
+                "mtime": _safe_mtime(disk_path),
+                "ingest_root": str(disk_path.parent.parent),
+                "dataset_tier": "ready_fallback",
+            }
             return loaded
 
     return None
@@ -3426,12 +3509,16 @@ def main() -> None:
     # ─────────────────────────────────────────────
     # KROK 1 — Status danych + preview kolumn (MUST)
     # ─────────────────────────────────────────────
-    src = _data_source_info()
+    src_loaded = st.session_state.get("datachat_loaded_source_info")
+    src = src_loaded if isinstance(src_loaded, dict) else _data_source_info()
 
     col_a, col_b = st.columns([2, 1], vertical_alignment="center")
     with col_a:
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
             st.error("Brak danych do analizy. Uruchom Etap 1–2 lub wskaż poprawny zestaw danych.")
+            last_err = st.session_state.get("datachat_last_load_error")
+            if isinstance(last_err, str) and last_err:
+                st.caption(f"Ostatni błąd ładowania: {last_err}")
             return
         st.success(f"Dane wczytane ✅  |  wiersze: {len(df):,}  |  kolumny: {df.shape[1]:,}")
 
