@@ -30,24 +30,25 @@ def _df_to_parquet(df: pd.DataFrame, path: Path) -> None:
 def _df_from_parquet(path: Path, max_rows: int | None = None) -> pd.DataFrame:
     """Load Parquet. If max_rows is set, read only first N rows (fast preview)."""
     try:
+        import pyarrow as pa
         import pyarrow.parquet as pq
         pf = pq.ParquetFile(path)
         if not max_rows:
             return pf.read().to_pandas()
-        out = []
+
+        batches = []
         remaining = int(max_rows)
-        for rg in range(pf.num_row_groups):
+        batch_size = max(1, min(remaining, 10_000))
+        for batch in pf.iter_batches(batch_size=batch_size):
             if remaining <= 0:
                 break
-            tbl = pf.read_row_group(rg)
-            df_rg = tbl.to_pandas()
-            if len(df_rg) > remaining:
-                df_rg = df_rg.iloc[:remaining].copy()
-            out.append(df_rg)
-            remaining -= len(df_rg)
-        if not out:
-            return pf.read_row_group(0).to_pandas().head(max_rows)
-        return pd.concat(out, ignore_index=True)
+            if batch.num_rows > remaining:
+                batch = batch.slice(0, remaining)
+            batches.append(batch)
+            remaining -= batch.num_rows
+        if not batches:
+            return pd.DataFrame()
+        return pa.Table.from_batches(batches, schema=pf.schema_arrow).to_pandas()
     except Exception:
         # fallback: pandas may still read full file
         df = pd.read_parquet(path)
@@ -1830,7 +1831,7 @@ def _restore_latest_artifacts_from_disk() -> dict | None:
     return None
 
 
-def _load_latest_dataset() -> Tuple[pd.DataFrame | None, dict | None, str | None]:
+def _load_latest_dataset(max_rows: int | None = None) -> Tuple[pd.DataFrame | None, dict | None, str | None]:
     """Wczytuje zbiór z poprzedniego kroku (PARQUET only)."""
     latest_info = _valid_latest_artifacts(st.session_state.get("latest_artifacts"))
     if latest_info is None:
@@ -1853,13 +1854,15 @@ def _load_latest_dataset() -> Tuple[pd.DataFrame | None, dict | None, str | None
     path = Path(parquet_path)
     try:
         size_mb = path.stat().st_size / (1024 * 1024)
-        # Smart preview for huge files to avoid hangs
-        preview_max = 500_000 if size_mb >= 500 else None
-        df = _df_from_parquet(path, max_rows=preview_max)
-        if preview_max:
+        read_limit = int(max_rows) if max_rows and max_rows > 0 else None
+        # Smart preview for huge files to avoid hangs even when sample mode is off.
+        if read_limit is None and size_mb >= 500:
+            read_limit = 500_000
+        df = _df_from_parquet(path, max_rows=read_limit)
+        if read_limit:
             st.caption(
-                f"⚡ PREVIEW MODE: wczytano pierwsze {len(df):,} wierszy "
-                f"z pliku ~{size_mb:,.0f} MB. Do analizy użyjemy próbki."
+                f"⚡ Tryb próbki EDA: wczytano {len(df):,} wierszy "
+                f"z pliku ~{size_mb:,.1f} MB bez ładowania całości do RAM."
             )
     except Exception as e:
         return None, latest_info, f"Nie udało się wczytać danych z PARQUET: {e}"
@@ -4623,32 +4626,27 @@ def main():
     eda_debug_slots = None
 
     # 0) Wczytanie danych
+    # Etap 2 na DO/Streamlit CC nie może najpierw ładować całego Parquetu,
+    # bo proces z 1 GB RAM potrafi zostać ubity zanim powstanie próbka.
+    load_sample_rows = None
+    if "use_sample" in locals() and "sample_rows_eda" in locals() and use_sample:
+        load_sample_rows = int(sample_rows_eda)
 
-    # Najpierw wczytujemy PEŁNY zbiór z Etapu 1
-    df_full, latest_info, err = _load_latest_dataset()
+    df_full, latest_info, err = _load_latest_dataset(max_rows=load_sample_rows)
     if err:
         st.error(err)
         st.stop()
 
-    # Domyślnie EDA pracuje na pełnym zbiorze
+    # W trybie próbki _load_latest_dataset zwraca już próbkę odczytaną bezpośrednio
+    # z Parquetu, więc nie wykonujemy kosztownego df_full.sample(...) po pełnym loadzie.
     df = df_full
     is_sampled = False
 
-    # Jeżeli w sidebarze mamy przełącznik "Pracuj na próbce danych (szybsza EDA)"
-    # i parametr rozmiaru próbki, to spróbujmy użyć próbkowania
-    if "use_sample" in locals() and "sample_rows_eda" in locals():
-        try:
-            n_rows_full = df_full.shape[0]
-            if use_sample and n_rows_full > int(sample_rows_eda):
-                df = df_full.sample(
-                    n=int(sample_rows_eda),
-                    random_state=0,
-                ).reset_index(drop=True)
-                is_sampled = True
-        except Exception:
-            # w razie problemu z próbkowaniem wracamy do pełnego zbioru
-            df = df_full
-            is_sampled = False
+    try:
+        n_rows_total = int((latest_info or {}).get("n_rows") or df.shape[0])
+        is_sampled = bool(load_sample_rows and n_rows_total > df.shape[0])
+    except Exception:
+        is_sampled = bool(load_sample_rows and df.shape[0] >= int(load_sample_rows))
 
     # ➜ na potrzeby Sekcji 2–6 dorzuć warianty liczbowe (np. Czas_sec)
     df = _augment_numeric_derivatives_for_ui(df)
@@ -4680,8 +4678,8 @@ def main():
             st.session_state.pop(k, None)
 
     # 2) policz df_aug i roles tylko raz dla tej sygnatury (+ tryb próbki)
-    sample_flag = bool(st.session_state.get("use_sample", False))
-    sample_n = int(st.session_state.get("sample_n", df.shape[0]))
+    sample_flag = bool(st.session_state.get("eda_use_sample", False))
+    sample_n = int(st.session_state.get("eda_sample_rows", df.shape[0]))
     core_sig = f"{sig_now}|sample={sample_flag}|n={sample_n}"
 
     if st.session_state.get("_cached_df_aug_sig") != core_sig:
