@@ -3821,7 +3821,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                         if "ogon" in str(s).lower():
                             color_map[s] = "#E0E0E0"
 
-                    # ── Label w polu (warunkowy) + auto kolor tekstu + tooltip ──
+                    # ── Label w polu (warunkowy) + tooltip na calym prostokacie ──
                     def _hex_to_rgb(hx: str) -> tuple[int, int, int]:
                         hx = (hx or "").lstrip("#")
                         if len(hx) != 6:
@@ -3846,7 +3846,12 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                     MIN_H_PCT = 4.0  # min wysokość komórki
                     MIN_AREA = 0.8  # min pole (w% * h%)
 
-                    hover_x, hover_y, hover_cd = [], [], []
+                    def _top_segment_label(label: str, width_pct: float) -> str:
+                        txt = str(label)
+                        if width_pct < 2.5:
+                            return ""
+                        max_chars = max(6, min(22, int(width_pct * 1.45)))
+                        return txt if len(txt) <= max_chars else f"{txt[:max_chars - 1]}…"
 
                     for g in gtot.sort_values("group_total", ascending=False)[group_col].tolist():
                         w = float(gtot.loc[gtot[group_col] == g, "width_pct"].iloc[0])
@@ -3862,26 +3867,34 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                             height_pct = float(h)
                             area_pct = (v / total_value * 100.0) if total_value else 0.0
 
-                            fig_mm.add_shape(
-                                type="rect",
-                                x0=x0, x1=x0+w,
-                                y0=y0, y1=y0+h,
-                                line=dict(width=0.5),
-                                fillcolor=fill,
-                            )
-
-                            # Tooltip: dodaj "niewidzialny" punkt w środku prostokąta
-                            hover_x.append(x0 + w / 2)
-                            hover_y.append(y0 + h / 2)
-                            hover_cd.append(
-                                [
-                                    str(g),
-                                    comp,
-                                    v,
-                                    width_pct,
-                                    height_pct,
-                                    area_pct,
-                                ]
+                            cell_customdata = [[
+                                str(g),
+                                comp,
+                                v,
+                                width_pct,
+                                height_pct,
+                                area_pct,
+                            ]] * 5
+                            fig_mm.add_trace(
+                                go.Scatter(
+                                    x=[x0, x0 + w, x0 + w, x0, x0],
+                                    y=[y0, y0, y0 + h, y0 + h, y0],
+                                    mode="lines",
+                                    fill="toself",
+                                    fillcolor=fill,
+                                    line=dict(color="white", width=1),
+                                    hoveron="fills",
+                                    customdata=cell_customdata,
+                                    hovertemplate=(
+                                        f"<b>{group_col}: %{{customdata[0]}}</b><br>"
+                                        f"{group_col2}: %{{customdata[1]}}<br>"
+                                        "Wartość: %{customdata[2]:,.0f}<br>"
+                                        "Udział segmentu w totalu (szerokość): %{customdata[3]:.1f}%<br>"
+                                        "Udział składnika w segmencie (wysokość): %{customdata[4]:.1f}%<br>"
+                                        "Udział komórki w totalu (pole): %{customdata[5]:.1f}%<extra></extra>"
+                                    ),
+                                    showlegend=False,
+                                )
                             )
 
                             # Label w polu: tylko jeśli komórka jest wystarczająco duża
@@ -3895,50 +3908,39 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                                     bgcolor="rgba(255,255,255,0.72)",
                                     bordercolor="rgba(255,255,255,0)",
                                     borderpad=2,
+                                    captureevents=False,
                                 )
                             y0 += h
-                        # Group label (Kategoria 1) must be visible without hovering.
-                        fig_mm.add_annotation(
-                            x=x0 + min(max(w * 0.02, 0.25), 1.2),
-                            y=98.5,
-                            text=f"<b>{str(g)}</b>",
-                            showarrow=False,
-                            xanchor="left",
-                            yanchor="top",
-                            align="left",
-                            font=dict(size=11, color="#111827"),
-                            bgcolor="rgba(255,255,255,0.82)",
-                            bordercolor="rgba(255,255,255,0)",
-                            borderpad=1,
-                        )
+                        # Kategoria 1 ma byc czytelna nad wykresem, a nie wewnatrz pola.
+                        _label = _top_segment_label(str(g), w)
+                        if _label:
+                            fig_mm.add_annotation(
+                                x=x0 + w / 2,
+                                y=1.17,
+                                xref="x",
+                                yref="paper",
+                                text=f"<b>{_label}</b>",
+                                showarrow=False,
+                                xanchor="center",
+                                yanchor="bottom",
+                                align="center",
+                                font=dict(size=11, color="#111827"),
+                                bgcolor="rgba(255,255,255,0.88)",
+                                bordercolor="rgba(209,213,219,0.75)",
+                                borderwidth=1,
+                                borderpad=4,
+                                captureevents=False,
+                            )
                         x0 += w
 
-                    # Tooltip trace (po shapes)
-                    fig_mm.add_trace(
-                        go.Scatter(
-                            x=hover_x,
-                            y=hover_y,
-                            mode="markers",
-                            marker=dict(size=18, opacity=0),
-                            customdata=hover_cd,
-                            hovertemplate=(
-                                "<b>%{customdata[0]}</b><br>"
-                                f"{group_col2}: " + "%{customdata[1]}<br>"
-                                "Wartość: %{customdata[2]:,.0f}<br>"
-                                "Udział segmentu w totalu (szerokość): %{customdata[3]:.1f}%<br>"
-                                "Udział składnika w segmencie (wysokość): %{customdata[4]:.1f}%<br>"
-                                "Udział komórki w totalu (pole): %{customdata[5]:.1f}%<extra></extra>"
-                            ),
-                            showlegend=False,
-                        )
-                    )
-
                     fig_mm.update_layout(
-                        height=420,
-                        margin=dict(l=20, r=20, t=30, b=40),
+                        height=470,
+                        hovermode="closest",
+                        margin=dict(l=20, r=20, t=112, b=40),
                         xaxis=dict(title="Udział w totalu (%)", range=[0, 100], showgrid=False, zeroline=False),
                         yaxis=dict(title="Struktura (%)", range=[0, 100], showgrid=False, zeroline=False),
                         showlegend=False,
+                        hoverlabel=dict(bgcolor="white", font_size=12, font_color="#111827"),
                     )
                     plotly_chart_stretch(st, fig_mm, config={"displayModeBar": False})
                 except Exception:
