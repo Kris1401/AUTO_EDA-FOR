@@ -237,6 +237,21 @@ def _looks_numeric_like(s: pd.Series | None, min_share: float = 0.90) -> bool:
     return float(parsed.notna().mean() or 0.0) >= float(min_share)
 
 
+def _is_text_or_categorical_dtype(s: pd.Series | None) -> bool:
+    """Accept pandas/object/category plus Arrow-backed string columns as dimensions."""
+    if s is None:
+        return False
+    try:
+        if pd.api.types.is_object_dtype(s) or pd.api.types.is_categorical_dtype(s) or pd.api.types.is_bool_dtype(s):
+            return True
+        if pd.api.types.is_string_dtype(s):
+            return True
+    except Exception:
+        pass
+    dtype_txt = str(getattr(s, "dtype", "")).lower()
+    return any(tok in dtype_txt for tok in ("string", "utf8", "large_string", "category"))
+
+
 def _is_numeric_continuous(s: pd.Series, max_low_card: int = 30) -> bool:
     """Numeric or numeric-like and high-cardinality enough to behave like a measure."""
     if s is None or pd.api.types.is_bool_dtype(s) or not _looks_numeric_like(s):
@@ -271,6 +286,19 @@ def _is_generated_helper_col(col: str) -> bool:
         or cl.endswith("_outlier")
         or "helper" in cl
     )
+
+
+def _is_forbidden_dimension_col(col: str) -> bool:
+    """Columns that are technically discrete but are identifiers, measures, or helper fields."""
+    cl = re.sub(r"[^a-z0-9]+", " ", str(col).lower()).strip()
+    tokens = set(cl.split())
+    if _is_generated_helper_col(col) or _is_time_like(col) or _is_id_like(col):
+        return True
+    if tokens & {"quantity", "qty", "price", "amount", "value", "total", "sum", "sales", "revenue", "line"}:
+        return True
+    if any(phrase in cl for phrase in ("line value", "unit price", "net value", "gross value")):
+        return True
+    return False
 
 
 def _score_group_col(name: str) -> int:
@@ -330,7 +358,7 @@ def get_groupable_columns(
         return []
 
     exclude = exclude or set()
-    cache = st.session_state.get("cs_schema_candidates_cache_v1")
+    cache = st.session_state.get("cs_schema_candidates_cache_v2")
     if not isinstance(cache, dict):
         cache = {}
     cache_key = _cs_schema_cache_key(df, tag=f"groupable:{int(max_unique)}", exclude=exclude)
@@ -343,7 +371,7 @@ def get_groupable_columns(
     for col in df.columns:
         if col in exclude:
             continue
-        if _is_generated_helper_col(col) or _is_time_like(col) or _is_id_like(col):
+        if _is_forbidden_dimension_col(col):
             continue
 
         s = df[col]
@@ -366,7 +394,7 @@ def get_groupable_columns(
                 cols.append(col)
             continue
 
-        if pd.api.types.is_object_dtype(s) or isinstance(s.dtype, pd.CategoricalDtype) or str(s.dtype) == "string":
+        if _is_text_or_categorical_dtype(s):
             cols.append(col)
 
     result = sorted(
@@ -377,7 +405,7 @@ def get_groupable_columns(
     if len(cache) > 16:
         for _old_key in list(cache.keys())[:-16]:
             cache.pop(_old_key, None)
-    st.session_state["cs_schema_candidates_cache_v1"] = cache
+    st.session_state["cs_schema_candidates_cache_v2"] = cache
     return result
 
 
@@ -389,7 +417,7 @@ def get_price_candidate_columns(
         return []
 
     exclude = exclude or set()
-    cache = st.session_state.get("cs_schema_candidates_cache_v1")
+    cache = st.session_state.get("cs_schema_candidates_cache_v2")
     if not isinstance(cache, dict):
         cache = {}
     cache_key = _cs_schema_cache_key(df, tag="price_candidates", exclude=exclude)
@@ -453,7 +481,7 @@ def get_price_candidate_columns(
         if len(cache) > 16:
             for _old_key in list(cache.keys())[:-16]:
                 cache.pop(_old_key, None)
-        st.session_state["cs_schema_candidates_cache_v1"] = cache
+        st.session_state["cs_schema_candidates_cache_v2"] = cache
         return result
 
     weak_scored.sort(key=lambda row: (-row[0], -row[1], str(row[2]).lower()))
@@ -462,7 +490,7 @@ def get_price_candidate_columns(
     if len(cache) > 16:
         for _old_key in list(cache.keys())[:-16]:
             cache.pop(_old_key, None)
-    st.session_state["cs_schema_candidates_cache_v1"] = cache
+    st.session_state["cs_schema_candidates_cache_v2"] = cache
     return result
 
 
@@ -474,7 +502,7 @@ def get_value_candidate_columns(
         return []
 
     exclude = exclude or set()
-    cache = st.session_state.get("cs_schema_candidates_cache_v1")
+    cache = st.session_state.get("cs_schema_candidates_cache_v2")
     if not isinstance(cache, dict):
         cache = {}
     cache_key = _cs_schema_cache_key(df, tag="value_candidates", exclude=exclude)
@@ -529,7 +557,7 @@ def get_value_candidate_columns(
     if len(cache) > 16:
         for _old_key in list(cache.keys())[:-16]:
             cache.pop(_old_key, None)
-    st.session_state["cs_schema_candidates_cache_v1"] = cache
+    st.session_state["cs_schema_candidates_cache_v2"] = cache
     return result
 
 
@@ -575,21 +603,6 @@ def resolve_grouping_selection(
     group_col = selected_group or _infer_best_group_col(df, exclude={price_col} if price_col else None)
     groupable_group2 = get_groupable_columns(df, exclude={group_col} if group_col else None)
     group_col2 = selected_group2 if selected_group2 in groupable_group2 else None
-    if group_col2 is None and selected_group2 and selected_group2 != group_col:
-        try:
-            sample = _cs_schema_series_sample(df[selected_group2])
-            nuniq = int(sample.nunique(dropna=True))
-            is_bad_numeric = pd.api.types.is_numeric_dtype(df[selected_group2]) and _is_numeric_continuous(sample)
-            if (
-                2 <= nuniq <= 2_000
-                and not is_bad_numeric
-                and not _is_generated_helper_col(selected_group2)
-                and not _is_time_like(selected_group2)
-                and not _is_id_like(selected_group2)
-            ):
-                group_col2 = selected_group2
-        except Exception:
-            group_col2 = None
 
     return {
         "group_col": group_col,

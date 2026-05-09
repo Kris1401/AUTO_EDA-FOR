@@ -2765,34 +2765,42 @@ def _render_sidebar_filters(df: pd.DataFrame, schema_ctx: Dict[str, Any]) -> Dic
                 candidate_cols = composition_static.get_groupable_columns(df)
                 if not candidate_cols:
                     candidate_cols = composition_static.get_groupable_columns(df, max_unique=2000)
-                if not candidate_cols:
-                    candidate_cols = list(df.select_dtypes(include=["object", "category", "bool"]).columns[:10]) or list(df.columns[:10])
                 _cs_default = candidate_cols[0] if candidate_cols else None
 
-                # ── Kategoria 1 (segment główny)
-                _prev_g1 = st.session_state.get("cs__group_col")
-                _g1_idx = (
-                    candidate_cols.index(_prev_g1)
-                    if (_prev_g1 and _prev_g1 in candidate_cols)
-                    else (candidate_cols.index(_cs_default) if (_cs_default and _cs_default in candidate_cols) else 0)
-                )
-                cs_group_col = st.selectbox(
-                    "Kategoria 1 (segment główny)",
-                    options=candidate_cols,
-                    index=_g1_idx,
-                    key="cs__group_col",
-                )
+                if not candidate_cols:
+                    st.warning(
+                        "Nie znaleziono sensownych kolumn kategorii dla tego widoku. "
+                        "Selektory Kategoria 1/2 pokazują tylko wymiary biznesowe, a nie ID, daty ani miary liczbowe."
+                    )
+                    cs_group_col = None
+                    cs_group_col2 = "(brak)"
+                else:
+                    # ── Kategoria 1 (segment główny)
+                    _prev_g1 = st.session_state.get("cs__group_col")
+                    if not _prev_g1 or _prev_g1 not in candidate_cols:
+                        st.session_state["cs__group_col"] = _cs_default
+                        _prev_g1 = _cs_default
+                    _g1_idx = candidate_cols.index(_prev_g1) if (_prev_g1 in candidate_cols) else 0
+                    cs_group_col = st.selectbox(
+                        "Kategoria 1 (segment główny)",
+                        options=candidate_cols,
+                        index=_g1_idx,
+                        key="cs__group_col",
+                    )
 
-                # ── Kategoria 2 (opcjonalnie)
-                other_cols = ["(brak)"] + [c for c in candidate_cols if c != cs_group_col]
-                _prev_g2 = st.session_state.get("cs__group_col2", "(brak)")
-                _g2_idx = other_cols.index(_prev_g2) if (_prev_g2 in other_cols) else 0
-                cs_group_col2 = st.selectbox(
-                    "Kategoria 2 (opcjonalnie)",
-                    options=other_cols,
-                    index=_g2_idx,
-                    key="cs__group_col2",
-                )
+                    # ── Kategoria 2 (opcjonalnie)
+                    other_cols = ["(brak)"] + [c for c in candidate_cols if c != cs_group_col]
+                    _prev_g2 = st.session_state.get("cs__group_col2", "(brak)")
+                    if _prev_g2 not in other_cols:
+                        st.session_state["cs__group_col2"] = "(brak)"
+                        _prev_g2 = "(brak)"
+                    _g2_idx = other_cols.index(_prev_g2) if (_prev_g2 in other_cols) else 0
+                    cs_group_col2 = st.selectbox(
+                        "Kategoria 2 (opcjonalnie)",
+                        options=other_cols,
+                        index=_g2_idx,
+                        key="cs__group_col2",
+                    )
 
                 # ── TOP-N
                 _raw_cs_top_n = st.session_state.get("cs__top_n_v2", st.session_state.get("cs__top_n", 10))
