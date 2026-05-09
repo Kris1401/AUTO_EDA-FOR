@@ -3848,12 +3848,12 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
 
                     def _top_segment_label(label: str, width_pct: float) -> str:
                         txt = str(label)
-                        if width_pct < 2.5:
+                        if width_pct < 0.75:
                             return ""
-                        max_chars = max(6, min(22, int(width_pct * 1.45)))
-                        return txt if len(txt) <= max_chars else f"{txt[:max_chars - 1]}…"
+                        max_chars = max(4, min(22, int(width_pct * 1.65)))
+                        return txt if len(txt) <= max_chars else f"{txt[:max_chars - 3]}..."
 
-                    for g in gtot.sort_values("group_total", ascending=False)[group_col].tolist():
+                    for group_idx, g in enumerate(gtot.sort_values("group_total", ascending=False)[group_col].tolist()):
                         w = float(gtot.loc[gtot[group_col] == g, "width_pct"].iloc[0])
                         y0 = 0.0
                         mm_g = mm[mm[group_col] == g].sort_values("height_pct", ascending=False)
@@ -3866,6 +3866,13 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                             width_pct = float(w)
                             height_pct = float(h)
                             area_pct = (v / total_value * 100.0) if total_value else 0.0
+                            tooltip_text = (
+                                f"<b>Kategoria 1 ({group_col}): {str(g)}</b><br>"
+                                f"Kategoria 2 ({group_col2}): {comp}<br>"
+                                f"Wartość: {v:,.0f}<br>"
+                                f"Udział w totalu: {area_pct:.1f}%<br>"
+                                f"Wartość w strukturze: {height_pct:.1f}%"
+                            )
 
                             cell_customdata = [[
                                 str(g),
@@ -3885,14 +3892,10 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                                     line=dict(color="white", width=1),
                                     hoveron="fills",
                                     customdata=cell_customdata,
-                                    hovertemplate=(
-                                        f"<b>{group_col}: %{{customdata[0]}}</b><br>"
-                                        f"{group_col2}: %{{customdata[1]}}<br>"
-                                        "Wartość: %{customdata[2]:,.0f}<br>"
-                                        "Udział segmentu w totalu (szerokość): %{customdata[3]:.1f}%<br>"
-                                        "Udział składnika w segmencie (wysokość): %{customdata[4]:.1f}%<br>"
-                                        "Udział komórki w totalu (pole): %{customdata[5]:.1f}%<extra></extra>"
-                                    ),
+                                    text=[tooltip_text] * 5,
+                                    hoverinfo="text",
+                                    hovertemplate="%{text}<extra></extra>",
+                                    name="",
                                     showlegend=False,
                                 )
                             )
@@ -3916,7 +3919,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                         if _label:
                             fig_mm.add_annotation(
                                 x=x0 + w / 2,
-                                y=1.17,
+                                y=1.035 if (group_idx % 2 == 0) else 1.085,
                                 xref="x",
                                 yref="paper",
                                 text=f"<b>{_label}</b>",
@@ -3934,9 +3937,9 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                         x0 += w
 
                     fig_mm.update_layout(
-                        height=470,
+                        height=455,
                         hovermode="closest",
-                        margin=dict(l=20, r=20, t=112, b=40),
+                        margin=dict(l=20, r=20, t=82, b=40),
                         xaxis=dict(title="Udział w totalu (%)", range=[0, 100], showgrid=False, zeroline=False),
                         yaxis=dict(title="Struktura (%)", range=[0, 100], showgrid=False, zeroline=False),
                         showlegend=False,
