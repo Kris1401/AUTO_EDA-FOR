@@ -3821,6 +3821,13 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                         if "ogon" in str(s).lower():
                             color_map[s] = "#E0E0E0"
 
+                    ordered_groups = gtot.sort_values("group_total", ascending=False)[group_col].tolist()
+                    if ordered_groups:
+                        st.caption(
+                            f"Kategoria 1 ({group_col}) od lewej: "
+                            + " · ".join(str(g) for g in ordered_groups)
+                        )
+
                     # ── Label w polu (warunkowy) + tooltip na calym prostokacie ──
                     def _hex_to_rgb(hx: str) -> tuple[int, int, int]:
                         hx = (hx or "").lstrip("#")
@@ -3853,7 +3860,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                         max_chars = max(4, min(22, int(width_pct * 1.65)))
                         return txt if len(txt) <= max_chars else f"{txt[:max_chars - 3]}..."
 
-                    for group_idx, g in enumerate(gtot.sort_values("group_total", ascending=False)[group_col].tolist()):
+                    for g in ordered_groups:
                         w = float(gtot.loc[gtot[group_col] == g, "width_pct"].iloc[0])
                         y0 = 0.0
                         mm_g = mm[mm[group_col] == g].sort_values("height_pct", ascending=False)
@@ -3874,27 +3881,19 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                                 f"Wartość w strukturze: {height_pct:.1f}%"
                             )
 
-                            cell_customdata = [[
-                                str(g),
-                                comp,
-                                v,
-                                width_pct,
-                                height_pct,
-                                area_pct,
-                            ]] * 5
                             fig_mm.add_trace(
-                                go.Scatter(
-                                    x=[x0, x0 + w, x0 + w, x0, x0],
-                                    y=[y0, y0, y0 + h, y0 + h, y0],
-                                    mode="lines",
-                                    fill="toself",
-                                    fillcolor=fill,
-                                    line=dict(color="white", width=1),
-                                    hoveron="fills",
-                                    customdata=cell_customdata,
-                                    text=[tooltip_text] * 5,
+                                go.Bar(
+                                    x=[x0 + w / 2],
+                                    y=[h],
+                                    width=[w],
+                                    base=[y0],
+                                    marker=dict(
+                                        color=fill,
+                                        line=dict(color="white", width=1),
+                                    ),
+                                    hovertext=[tooltip_text],
                                     hoverinfo="text",
-                                    hovertemplate="%{text}<extra></extra>",
+                                    hovertemplate="%{hovertext}<extra></extra>",
                                     name="",
                                     showlegend=False,
                                 )
@@ -3916,10 +3915,10 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                             y0 += h
                         # Kategoria 1 ma byc czytelna nad wykresem, a nie wewnatrz pola.
                         _label = _top_segment_label(str(g), w)
-                        if _label:
+                        if _label and w >= 4.0:
                             fig_mm.add_annotation(
                                 x=x0 + w / 2,
-                                y=1.035 if (group_idx % 2 == 0) else 1.085,
+                                y=1.015,
                                 xref="x",
                                 yref="paper",
                                 text=f"<b>{_label}</b>",
@@ -3939,9 +3938,12 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                     fig_mm.update_layout(
                         height=455,
                         hovermode="closest",
-                        margin=dict(l=20, r=20, t=82, b=40),
+                        margin=dict(l=20, r=20, t=50, b=40),
                         xaxis=dict(title="Udział w totalu (%)", range=[0, 100], showgrid=False, zeroline=False),
                         yaxis=dict(title="Struktura (%)", range=[0, 100], showgrid=False, zeroline=False),
+                        barmode="overlay",
+                        bargap=0,
+                        bargroupgap=0,
                         showlegend=False,
                         hoverlabel=dict(bgcolor="white", font_size=12, font_color="#111827"),
                     )
