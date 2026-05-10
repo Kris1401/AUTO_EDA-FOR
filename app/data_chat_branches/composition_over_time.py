@@ -4299,7 +4299,7 @@ def _is_valid_time_col(df: pd.DataFrame, col: str, *, sample_n: int = 20000) -> 
     s = df[col]
     if pd.api.types.is_datetime64_any_dtype(s):
         # still guard against absurd future dates
-        ss = s.dropna()
+        ss = _as_numpy_datetime_series(s).dropna()
         if ss.empty:
             return False
         years = ss.dt.year
@@ -4331,8 +4331,37 @@ def _is_valid_time_col(df: pd.DataFrame, col: str, *, sample_n: int = 20000) -> 
     return True
 
 
+def _as_numpy_datetime_series(s: pd.Series) -> pd.Series:
+    """Return a pandas datetime64[ns] Series even when input uses Arrow dtypes."""
+    idx = getattr(s, "index", None)
+    name = getattr(s, "name", None)
+    try:
+        dt = pd.to_datetime(s, errors="coerce")
+    except Exception:
+        try:
+            arr = s.to_numpy(dtype="datetime64[ns]", na_value=np.datetime64("NaT"))
+        except TypeError:
+            arr = s.to_numpy(dtype="datetime64[ns]")
+        return pd.Series(arr, index=idx, name=name)
+    if isinstance(dt, pd.Series):
+        idx = dt.index
+        name = dt.name
+        try:
+            arr = dt.to_numpy(dtype="datetime64[ns]", na_value=np.datetime64("NaT"))
+        except TypeError:
+            arr = dt.to_numpy(dtype="datetime64[ns]")
+        except Exception:
+            arr = pd.DatetimeIndex(dt.astype("datetime64[ns]")).to_numpy(dtype="datetime64[ns]")
+        return pd.Series(arr, index=idx, name=name)
+    return pd.Series(
+        pd.DatetimeIndex(dt).to_numpy(dtype="datetime64[ns]"),
+        index=idx,
+        name=name,
+    )
+
+
 def _to_month_start(s: pd.Series) -> pd.Series:
-    dt = pd.to_datetime(s, errors="coerce")
+    dt = _as_numpy_datetime_series(s)
     # normalize to month start (for deterministic axis)
     return dt.dt.to_period("M").dt.to_timestamp()
 
