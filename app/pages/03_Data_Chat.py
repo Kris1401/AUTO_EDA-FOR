@@ -2665,42 +2665,64 @@ def _render_sidebar_filters(df: pd.DataFrame, schema_ctx: Dict[str, Any]) -> Dic
 
                 date_cols = list(schema_ctx.get("date_cols") or [])
 
-                # Wybór kategorii (opcjonalnie) — domyślnie auto (COT ma też własną inferencję)
-                # Wybór kategorii (opcjonalnie) — domyślnie auto (COT ma też własną inferencję)
-                # ✅ Guard: pokazuj WYŁĄCZNIE sensowne kolumny kategoryczne (bez liczbowych/numeric-like i datetime)
-                def _looks_numeric_like(_s: pd.Series, sample_n: int = 5000) -> bool:
-                    try:
-                        if pd.api.types.is_numeric_dtype(_s):
-                            return True
-                        if pd.api.types.is_datetime64_any_dtype(_s):
-                            return False
-                        # object/string: try fast numeric coercion on a sample
-                        ss = _s.dropna().head(sample_n)
-                        if ss.empty:
-                            return False
-                        nn = pd.to_numeric(ss, errors="coerce")
-                        ok = float(nn.notna().mean())
-                        # if almost everything parses as number -> treat as numeric-like
-                        return ok >= 0.95
-                    except Exception:
-                        return False
+                # Wybór kategorii (opcjonalnie) — używamy tej samej, dopracowanej
+                # logiki kandydatów co Composition Static. Dzięki temu w COT nie
+                # znikają biznesowe wymiary typu Category/Kategoria.
+                try:
+                    _cot_candidates = composition_static.get_groupable_columns(df, max_unique=2000)
+                except Exception:
+                    _cot_candidates = []
 
-                _cot_cat_opts = ["(auto)"]
-                for _c in df.columns:
-                    if _c in (date_cols or []):
-                        continue
+                if not _cot_candidates:
                     try:
-                        s = df[_c]
-                        # hard reject: datetime, numeric dtype or numeric-like strings
-                        if pd.api.types.is_datetime64_any_dtype(s) or _looks_numeric_like(s):
-                            continue
-                        # reject extremely high-cardinality (usually IDs/descriptions)
-                        nun = int(s.nunique(dropna=True)) if len(s) else 0
-                        if nun > 5000:
-                            continue
+                        _cot_candidates = composition_static.get_groupable_columns(df, max_unique=5000)
                     except Exception:
-                        continue
-                    _cot_cat_opts.append(_c)
+                        _cot_candidates = []
+
+                if not _cot_candidates:
+                    _bad_tokens = {
+                        "invoice", "customer", "client", "stock", "id", "code",
+                        "quantity", "qty", "price", "amount", "value", "total",
+                        "sum", "sales", "revenue", "line", "date", "time",
+                        "day", "week", "month", "year", "hour", "index",
+                    }
+                    _scored_cot: list[tuple[int, int, str]] = []
+                    _schema_cats = [
+                        str(c)
+                        for c in list(schema_ctx.get("cat_cols") or [])
+                        if isinstance(c, str) and c in df.columns
+                    ]
+                    for _col in list(dict.fromkeys([*_schema_cats, *[str(c) for c in df.columns]])):
+                        if _col not in df.columns:
+                            continue
+                        _norm = re.sub(r"[^a-z0-9]+", " ", str(_col).lower()).strip()
+                        _tokens = set(_norm.split())
+                        if _tokens & _bad_tokens:
+                            continue
+                        try:
+                            _sample = df[_col].dropna().head(50000)
+                            if _sample.empty:
+                                continue
+                            _nuniq = int(_sample.astype(str).nunique(dropna=True))
+                            if _nuniq < 2 or _nuniq > 5000:
+                                continue
+                            if pd.api.types.is_datetime64_any_dtype(df[_col]):
+                                continue
+                            if pd.api.types.is_numeric_dtype(df[_col]) and _nuniq > 30:
+                                continue
+                            _score = 0
+                            if any(tok in _norm for tok in ("category", "kategoria", "product", "produkt", "segment", "brand", "marka")):
+                                _score += 300
+                            if any(tok in _norm for tok in ("country", "kraj", "region", "market", "rynek")):
+                                _score += 220
+                            _scored_cot.append((_score, _nuniq, _col))
+                        except Exception:
+                            continue
+                    _cot_candidates = [
+                        col for _, _, col in sorted(_scored_cot, key=lambda x: (-x[0], x[1], x[2].lower()))
+                    ]
+
+                _cot_cat_opts = ["(auto)"] + [str(c) for c in dict.fromkeys(_cot_candidates) if str(c) in df.columns]
 
                 _cot_cat_default = st.session_state.get("cot__cat_col", "(auto)")
                 _cot_cat_i = _cot_cat_opts.index(_cot_cat_default) if _cot_cat_default in _cot_cat_opts else 0

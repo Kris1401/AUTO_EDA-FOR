@@ -42,6 +42,37 @@ def _safe_json(v: Any) -> Any:
         return "<unserializable>"
 
 
+def _safe_linear_fit(x: Any, y: Any) -> Tuple[float, float]:
+    """Return slope/intercept without np.polyfit, which can be unstable on small containers."""
+    try:
+        x_arr = np.asarray(x, dtype=float)
+        y_arr = np.asarray(y, dtype=float)
+        mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+        if int(mask.sum()) < 2:
+            y_mean = float(np.nanmean(y_arr)) if y_arr.size else 0.0
+            if not np.isfinite(y_mean):
+                y_mean = 0.0
+            return 0.0, y_mean
+
+        xx = x_arr[mask]
+        yy = y_arr[mask]
+        x_mean = float(xx.mean())
+        y_mean = float(yy.mean())
+        x_dev = xx - x_mean
+        denom = float(np.sum(x_dev * x_dev))
+        if not np.isfinite(denom) or denom <= 1e-12:
+            return 0.0, y_mean
+        slope = float(np.sum(x_dev * (yy - y_mean)) / denom)
+        intercept = float(y_mean - slope * x_mean)
+        if not np.isfinite(slope):
+            slope = 0.0
+        if not np.isfinite(intercept):
+            intercept = y_mean if np.isfinite(y_mean) else 0.0
+        return slope, intercept
+    except Exception:
+        return 0.0, 0.0
+
+
 # --- Debug checkpoints (ET flow) ---------------------------------------------
 # Lightweight, safe to keep in production (no-op unless __cot_exec_dbg_on == True)
 _EXEC_CP_KEY = "__cot_exec_cp_v1"
@@ -4144,23 +4175,125 @@ def _infer_time_col(df: pd.DataFrame, schema_ctx: Optional[Dict[str, Any]] = Non
             best = c
 
     return best
-def _infer_cat_col(df: pd.DataFrame, schema_ctx: Dict[str, Any]) -> Optional[str]:
-    cols = list(df.columns)
-    c = schema_ctx.get("group_col")
-    if isinstance(c, str) and c in cols:
-        return c
-    cat_cols = schema_ctx.get("cat_cols") or []
-    for c in cat_cols:
-        if isinstance(c, str) and c in cols:
-            return c
-    # fallback: low-cardinality non-numeric
-    for c in cols:
-        s = df[c]
-        if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_datetime64_any_dtype(s):
+def _norm_col_key(name: Any) -> str:
+    s = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode("ascii").lower()
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+def _norm_question_key(text: Any) -> str:
+    s = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode("ascii").lower()
+    return re.sub(r"[^a-z0-9]+", " ", s)
+
+
+def _question_prefers_product_category(question: str) -> bool:
+    q = _norm_question_key(question)
+    return any(tok in q for tok in ("kategori", "category", "produkt", "product", "asortyment"))
+
+
+def _question_prefers_geo(question: str) -> bool:
+    q = _norm_question_key(question)
+    return any(tok in q for tok in ("kraj", "panstw", "country", "region", "rynek", "market"))
+
+
+def _looks_numeric_like_for_dimension(s: pd.Series, sample_n: int = 5000) -> bool:
+    try:
+        if pd.api.types.is_numeric_dtype(s):
+            return True
+        if pd.api.types.is_datetime64_any_dtype(s):
+            return False
+        sample = s.dropna().head(sample_n)
+        if sample.empty:
+            return False
+        parsed = pd.to_numeric(sample, errors="coerce")
+        return float(parsed.notna().mean()) >= 0.95
+    except Exception:
+        return False
+
+
+def _cat_series(df: pd.DataFrame, col: str) -> Optional[pd.Series]:
+    try:
+        if col not in df.columns:
+            return None
+        v = df.loc[:, col]
+        if isinstance(v, pd.DataFrame):
+            if v.shape[1] == 0:
+                return None
+            return v.iloc[:, 0]
+        return v
+    except Exception:
+        return None
+
+
+def _cat_candidate_score(df: pd.DataFrame, col: str, schema_ctx: Dict[str, Any], question: str) -> Optional[tuple[int, int]]:
+    s = _cat_series(df, col)
+    if s is None:
+        return None
+    try:
+        if pd.api.types.is_datetime64_any_dtype(s) or _looks_numeric_like_for_dimension(s):
+            return None
+        sample = s.dropna().head(50_000)
+        if sample.empty:
+            return None
+        nunique = int(sample.nunique(dropna=True))
+        if nunique < 2 or nunique > 5000:
+            return None
+    except Exception:
+        return None
+
+    key = _norm_col_key(col)
+    score = 0
+    if key in {"category", "categories", "kategoria", "kategorie", "productcategory", "productcategories"}:
+        score += 900
+    elif any(tok in key for tok in ("category", "kategoria", "segment", "subcategory", "podkategoria", "brand", "marka")):
+        score += 650
+    if key in {"country", "countryname", "kraj", "panstwo", "region", "market", "rynek"}:
+        score += 320
+    elif any(tok in key for tok in ("country", "kraj", "region", "market")):
+        score += 260
+
+    if _question_prefers_product_category(question):
+        if any(tok in key for tok in ("category", "kategoria", "product", "segment", "brand", "marka")):
+            score += 900
+        if any(tok in key for tok in ("country", "kraj", "region", "market")):
+            score -= 180
+    if _question_prefers_geo(question):
+        if any(tok in key for tok in ("country", "kraj", "region", "market")):
+            score += 900
+
+    if isinstance(schema_ctx.get("group_col"), str) and schema_ctx.get("group_col") == col:
+        score += 120
+    if col in (schema_ctx.get("cat_cols") or []):
+        score += 80
+
+    if any(tok in key for tok in ("invoice", "customer", "client", "stockcode", "sku", "barcode", "uuid", "guid", "index")):
+        score -= 700
+    if any(tok in key for tok in ("description", "opis", "name", "nazwa", "text", "tekst")):
+        score -= 250
+    if any(tok in key for tok in ("price", "quantity", "qty", "value", "amount", "sales", "revenue", "total", "linevalue")):
+        score -= 900
+
+    return score, nunique
+
+
+def _infer_cat_col(df: pd.DataFrame, schema_ctx: Dict[str, Any], question: str = "") -> Optional[str]:
+    cols = [str(c) for c in list(df.columns)]
+    ordered: List[str] = []
+    for c in [schema_ctx.get("group_col"), *(schema_ctx.get("cat_cols") or []), *cols]:
+        if isinstance(c, str) and c in cols and c not in ordered:
+            ordered.append(c)
+
+    scored: List[tuple[int, int, str]] = []
+    for c in ordered:
+        got = _cat_candidate_score(df, c, schema_ctx, question)
+        if got is None:
             continue
-        nunique = s.nunique(dropna=True)
-        if 2 <= nunique <= 80:
-            return c
+        score, nunique = got
+        scored.append((score, nunique, c))
+
+    if scored:
+        scored.sort(key=lambda x: (-x[0], x[1], x[2].lower()))
+        return scored[0][2]
+
     return None
 
 
@@ -8253,6 +8386,13 @@ def _prep_time_df(
             x["__value"] = 1.0
 
     x["__value"] = x["__value"].fillna(0.0)
+    # COT charts operate at monthly x category grain. Keeping the raw million-row
+    # table here makes every insight block regroup the same data and can exhaust
+    # small DO containers. This aggregation preserves sums while reducing memory.
+    x = (
+        x.groupby(["__month", cat_col], as_index=False, observed=True)["__value"]
+        .sum()
+    )
     return x
 
 def _densify_month_grid(
@@ -9109,10 +9249,12 @@ def _block3_seasonality(
     import numpy as np
     import pandas as pd
 
-    try:
-        from statsmodels.tsa.seasonal import STL
-    except Exception:
-        STL = None  # no STL available
+    # Do not use statsmodels.STL in the interactive Streamlit path. On small
+    # containers the native numerical stack can stall or terminate the process,
+    # which surfaces to the user as 504 + lost session data. The rolling
+    # de-trended fallback below is deterministic, fast, and sufficient for the
+    # visual heatmap/scorecard.
+    STL = None
 
     stats: Dict[str, Any] = {"topN": 0}
 
@@ -9208,8 +9350,8 @@ def _block3_seasonality(
             x = np.arange(len(vals), dtype=float)
             ok = np.isfinite(vals)
             if int(ok.sum()) >= 2:
-                coeff = np.polyfit(x[ok], vals[ok], 1)
-                trend_vals = np.polyval(coeff, x)
+                slope_fit, intercept_fit = _safe_linear_fit(x[ok], vals[ok])
+                trend_vals = slope_fit * x + intercept_fit
             else:
                 trend_vals = np.full(len(vals), float(np.nanmean(vals)))
 
@@ -9246,7 +9388,7 @@ def _block3_seasonality(
         if len(amp_year) >= 2:
             x = np.arange(len(amp_year), dtype=float)
             y_amp = amp_year["seasonal"].values.astype(float)
-            slope = float(np.polyfit(x, y_amp, 1)[0])
+            slope = float(_safe_linear_fit(x, y_amp)[0])
         else:
             slope = 0.0
 
@@ -9787,8 +9929,8 @@ def _fallback_seasonality_heatmap(
         x = np.arange(len(vals), dtype=float)
         ok = np.isfinite(vals)
         if int(ok.sum()) >= 2 and float(np.nanvar(vals)) > 0.0:
-            coeff = np.polyfit(x[ok], vals[ok], 1)
-            trend = np.polyval(coeff, x)
+            slope_fit, intercept_fit = _safe_linear_fit(x[ok], vals[ok])
+            trend = slope_fit * x + intercept_fit
             seasonal = vals - trend
         else:
             seasonal = np.zeros(len(vals), dtype=float)
@@ -10193,7 +10335,7 @@ def _block5_concentration(
             y_pp = pd.to_numeric(ss["share"], errors="coerce").fillna(0.0).astype(float).values * 100.0
             if float(np.nanvar(y_pp)) == 0.0:
                 return 0.0, 0.0
-            slope, intercept = np.polyfit(t.values, y_pp, 1)
+            slope, intercept = _safe_linear_fit(t.values, y_pp)
             y_hat = slope * t.values + intercept
             ss_res = float(np.sum((y_pp - y_hat) ** 2))
             ss_tot = float(np.sum((y_pp - float(np.mean(y_pp))) ** 2))
@@ -10212,7 +10354,7 @@ def _block5_concentration(
             y = pd.to_numeric(ss["share"], errors="coerce").fillna(0.0).astype(float).values
             if float(np.nanvar(y)) == 0.0:
                 return 0.0, 0.0
-            slope, intercept = np.polyfit(t.values, y, 1)
+            slope, intercept = _safe_linear_fit(t.values, y)
             y_hat = slope * t.values + intercept
             ss_res = float(np.sum((y - y_hat) ** 2))
             ss_tot = float(np.sum((y - float(np.mean(y))) ** 2))
@@ -10665,16 +10807,19 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             ss["cot__memo_timecol"] = {"df_fp": df_fp, "time_col": time_col}
     _timings["infer_time_col"] = (perf_counter() - _t_inf_time) * 1000.0
 
-    # cat_col: prefer sidebar cat, else memoized inference, else infer
+    # cat_col: prefer explicit sidebar cat; otherwise infer per question. The
+    # memo includes a question signature so a previous "country over time" run
+    # cannot force Country when the next prompt asks for product category.
     _t_inf_cat = perf_counter()
     cat_col = (filters.get("cot_cat_col") or None)
     if not cat_col:
+        _q_sig = hashlib.sha1(_norm_question_key(question).encode("utf-8", errors="ignore")).hexdigest()[:12]
         memo = ss.get("cot__memo_catcol")
-        if isinstance(memo, dict) and memo.get("df_fp") == df_fp:
+        if isinstance(memo, dict) and memo.get("df_fp") == df_fp and memo.get("question_sig") == _q_sig:
             cat_col = memo.get("cat_col")
         if not cat_col:
-            cat_col = _infer_cat_col(df, schema_ctx)
-            ss["cot__memo_catcol"] = {"df_fp": df_fp, "cat_col": cat_col}
+            cat_col = _infer_cat_col(df, schema_ctx, question)
+            ss["cot__memo_catcol"] = {"df_fp": df_fp, "question_sig": _q_sig, "cat_col": cat_col}
     _timings["infer_cat_col"] = (perf_counter() - _t_inf_cat) * 1000.0
 
     dimension_label = _dimension_display_label(cat_col) if cat_col else "Wymiar"
@@ -10712,7 +10857,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         or ctx.get("source_path")
         or ""
     )
-    cache_key = f"cot_df_time::{data_id}::{time_col}::{cat_col}::{value_col}::{qty_col}::{price_col}"
+    cache_key = f"cot_df_time_v2_monthly::{data_id}::{time_col}::{cat_col}::{value_col}::{qty_col}::{price_col}"
     ss = st.session_state
     _t_prep = perf_counter()
     if cache_key in ss and isinstance(ss.get(cache_key), pd.DataFrame):
@@ -10811,19 +10956,20 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
             # --- Driver insight (share): detect driver category + Δ pp and Top-10 share ---
             try:
                 val_col = "__value"  # internal aggregated value column from _prep_time_df
-                _dfv = df_time_main[[time_col, cat_col, val_col]].copy()
-                _dfv = _dfv.dropna(subset=[time_col, cat_col])
+                _time_key = "__month"
+                _dfv = df_time_main[[_time_key, cat_col, val_col]].copy()
+                _dfv = _dfv.dropna(subset=[_time_key, cat_col])
                 _dfv[val_col] = pd.to_numeric(_dfv[val_col], errors="coerce").fillna(0.0)
-                _dfv = _dfv.sort_values(time_col)
+                _dfv = _dfv.sort_values(_time_key)
 
                 _by_cat_total = _dfv.groupby(cat_col, dropna=False)[val_col].sum().sort_values(ascending=False)
-                _by_time_cat = _dfv.groupby([time_col, cat_col], dropna=False)[val_col].sum().reset_index()
-                _by_time_total = _by_time_cat.groupby(time_col, dropna=False)[val_col].sum().rename("total").reset_index()
-                _m = _by_time_cat.merge(_by_time_total, on=time_col, how="left")
+                _by_time_cat = _dfv.groupby([_time_key, cat_col], dropna=False)[val_col].sum().reset_index()
+                _by_time_total = _by_time_cat.groupby(_time_key, dropna=False)[val_col].sum().rename("total").reset_index()
+                _m = _by_time_cat.merge(_by_time_total, on=_time_key, how="left")
                 _m["share"] = _m[val_col] / _m["total"].replace(0, pd.NA)
                 _m["share"] = _m["share"].fillna(0.0)
 
-                _pivot = _m.pivot_table(index=time_col, columns=cat_col, values="share", aggfunc="sum", fill_value=0.0).sort_index()
+                _pivot = _m.pivot_table(index=_time_key, columns=cat_col, values="share", aggfunc="sum", fill_value=0.0).sort_index()
                 _cols = [c for c in _pivot.columns.tolist() if not _is_other(c)]
                 _cols = _cols or _pivot.columns.tolist()
 
@@ -10907,17 +11053,18 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
 
             # --- Driver insight (value): detect driver category + Δ PLN ---
             try:
-                _dfv = df_time_main[[time_col, cat_col, val_col]].copy()
-                _dfv = _dfv.dropna(subset=[time_col, cat_col])
+                _time_key = "__month"
+                _dfv = df_time_main[[_time_key, cat_col, val_col]].copy()
+                _dfv = _dfv.dropna(subset=[_time_key, cat_col])
                 _dfv[val_col] = pd.to_numeric(_dfv[val_col], errors="coerce").fillna(0.0)
-                _dfv = _dfv.sort_values(time_col)
+                _dfv = _dfv.sort_values(_time_key)
 
                 _by_cat_total = _dfv.groupby(cat_col, dropna=False)[val_col].sum().sort_values(ascending=False)
                 _cats = [c for c in _by_cat_total.index.tolist() if not _is_other(c)]
                 _drv = _cats[0] if _cats else (_by_cat_total.index[0] if len(_by_cat_total) else None)
 
                 if _drv is not None:
-                    _drv_df = _dfv[_dfv[cat_col] == _drv].groupby(time_col, dropna=False)[val_col].sum().reset_index().sort_values(time_col)
+                    _drv_df = _dfv[_dfv[cat_col] == _drv].groupby(_time_key, dropna=False)[val_col].sum().reset_index().sort_values(_time_key)
                     _v0 = float(_drv_df.iloc[0][val_col]) if len(_drv_df) else 0.0
                     _v1 = float(_drv_df.iloc[-1][val_col]) if len(_drv_df) else 0.0
                     stats_for_interp.update({
@@ -13117,7 +13264,6 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                             if demo_df.empty:
                                 st.info("Brak danych dla wybranej kategorii.")
                             else:
-                                from statsmodels.tsa.seasonal import STL as _STL
                                 idx_full = pd.date_range(demo_df["__month"].min(), demo_df["__month"].max(), freq="MS")
                                 y = demo_df.set_index("__month")["__value"].reindex(idx_full)
                                 y = pd.to_numeric(y, errors="coerce").fillna(0.0).astype(float)
@@ -13125,14 +13271,21 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                                 if len(y) < 18 or float(np.nanvar(y.values)) == 0.0:
                                     st.info("Za krótki lub stały szereg do dekompozycji STL.")
                                 else:
-                                    res = _STL(y, period=12, robust=True).fit()
+                                    _x_demo = np.arange(len(y), dtype=float)
+                                    _slope_demo, _intercept_demo = _safe_linear_fit(_x_demo, y.values)
+                                    _trend_demo = _slope_demo * _x_demo + _intercept_demo
+                                    _dev_demo = pd.Series(y.values - _trend_demo, index=idx_full)
+                                    _win_demo = 3 if len(_dev_demo) < 18 else 5
+                                    _seasonal_demo = _dev_demo.rolling(window=_win_demo, center=True, min_periods=1).mean()
+                                    _seasonal_demo = _seasonal_demo - float(np.nanmean(_seasonal_demo.values))
+                                    _noise_demo = _dev_demo - _seasonal_demo
                                     dplot = pd.DataFrame(
                                         {
                                             "period": idx_full,
                                             "original": y.values,
-                                            "trend": res.trend,
-                                            "seasonal": res.seasonal,
-                                            "noise": res.resid,
+                                            "trend": _trend_demo,
+                                            "seasonal": _seasonal_demo.values,
+                                            "noise": _noise_demo.values,
                                         }
                                     )
 
