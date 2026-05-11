@@ -2361,18 +2361,59 @@ def _render_sidebar_filters(df: pd.DataFrame, schema_ctx: Dict[str, Any]) -> Dic
 
     def _looks_like_dist_id(_col: str) -> bool:
         low = str(_col or "").strip().lower()
+        compact = re.sub(r"[^a-z0-9]+", "", low)
+        tokens = [t for t in re.split(r"[^a-z0-9]+", low) if t]
         if not low:
             return False
-        if low in {"id", "idx", "index"}:
+        if compact in {
+            "id", "idx", "index", "rowid", "recordid", "uuid", "guid",
+            "invoice", "invoiceno", "invoicenumber", "transactionid", "txn",
+            "txnid", "orderid", "orderno", "ordernumber", "receiptid",
+            "customerid", "clientid", "userid", "accountid", "stockcode",
+            "productid", "productcode", "sku", "zipcode", "postcode",
+        }:
             return True
-        if low.endswith("_id"):
+        if low.endswith("_id") or low.endswith(" id"):
             return True
-        return ("id" in low) and (len(low) <= 8)
+        if {"id", "idx", "index", "uuid", "guid", "code", "sku"} & set(tokens):
+            return True
+        return False
+
+    def _looks_like_date_part_col(_col: str) -> bool:
+        low = str(_col or "").strip().lower()
+        compact = re.sub(r"[^a-z0-9]+", "", low)
+        tokens = set(t for t in re.split(r"[^a-z0-9]+", low) if t)
+        date_parts = {
+            "year", "rok", "month", "miesiac", "miesiąc", "quarter", "kwartal", "kwartał",
+            "week", "tydzien", "tydzień", "day", "dzien", "dzień", "hour", "godzina",
+            "minute", "minuta", "second", "sekunda", "weekday", "dayofweek",
+            "weekofyear", "weekend", "datepart", "timepart",
+        }
+        if compact in {re.sub(r"[^a-z0-9]+", "", x) for x in date_parts}:
+            return True
+        return bool(tokens & {re.sub(r"[^a-z0-9]+", "", x) for x in date_parts})
+
+    def _looks_like_distribution_measure_name(_col: str) -> bool:
+        low = str(_col or "").strip().lower()
+        compact = re.sub(r"[^a-z0-9]+", "", low)
+        measure_terms = {
+            "value", "wartosc", "wartość", "amount", "sales", "sale", "sprzedaz", "sprzedaż",
+            "revenue", "turnover", "price", "cena", "cost", "koszt", "quantity", "qty",
+            "ilosc", "ilość", "unit", "units", "linevalue", "total", "sum", "profit",
+            "margin", "discount", "tax", "fee", "charge", "premium", "income", "salary",
+            "age", "score", "rating", "rate", "ratio", "pct", "percent", "percentage",
+            "weight", "height", "length", "width", "area", "volume", "duration", "balance",
+            "spend", "expense", "loss", "gain", "measure", "metric",
+        }
+        compact_terms = {re.sub(r"[^a-z0-9]+", "", x) for x in measure_terms}
+        if compact in compact_terms:
+            return True
+        return any(term and term in compact for term in compact_terms)
 
     def _is_distribution_measure_candidate(_c: str) -> bool:
         if not isinstance(_c, str) or _c not in df.columns:
             return False
-        if _is_dist_technical_col(_c) or _looks_like_dist_id(_c):
+        if _is_dist_technical_col(_c) or _looks_like_dist_id(_c) or _looks_like_date_part_col(_c):
             return False
         _s = df[_c]
         if pd.api.types.is_datetime64_any_dtype(_s) or pd.api.types.is_bool_dtype(_s):
@@ -2383,17 +2424,27 @@ def _render_sidebar_filters(df: pd.DataFrame, schema_ctx: Dict[str, Any]) -> Dic
             _nn = pd.to_numeric(_s, errors="coerce").dropna().head(50000)
             if _nn.empty:
                 return False
-            if int(_nn.nunique(dropna=True)) < 3:
+            _n = int(len(_nn))
+            _nun = int(_nn.nunique(dropna=True))
+            if _nun < 3:
                 return False
+            _is_integer_like = bool(((_nn - _nn.round()).abs().max() if _n else 0) < 1e-9)
+            _measure_name = _looks_like_distribution_measure_name(_c)
+            _unique_ratio = float(_nun / max(_n, 1))
+            # Serial numbers and encoded categories can be numeric, but their
+            # distribution is not a useful business distribution.
+            if _is_integer_like and not _measure_name:
+                if _unique_ratio >= 0.70:
+                    return False
+                if _nun <= 24:
+                    return False
         except Exception:
             return False
         return True
 
-    num_cols = list(schema_ctx.get("num_cols") or [])
-    if not num_cols:
-        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-
-    num_cols = [c for c in num_cols if _is_distribution_measure_candidate(c)]
+    _schema_num_cols = list(schema_ctx.get("num_cols") or [])
+    _candidate_source = list(dict.fromkeys(_schema_num_cols + list(df.columns)))
+    num_cols = [c for c in _candidate_source if _is_distribution_measure_candidate(c)]
 
     # Kolumny kategoryczne (w tym niska krotność liczb)
     cat_cols = list(schema_ctx.get("cat_cols") or [])
