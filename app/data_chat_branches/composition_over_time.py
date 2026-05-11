@@ -9740,7 +9740,11 @@ def _block3_seasonality(
 },
     }
 
-    a1 = alt.Chart.from_dict(spec)
+    # Streamlit Cloud / DO can run Altair versions that validate this hconcat spec
+    # more strictly and dump the entire embedded dataset on failure. Vega-Lite can
+    # render the spec, so keep Altair validation off here and let the safe renderer
+    # handle any downstream render incompatibility.
+    a1 = alt.Chart.from_dict(spec, validate=False)
 
     _seasonality_focus_category = None
     _seasonality_focus_weight = None
