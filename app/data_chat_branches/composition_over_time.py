@@ -125,7 +125,6 @@ def _debug_df_safe(rows: Any):
         return rows
 
 
-from core.ui_safe import altair_chart_stretch
 import altair as alt
 
 from data_chat_core.ui_contract import render_exec_takeaway, render_guidance
@@ -10724,6 +10723,74 @@ def _unwrap_altair_chart(obj: Any, *, _depth: int = 2) -> Optional[Any]:
                 return ch
     return None
 
+def _render_altair_chart_safe(target: Any, chart: Any, *, block_id: str = "chart", debug_perf: bool = False) -> bool:
+    """Render an Altair chart without letting schema/render errors dump full data in Streamlit."""
+    import streamlit as st
+    from core.ui_safe import altair_chart_stretch, _supports_kw
+
+    raw_chart = chart
+    ch = _unwrap_altair_chart(chart)
+    if ch is None:
+        if debug_perf:
+            st.error(
+                "Nieprawidlowy obiekt wykresu - pomijam render, aby uniknac crasha."
+                f"\n\n- block: `{block_id}`"
+                f"\n- type: `{type(raw_chart)}`"
+                f"\n- repr: `{_short_repr(raw_chart)}`"
+            )
+        else:
+            st.warning(
+                "Wykres chwilowo niedostepny dla aktualnego zakresu danych. "
+                "Sprobuj odswiezyc albo zmienic filtr."
+            )
+        return False
+
+    try:
+        altair_chart_stretch(target, ch)
+        return True
+    except Exception as first_exc:
+        # Some Streamlit/Altair combinations raise during validation and print the
+        # whole embedded dataset. Try rendering the Vega-Lite spec without Altair
+        # validation before giving up.
+        try:
+            spec = ch.to_dict(validate=False)
+            fn = getattr(target, "vega_lite_chart", None) or st.vega_lite_chart
+            if _supports_kw(fn, "spec"):
+                base_args: tuple[Any, ...] = ()
+                base_kwargs: dict[str, Any] = {"spec": spec}
+            else:
+                base_args = (spec,)
+                base_kwargs = {}
+            if _supports_kw(fn, "width"):
+                try:
+                    fn(*base_args, width="stretch", **base_kwargs)
+                    return True
+                except TypeError as exc:
+                    if "width" not in str(exc).lower():
+                        raise
+            try:
+                fn(*base_args, use_container_width=True, **base_kwargs)
+                return True
+            except TypeError as exc:
+                if "use_container_width" not in str(exc).lower():
+                    raise
+            fn(*base_args, **base_kwargs)
+            return True
+        except Exception as fallback_exc:
+            if debug_perf:
+                st.error(
+                    "Nie udalo sie wyrenderowac wykresu Altair/Vega-Lite."
+                    f"\n\n- block: `{block_id}`"
+                    f"\n- altair_error: `{type(first_exc).__name__}: {_short_repr(first_exc, 520)}`"
+                    f"\n- fallback_error: `{type(fallback_exc).__name__}: {_short_repr(fallback_exc, 520)}`"
+                )
+            else:
+                st.warning(
+                    "Wykres chwilowo niedostepny. Dane zostaly wczytane, ale renderer wykresu "
+                    "zwrocil blad walidacji; pozostale sekcje dzialaja dalej."
+                )
+            return False
+
 # ------------------------------
 # LLM safety helpers (module-scope)
 # ------------------------------
@@ -11101,7 +11168,6 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
         # Streamlit version compatibility: width='stretch' (new) vs width (old)
         # NOTE: do NOT import via "app.core" because the Streamlit multipage runtime
         # executes scripts in a way where "app" is not a Python package.
-        from core.ui_safe import altair_chart_stretch
         _t_render_chart = perf_counter()
         # Guard: Streamlit expects an Altair chart-like object (with .to_dict()).
         _raw_chart = chart
@@ -11118,7 +11184,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                     "Spróbuj odświeżyć lub zmienić zakres."
                 )
         else:
-            altair_chart_stretch((chart_slot or st), chart)
+            _render_altair_chart_safe((chart_slot or st), chart, block_id="cot__overview", debug_perf=debug_perf)
         _timings["render_chart"] = (perf_counter() - _t_render_chart) * 1000.0
 
         if debug_perf:
@@ -12541,8 +12607,6 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                 pass
 
             # Streamlit multipage: avoid importing via "app.*" ("app" isn't a package at runtime)
-            from core.ui_safe import altair_chart_stretch
-
             if b.get("id") == "cot__seasonality":
                 st.markdown(f"#### 🧩 Heatmapa czystej sezonowości per {dimension_entity} + waga sezonowości")
                 st.caption("Odchylenie sezonowe (po usunięciu trendu) — skala symetryczna: ujemne ↔ dodatnie.")
@@ -12578,7 +12642,7 @@ def render(df: pd.DataFrame, ctx: Dict[str, Any]) -> Dict[str, Any]:
                         "Spróbuj odświeżyć lub zmienić zakres."
                     )
             else:
-                altair_chart_stretch(st, ch)
+                _render_altair_chart_safe(st, ch, block_id=str(b.get("id") or "cot__block"), debug_perf=debug_perf)
 
             if b.get("id") == "cot__concentration":
                 st_stats = b.get("stats") or {}
