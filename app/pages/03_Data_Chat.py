@@ -2393,6 +2393,33 @@ def _render_sidebar_filters(df: pd.DataFrame, schema_ctx: Dict[str, Any]) -> Dic
             return True
         return bool(tokens & {re.sub(r"[^a-z0-9]+", "", x) for x in date_parts})
 
+    def _looks_like_datetime_col(_col: str, _s: pd.Series) -> bool:
+        low = str(_col or "").strip().lower()
+        compact = re.sub(r"[^a-z0-9]+", "", low)
+        tokens = set(t for t in re.split(r"[^a-z0-9]+", low) if t)
+        date_names = {
+            "date", "data", "datetime", "timestamp", "time", "czas",
+            "invoicedate", "orderdate", "createddate", "updateddate",
+            "createdat", "updatedat", "eventtime", "eventdate",
+        }
+        normalized = {re.sub(r"[^a-z0-9]+", "", x) for x in date_names}
+        if compact in normalized or compact.endswith("date") or compact.endswith("datetime") or compact.endswith("timestamp"):
+            return True
+        if tokens & normalized:
+            return True
+        try:
+            if pd.api.types.is_datetime64_any_dtype(_s):
+                return True
+            if pd.api.types.is_numeric_dtype(_s):
+                return False
+            ss = _s.dropna().astype(str).head(200)
+            if ss.empty:
+                return False
+            parsed = pd.to_datetime(ss, errors="coerce", infer_datetime_format=True)
+            return float(parsed.notna().mean()) >= 0.90
+        except Exception:
+            return False
+
     def _looks_like_distribution_measure_name(_col: str) -> bool:
         low = str(_col or "").strip().lower()
         compact = re.sub(r"[^a-z0-9]+", "", low)
@@ -2416,7 +2443,7 @@ def _render_sidebar_filters(df: pd.DataFrame, schema_ctx: Dict[str, Any]) -> Dic
         if _is_dist_technical_col(_c) or _looks_like_dist_id(_c) or _looks_like_date_part_col(_c):
             return False
         _s = df[_c]
-        if pd.api.types.is_datetime64_any_dtype(_s) or pd.api.types.is_bool_dtype(_s):
+        if _looks_like_datetime_col(_c, _s) or pd.api.types.is_bool_dtype(_s):
             return False
         if not _looks_numeric_like(_s):
             return False
