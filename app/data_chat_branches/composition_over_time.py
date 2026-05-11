@@ -8369,23 +8369,36 @@ def _prep_time_df(
     qty_col: Optional[str],
     price_col: Optional[str],
 ) -> pd.DataFrame:
-    x = df[[time_col, cat_col] + ([c for c in [value_col, qty_col, price_col] if c and c in df.columns])].copy()
-    x["__month"] = _to_month_start(x[time_col])
-    x = x.dropna(subset=["__month", cat_col])
-    x[cat_col] = x[cat_col].astype(str)
-    # __value: prefer explicit value_col; otherwise qty*price; fallback = 1.0 (count)
-    s_value = _safe_series(x, value_col) if value_col else None
-    if s_value is not None:
-        x["__value"] = pd.to_numeric(s_value, errors="coerce")
-    else:
-        s_qty = _safe_series(x, qty_col) if qty_col else None
-        s_price = _safe_series(x, price_col) if price_col else None
-        if (s_qty is not None) and (s_price is not None):
-            x["__value"] = pd.to_numeric(s_qty, errors="coerce") * pd.to_numeric(s_price, errors="coerce")
-        else:
-            x["__value"] = 1.0
+    # Build a compact frame from Series instead of slicing/mutating the possibly
+    # fragmented app-level DataFrame. On small containers Pandas PerformanceWarning
+    # can be promoted to an exception, which previously crashed COT rendering.
+    s_time = _safe_series(df, time_col)
+    s_cat = _safe_series(df, cat_col)
+    if s_time is None or s_cat is None:
+        return pd.DataFrame(columns=["__month", cat_col, "__value"])
 
-    x["__value"] = x["__value"].fillna(0.0)
+    # __value: prefer explicit value_col; otherwise qty*price; fallback = 1.0 (count)
+    s_value = _safe_series(df, value_col) if value_col else None
+    if s_value is not None:
+        value = pd.to_numeric(s_value, errors="coerce")
+    else:
+        s_qty = _safe_series(df, qty_col) if qty_col else None
+        s_price = _safe_series(df, price_col) if price_col else None
+        if (s_qty is not None) and (s_price is not None):
+            value = pd.to_numeric(s_qty, errors="coerce") * pd.to_numeric(s_price, errors="coerce")
+        else:
+            value = pd.Series(1.0, index=df.index)
+
+    x = pd.DataFrame(
+        {
+            "__month": _to_month_start(s_time),
+            cat_col: s_cat.astype(str),
+            "__value": pd.to_numeric(value, errors="coerce").fillna(0.0),
+        },
+        copy=True,
+    )
+
+    x = x.dropna(subset=["__month", cat_col])
     # COT charts operate at monthly x category grain. Keeping the raw million-row
     # table here makes every insight block regroup the same data and can exhaust
     # small DO containers. This aggregation preserves sums while reducing memory.
