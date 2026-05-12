@@ -4861,7 +4861,7 @@ def main():
     with st.sidebar.expander("🎙️ Lektor & TL;DR", expanded=False):
         fast_sidebar = st.checkbox(
             "🧠 Generuj TL;DR (OpenAI)",
-            value=False,
+            value=True,
             key="eda_generate_tldr",
             help="4–6 zwięzłych zdań na bazie metryk i wniosków",
         )
@@ -4879,7 +4879,7 @@ def main():
         eleven_tts_model_selected = os.getenv("ELEVEN_TTS_MODEL", "eleven_multilingual_v2")
 
         st.markdown("---")
-        st.checkbox("✅ Włącz lektora (TTS)", value=False, key="tts_enabled")
+        st.checkbox("✅ Włącz lektora (TTS)", value=True, key="tts_enabled")
 
         # Dostawca TTS: w Etapie 2 blokujemy wybór (zostawiamy OpenAI).
         provider = 'OpenAI'
@@ -5904,7 +5904,7 @@ def main():
                         agg_choice = st.selectbox(
                             "Agregacja czasu",
                             ["Dzień", "Tydzień", "Miesiąc", "Rok", "Dzień tygodnia"],
-                            index=2,
+                            index=0,
                             key="ts_seasonality_agg",
                         )
                     with c3:
@@ -5982,17 +5982,17 @@ def main():
                             dt = ts_df[x_choice].dt
 
                             if agg_choice == "Rok":
-                                ts_df["season_key"] = dt.year
+                                ts_df["season_key"] = dt.to_period("Y").dt.start_time
                                 x_title = "Rok"
                             elif agg_choice == "Kwartal":
-                                ts_df["season_key"] = dt.to_period("Q").astype(str)
+                                ts_df["season_key"] = dt.to_period("Q").dt.start_time
                                 x_title = "Kwartal"
                             elif agg_choice == "Miesiąc":
-                                ts_df["season_key"] = dt.to_period("M").astype(str)
+                                ts_df["season_key"] = dt.to_period("M").dt.start_time
                                 x_title = "Miesiąc"
                             elif agg_choice == "Tydzień":
-                                ts_df["season_key"] = dt.isocalendar().week.astype(int)
-                                x_title = "Tydzień roku"
+                                ts_df["season_key"] = dt.to_period("W-SUN").dt.start_time
+                                x_title = "Tydzień"
                             elif agg_choice == "Dzień tygodnia":
                                 ts_df["season_key"] = dt.dayofweek.astype(int)
                                 x_title = "Dzień tygodnia"
@@ -6020,7 +6020,52 @@ def main():
                     if not agg_df.empty:
                         agg_df = agg_df.rename(columns={col_to_plot: "value"})
                         agg_df = agg_df.dropna(subset=["season_key", "value"])
-                        agg_df = agg_df.sort_values("season_key")
+                        agg_df = agg_df.sort_values("season_key").reset_index(drop=True)
+
+                        if agg_choice == "Dzień tygodnia":
+                            agg_df["season_label"] = agg_df["season_key"].map(dow_map).fillna(
+                                agg_df["season_key"].astype(str)
+                            )
+                            _sort_order = [v for v in dow_map.values() if v in set(agg_df["season_label"])]
+                            x_enc = alt.X(
+                                "season_label:N",
+                                sort=_sort_order,
+                                axis=alt.Axis(title=x_title, labelAngle=0),
+                            )
+                        elif pd.api.types.is_datetime64_any_dtype(agg_df["season_key"]):
+                            _fmt_map = {
+                                "Dzień": "%Y-%m-%d",
+                                "Tydzień": "%Y-%m-%d",
+                                "Miesiąc": "%Y-%m",
+                                "Kwartal": "%Y-Q%q",
+                                "Rok": "%Y",
+                            }
+                            _fmt = _fmt_map.get(agg_choice, "%Y-%m-%d")
+                            _dt_key = pd.to_datetime(agg_df["season_key"], errors="coerce")
+                            if agg_choice == "Kwartal":
+                                agg_df["season_label"] = _dt_key.dt.to_period("Q").astype(str)
+                            else:
+                                agg_df["season_label"] = _dt_key.dt.strftime(_fmt)
+                            _sort_order = agg_df["season_label"].astype(str).tolist()
+                            x_enc = alt.X(
+                                "season_label:N",
+                                sort=_sort_order,
+                                axis=alt.Axis(
+                                    title=x_title,
+                                    labelAngle=-35 if len(_sort_order) > 8 else 0,
+                                ),
+                            )
+                        else:
+                            agg_df["season_label"] = agg_df["season_key"].astype(str)
+                            _sort_order = agg_df["season_label"].tolist()
+                            x_enc = alt.X(
+                                "season_label:N",
+                                sort=_sort_order,
+                                axis=alt.Axis(
+                                    title=x_title,
+                                    labelAngle=-35 if len(_sort_order) > 8 else 0,
+                                ),
+                            )
 
                 except Exception as e:
                     agg_df = pd.DataFrame()
@@ -6050,39 +6095,62 @@ def main():
                     COLOR_TREND = "#10b981"
 
                     n_points = len(agg_df)
-                    max_ma = max(2, min(60, n_points))
-                    default_ma = min(6, n_points)
+                    can_analyze_ts = n_points >= 3
+                    if can_analyze_ts:
+                        max_ma = max(2, min(60, n_points))
+                        default_ma = max(2, min(6, max_ma))
+                    else:
+                        max_ma = 1
+                        default_ma = 1
 
                     # --- układ suwak + checkboxy (zgodnie z Twoim layoutem) ---
                     with chart_col:
-                        # suwak na szerokość 2 pól wyboru, checkboxy pod 3. polem
-                        row = st.columns([2.0, 1.0])
-
-                        with row[0]:
-                            ma_window = st.slider(
-                                "Okno średniej kroczącej",
-                                min_value=2, max_value=max_ma,
-                                value=default_ma, step=1,
-                                key="ts_ma_window",
+                        if not can_analyze_ts:
+                            st.info(
+                                f"Po agregacji „{agg_choice}” są tylko {n_points} punkty. "
+                                "Trend, średnia krocząca i sezonowość wymagają minimum 3 punktów. "
+                                "Wybierz drobniejszą agregację, np. dzień, albo szerszy zakres danych."
                             )
+                            ma_window = 1
+                            show_raw = True
+                            show_ma = False
+                            show_trend = False
+                        else:
+                            # suwak na szerokość 2 pól wyboru, checkboxy pod 3. polem
+                            row = st.columns([2.0, 1.0])
 
-                        with row[1]:
-                            # lekki spacer, żeby checkboxy były w linii z suwakiem
-                            st.markdown("<div style='height: 1.6rem'></div>", unsafe_allow_html=True)
+                            with row[0]:
+                                ma_window = st.slider(
+                                    "Okno średniej kroczącej",
+                                    min_value=2, max_value=max_ma,
+                                    value=default_ma, step=1,
+                                    key="ts_ma_window",
+                                )
 
-                            cb1, cb2, cb3 = st.columns(3, gap="small")
-                            with cb1:
-                                show_raw = st.checkbox("dane", True, key="ts_show_raw")
-                            with cb2:
-                                show_ma = st.checkbox("śr. krocząca", True, key="ts_show_ma")
-                            with cb3:
-                                show_trend = st.checkbox("trend", True, key="ts_show_trend")
+                            with row[1]:
+                                # lekki spacer, żeby checkboxy były w linii z suwakiem
+                                st.markdown("<div style='height: 1.6rem'></div>", unsafe_allow_html=True)
+
+                                cb1, cb2, cb3 = st.columns(3, gap="small")
+                                with cb1:
+                                    show_raw = st.checkbox("dane", True, key="ts_show_raw")
+                                with cb2:
+                                    show_ma = st.checkbox("śr. krocząca", True, key="ts_show_ma")
+                                with cb3:
+                                    show_trend = st.checkbox("trend", True, key="ts_show_trend")
 
                     # zabezpieczenia (gdyby UI nie wyrenderowało się w danym rerunie)
-                    ma_window  = st.session_state.get("ts_ma_window", default_ma)
-                    show_raw   = st.session_state.get("ts_show_raw", True)
-                    show_ma    = st.session_state.get("ts_show_ma", True)
-                    show_trend = st.session_state.get("ts_show_trend", True)
+                    if can_analyze_ts:
+                        ma_window  = st.session_state.get("ts_ma_window", default_ma)
+                        ma_window = int(max(2, min(max_ma, ma_window)))
+                        show_raw   = st.session_state.get("ts_show_raw", True)
+                        show_ma    = st.session_state.get("ts_show_ma", True)
+                        show_trend = st.session_state.get("ts_show_trend", True)
+                    else:
+                        ma_window = 1
+                        show_raw = True
+                        show_ma = False
+                        show_trend = False
 
                     agg_df = agg_df.reset_index(drop=True)
                     agg_df["ma_value"] = agg_df["value"].rolling(
@@ -6174,7 +6242,7 @@ def main():
                     layers = []
                     if show_raw:
                         layers.append(
-                            base.mark_line(strokeWidth=1.7, color=COLOR_RAW).encode(
+                            base.mark_line(strokeWidth=1.7, color=COLOR_RAW, point=True).encode(
                                 x=x_enc,  # <-- wymuszenie osi X na warstwie danych
                                 y=alt.Y("value:Q", title=y_title, scale=y_scale)
                             )
@@ -6288,19 +6356,40 @@ def main():
 
                         # Które agregacje traktujemy jako cykl sezonowy?
                         cyclical_map = {
-                            "Dzień tygodnia": ("cykl tygodniowy (7 dni)", 7),
-                            "Miesiąc": ("cykl roczny (12 miesięcy)", 12),
-                            "Tydzień roku (ISO)": ("cykl roczny-tygodniowy (52 tyg.)", 52),
+                            "Dzień tygodnia": ("profil tygodniowy (7 dni)", 7, 3),
+                            "Miesiąc": ("cykl roczny (12 miesięcy)", 12, 18),
+                            "Tydzień": ("cykl roczny-tygodniowy (52 tyg.)", 52, 52),
                         }
 
                         if agg_choice in cyclical_map:
-                            season_cycle_name, season_period = cyclical_map[agg_choice]
+                            season_cycle_name, season_period, min_points_for_cycle = cyclical_map[agg_choice]
 
-                            prof = agg_df[["season_key", "value"]].dropna()
-                            if not prof.empty:
+                            if n_points < min_points_for_cycle:
+                                season_cycle_name = (
+                                    f"{season_cycle_name} — za mało punktów po agregacji "
+                                    f"({n_points}/{min_points_for_cycle})"
+                                )
+                                season_strength = "nie oceniono"
+                            else:
+                                prof = agg_df[["season_key", "value"]].dropna().copy()
+                                if agg_choice == "Dzień tygodnia":
+                                    prof["cycle_key"] = prof["season_key"]
+                                elif agg_choice == "Miesiąc":
+                                    prof["cycle_key"] = pd.to_datetime(
+                                        prof["season_key"], errors="coerce"
+                                    ).dt.month
+                                elif agg_choice == "Tydzień":
+                                    prof["cycle_key"] = pd.to_datetime(
+                                        prof["season_key"], errors="coerce"
+                                    ).dt.isocalendar().week.astype("Int64")
+                                else:
+                                    prof["cycle_key"] = prof["season_key"]
+
+                                prof = prof.dropna(subset=["cycle_key"])
+                            if n_points >= min_points_for_cycle and not prof.empty:
                                 overall = float(prof["value"].mean())
 
-                                grp_mean = prof.groupby("season_key")["value"].mean()
+                                grp_mean = prof.groupby("cycle_key")["value"].mean()
 
                                 # amplituda sezonowa
                                 season_amp = float(grp_mean.max() - grp_mean.min())
@@ -6312,7 +6401,7 @@ def main():
                                 eta2 = 0.0 if ss_total == 0 else ss_between / ss_total
 
                                 # regularność profilu: 1 - (within/total)
-                                resid = prof["value"] - prof["season_key"].map(grp_mean)
+                                resid = prof["value"] - prof["cycle_key"].map(grp_mean)
                                 ss_within = float((resid ** 2).sum())
                                 season_reg = 0.0 if ss_total == 0 else max(0.0, 1.0 - ss_within / ss_total)
 
@@ -6329,19 +6418,30 @@ def main():
                     with info_col:
                         st.subheader("Ocena zjawisk", divider="gray")
                         st.markdown("**Ocena trendu:**")
-                        st.markdown(
-                            f"""
-                            • **Oś czasu:** {x_choice}<br>
-                            • **Agregacja:** {agg_choice.lower()}<br>
-                            • **Miara:** {metric_choice.lower()}<br>
-                            • **Trend:** {trend_arrow} {strength} {direction} (**{signed_level}/3**,
-                              znormalizowane nachylenie ≈ {norm:+.3f},
-                              start trendu od punktu {trend_start_idx + 1} z {n_points} — zaznaczony kropką).<br>
-                            • **Kąt nachylenia trendu:** {angle_deg_raw:+.1f}°
-                            (znormalizowany: {angle_deg_norm:+.1f}°)
-                            """,
-                            unsafe_allow_html=True,
-                        )
+                        if can_analyze_ts:
+                            st.markdown(
+                                f"""
+                                • **Oś czasu:** {x_choice}<br>
+                                • **Agregacja:** {agg_choice.lower()}<br>
+                                • **Miara:** {metric_choice.lower()}<br>
+                                • **Trend:** {trend_arrow} {strength} {direction} (**{signed_level}/3**,
+                                  znormalizowane nachylenie ≈ {norm:+.3f},
+                                  start trendu od punktu {trend_start_idx + 1} z {n_points} — zaznaczony kropką).<br>
+                                • **Kąt nachylenia trendu:** {angle_deg_raw:+.1f}°
+                                (znormalizowany: {angle_deg_norm:+.1f}°)
+                                """,
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.markdown(
+                                f"""
+                                • **Oś czasu:** {x_choice}<br>
+                                • **Agregacja:** {agg_choice.lower()}<br>
+                                • **Miara:** {metric_choice.lower()}<br>
+                                • **Trend:** nie oceniono — po agregacji są tylko {n_points} punkty.
+                                """,
+                                unsafe_allow_html=True,
+                            )
                         st.markdown("**Ocena sezonowości:**")
                         st.markdown(
                             f"""
@@ -8050,7 +8150,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
 
         # --- Autoodtwarzanie TTS przy późniejszym odświeżaniu --- 
         _text_for_tts = (st.session_state.get("latest_summary_text", "") or "").strip()
-        tts_enabled   = st.session_state.get("tts_enabled", False)
+        tts_enabled   = st.session_state.get("tts_enabled", True)
 
         cur_tts_hash = _hash_key(
             _text_for_tts,
