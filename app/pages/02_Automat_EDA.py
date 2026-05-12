@@ -62,7 +62,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-from core.ui_safe import altair_chart_stretch
+from core.ui_safe import altair_chart_stretch, dataframe_stretch
 import altair as alt
 
 from core.top_nav import (
@@ -194,7 +194,7 @@ def st_df_safe(obj, *, max_rows: int = 2000, **kwargs):
     - coerces to Arrow-safe dtypes to prevent Streamlit serialization crashes
     """
     df2 = _df_preview_for_ui(obj, max_rows=max_rows)
-    return st.dataframe(df2, **kwargs)
+    return dataframe_stretch(st, df2, **kwargs)
 
 
 def st_table_safe(obj, *, max_rows: int = 2000, **kwargs):
@@ -854,13 +854,12 @@ def _build_cluster_summaries(
 
     work["_cluster_id"] = work[cluster_col].astype(str)
 
-    num_cols = [
-        c for c in work.select_dtypes(include="number").columns
-        if c not in (cluster_col, "_cluster_id")
-    ][:max_features]
+    num_cols = [c for c in _numeric_measure_candidates(work, min_non_null=3) if c not in (cluster_col, "_cluster_id")][:max_features]
+    for col in num_cols:
+        work[col] = _numeric_series_for_candidate(work[col])
 
     cat_cols = [
-        c for c in work.select_dtypes(exclude="number").columns
+        c for c in _categorical_feature_candidates(work)
         if c not in (cluster_col, "_cluster_id")
     ][:max_features]
 
@@ -1334,13 +1333,12 @@ def _describe_clusters_with_llm(
     work["_cluster_id"] = work[cluster_col].astype(str)
 
     # Wybór cech numerycznych i kategorycznych
-    num_cols = [
-        c for c in work.select_dtypes(include="number").columns
-        if c not in (cluster_col, "_cluster_id")
-    ][:max_features]
+    num_cols = [c for c in _numeric_measure_candidates(work, min_non_null=3) if c not in (cluster_col, "_cluster_id")][:max_features]
+    for col in num_cols:
+        work[col] = _numeric_series_for_candidate(work[col])
 
     cat_cols = [
-        c for c in work.select_dtypes(exclude="number").columns
+        c for c in _categorical_feature_candidates(work)
         if c not in (cluster_col, "_cluster_id")
     ][:max_features]
 
@@ -1858,11 +1856,26 @@ def _load_latest_dataset(max_rows: int | None = None) -> Tuple[pd.DataFrame | No
         # Smart preview for huge files to avoid hangs even when sample mode is off.
         if read_limit is None and size_mb >= 500:
             read_limit = 500_000
-        df = _df_from_parquet(path, max_rows=read_limit)
+        sample_note = None
+        if read_limit:
+            random_sample_max_mb = float(os.getenv("EDA_RANDOM_SAMPLE_MAX_MB", "50"))
+            if size_mb <= random_sample_max_mb:
+                df_all = _df_from_parquet(path, max_rows=None)
+                if len(df_all) > read_limit:
+                    df = df_all.sample(n=read_limit, random_state=42).sort_index()
+                    sample_note = "robocza probke losowa"
+                else:
+                    df = df_all
+                    sample_note = "caly plik"
+            else:
+                df = _df_from_parquet(path, max_rows=read_limit)
+                sample_note = "pierwsza lekka probke"
+        else:
+            df = _df_from_parquet(path, max_rows=None)
         if read_limit:
             st.caption(
-                f"⚡ Tryb próbki EDA: wczytano {len(df):,} wierszy "
-                f"z pliku ~{size_mb:,.1f} MB bez ładowania całości do RAM."
+                f"Tryb probki EDA: wczytano {len(df):,} wierszy ({sample_note}) "
+                f"z pliku ~{size_mb:,.1f} MB."
             )
     except Exception as e:
         return None, latest_info, f"Nie udało się wczytać danych z PARQUET: {e}"
@@ -1884,6 +1897,210 @@ def _calc_global_missing_pct(df: pd.DataFrame) -> float:
 
 # ───────────────────── ROLES & HERO CHARTS (TASK-AWARE EDA) ─────────────────────
 
+
+# -------------------- Stage 2 column semantics --------------------
+_DATE_PART_NAMES = {
+    "year", "month", "day", "hour", "minute", "second", "week", "quarter",
+    "dayofweek", "weekday", "weekday_name", "weekofyear", "isocalendar_week",
+}
+_DATE_PART_SUFFIXES = (
+    "_year", "_month", "_day", "_hour", "_minute", "_second", "_week",
+    "_quarter", "_dow", "_weekday", "_dayofweek",
+)
+_ID_CODE_TOKENS = (
+    "id", "uuid", "guid", "code", "kod", "nr", "no", "number", "invoice",
+    "receipt", "stockcode", "customer", "client", "konto", "account", "zip",
+    "postal", "phone", "telefon", "email", "mail",
+)
+_TECH_PREFIXES = ("is_", "flag_", "has_", "__", "tmp_", "temp_")
+_VALUE_NAME_PRIORITY = (
+    "target", "line_value", "value", "sales", "sprzed", "revenue", "amount",
+    "total", "price", "qty", "quantity", "cost", "margin", "profit", "score",
+)
+
+
+def _col_name_l(col: Any) -> str:
+    return str(col or "").strip().lower()
+
+
+def _is_date_part_column(col: Any) -> bool:
+    name = _col_name_l(col)
+    return name in _DATE_PART_NAMES or any(name.endswith(sfx) for sfx in _DATE_PART_SUFFIXES)
+
+
+def _looks_like_identifier_name(col: Any) -> bool:
+    name = _col_name_l(col)
+    if not name:
+        return False
+    compact = re.sub(r"[^a-z0-9]+", "", name)
+    parts = [p for p in re.split(r"[^a-z0-9]+", name) if p]
+
+    short_id_parts = {"id", "uuid", "guid", "code", "kod", "nr", "no"}
+    exact_compact = {
+        "id", "uuid", "guid", "code", "kod", "nr", "no",
+        "stockcode", "postcode", "postalcode", "zipcode",
+        "email", "mail", "phone", "telefon",
+    }
+    id_context = {"invoice", "receipt", "order", "customer", "client", "account", "konto"}
+
+    if compact in exact_compact:
+        return True
+    if any(part in short_id_parts for part in parts):
+        return True
+    if any(tok in compact for tok in ("uuid", "guid", "email", "phone", "telefon", "stockcode", "postcode", "postalcode")):
+        return True
+    if any(tok in compact for tok in ("invoice", "receipt")):
+        return True
+    if "number" in parts and any(part in id_context for part in parts):
+        return True
+    if compact.endswith("number") and any(tok in compact for tok in id_context):
+        return True
+    return False
+
+
+def _is_bool_like_series(series: pd.Series) -> bool:
+    try:
+        if pd.api.types.is_bool_dtype(series):
+            return True
+        vals = series.dropna().unique()
+        if len(vals) == 0 or len(vals) > 2:
+            return False
+        as_text = {str(v).strip().lower() for v in vals}
+        return as_text.issubset({"0", "1", "true", "false", "yes", "no", "tak", "nie"})
+    except Exception:
+        return False
+
+
+def _numeric_series_for_candidate(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    try:
+        return _coerce_to_numeric_special(series).replace([np.inf, -np.inf], np.nan)
+    except Exception:
+        return pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+
+def _is_numeric_measure_candidate(
+    df: pd.DataFrame,
+    col: Any,
+    *,
+    min_non_null: int = 2,
+    allow_low_cardinality: bool = False,
+) -> bool:
+    """Return True only for numeric columns that are useful analytical measures.
+
+    Stage 2 charts should not use technical IDs, codes, booleans or derived date parts as
+    normal measures. Those columns make correlations, outlier charts and model-prep advice
+    look precise while actually being misleading.
+    """
+    if df is None or col not in df.columns:
+        return False
+    s = df[col]
+    name = _col_name_l(col)
+    if not name or name.startswith(_TECH_PREFIXES) or _is_date_part_column(col):
+        return False
+    if pd.api.types.is_datetime64_any_dtype(s) or _is_bool_like_series(s):
+        return False
+
+    sn = _numeric_series_for_candidate(s)
+    non_na = sn.dropna()
+    if len(non_na) < min_non_null:
+        return False
+    nunique = int(non_na.nunique(dropna=True))
+    if nunique <= 1:
+        return False
+    if not allow_low_cardinality and nunique <= 2:
+        return False
+
+    source_non_null = s.dropna()
+    unique_ratio = float(source_non_null.nunique(dropna=True) / max(len(source_non_null), 1))
+    integer_like = False
+    try:
+        sample = non_na.head(5000)
+        integer_like = bool(not sample.empty and float((sample - sample.round()).abs().max()) < 1e-9)
+    except Exception:
+        integer_like = False
+
+    if _looks_like_identifier_name(col):
+        return False
+    if integer_like and unique_ratio > 0.90 and len(non_na) >= 50:
+        return False
+    return True
+
+
+def _numeric_measure_candidates(
+    df: pd.DataFrame,
+    *,
+    min_non_null: int = 2,
+    allow_low_cardinality: bool = False,
+) -> List[str]:
+    if df is None or df.empty:
+        return []
+    return [
+        c for c in df.columns
+        if _is_numeric_measure_candidate(
+            df, c,
+            min_non_null=min_non_null,
+            allow_low_cardinality=allow_low_cardinality,
+        )
+    ]
+
+
+def _categorical_feature_candidates(
+    df: pd.DataFrame,
+    *,
+    max_cardinality: int = 200,
+) -> List[str]:
+    if df is None or df.empty:
+        return []
+    out: List[str] = []
+    n = max(len(df), 1)
+    for c in df.columns:
+        s = df[c]
+        if pd.api.types.is_datetime64_any_dtype(s) or _is_date_part_column(c):
+            continue
+        if not pd.api.types.is_numeric_dtype(s) and _try_detect_datetime_from_object(s):
+            continue
+        if _looks_like_identifier_name(c) or _col_name_l(c).startswith(_TECH_PREFIXES):
+            continue
+        if pd.api.types.is_numeric_dtype(s) and _is_numeric_measure_candidate(df, c):
+            continue
+        nunique = int(s.nunique(dropna=True))
+        unique_ratio = nunique / n
+        if 2 <= nunique <= max_cardinality and unique_ratio <= 0.50:
+            out.append(c)
+    return out
+
+
+def _ordered_analysis_columns(df: pd.DataFrame) -> List[str]:
+    measures = _numeric_measure_candidates(df, min_non_null=2)
+    col_pos = {c: i for i, c in enumerate(df.columns)}
+    measures = sorted(measures, key=lambda c: (-_measure_priority_score(c), col_pos.get(c, 10**9)))
+    cats = _categorical_feature_candidates(df)
+    ordered: List[str] = []
+    for c in measures + cats + list(df.columns):
+        if c not in ordered:
+            ordered.append(c)
+    return ordered
+
+
+def _measure_priority_score(col: Any) -> int:
+    name = _col_name_l(col)
+    score = 0
+    for rank, token in enumerate(_VALUE_NAME_PRIORITY):
+        if token in name:
+            score = max(score, 100 - rank)
+    return score
+
+
+def _pick_preferred_numeric_measure(cols: List[str]) -> str | None:
+    if not cols:
+        return None
+    scored = []
+    for pos, col in enumerate(cols):
+        scored.append((_measure_priority_score(col), -pos, col))
+    scored.sort(reverse=True)
+    return scored[0][2]
 def _infer_eda_roles(df: pd.DataFrame, latest_info: dict | None) -> dict:
     """Heurystyczne wykrywanie typu zadania i ról kolumn.
     Korzysta z meta (task) oraz source_name z Etapu 1, a jak trzeba – z samych danych.
@@ -1923,7 +2140,7 @@ def _infer_eda_roles(df: pd.DataFrame, latest_info: dict | None) -> dict:
     task = None
 
     # polskie + angielskie warianty
-    if any(t in raw_task for t in ["szereg czasowy", "time series", "czasowy"]):
+    if any(t in raw_task for t in ["szereg czasowy", "time series", "czasowy"]) or re.search(r"(^|[^a-z])ts([^a-z]|$)", raw_task):
         task = "time_series"
     elif any(t in raw_task for t in ["klasteryzacja", "cluster", "segment"]):
         task = "clustering"
@@ -1942,12 +2159,16 @@ def _infer_eda_roles(df: pd.DataFrame, latest_info: dict | None) -> dict:
         if any(tok in c.lower() for tok in ["cluster", "segment", "segm", "klaster", "grupa", "group"])
     ]
 
-    # małoliczne kolumny (kandydaci na target klasyfikacyjny / kolumnę klastrów)
-    small_card_cols = [
-        c for c in df.columns
-        if 1 < nunique.get(c, 0) <= min(50, max(10, df.shape[0] // 10))
-    ]
-
+    # maloliczne kolumny (kandydaci na target klasyfikacyjny / kolumne klastrow)
+    small_card_cols = []
+    small_card_limit = min(50, max(10, df.shape[0] // 10))
+    for c in df.columns:
+        if _is_date_part_column(c) or _looks_like_identifier_name(c):
+            continue
+        if pd.api.types.is_datetime64_any_dtype(df[c]):
+            continue
+        if 1 < int(nunique.get(c, 0)) <= small_card_limit:
+            small_card_cols.append(c)
     if task is None:
         if cluster_candidates:
             task = "clustering"
@@ -2008,9 +2229,8 @@ def _infer_eda_roles(df: pd.DataFrame, latest_info: dict | None) -> dict:
             if task == "classification" and small_card_cols:
                 target = small_card_cols[0]
             elif task == "regression":
-                num_cols = df.select_dtypes(include="number").columns.tolist()
-                if num_cols:
-                    target = num_cols[-1]
+                num_cols = _numeric_measure_candidates(df, min_non_null=2, allow_low_cardinality=True)
+                target = _pick_preferred_numeric_measure(num_cols)
     roles["target"] = target
 
     return roles
@@ -2018,12 +2238,30 @@ def _infer_eda_roles(df: pd.DataFrame, latest_info: dict | None) -> dict:
 def _infer_logical_type(series: pd.Series) -> str:
     """
     Heurystyka 'logicznego' typu:
-      numeric / datetime / id_like / text_long / categorical
+      numeric / datetime / id_like / text_long / categorical / boolean / date_part
     """
-    if pd.api.types.is_numeric_dtype(series):
-        return "numeric"
+    col_name = getattr(series, "name", "")
+    if _is_date_part_column(col_name):
+        return "date_part"
+    if _is_bool_like_series(series):
+        return "boolean"
     if pd.api.types.is_datetime64_any_dtype(series):
         return "datetime"
+
+    non_null = series.dropna()
+    nunique = int(series.nunique(dropna=True))
+    ratio_unique = nunique / max(len(non_null), 1)
+
+    if pd.api.types.is_numeric_dtype(series):
+        integer_like = False
+        try:
+            sample = pd.to_numeric(non_null, errors="coerce").dropna().head(5000)
+            integer_like = bool(not sample.empty and float((sample - sample.round()).abs().max()) < 1e-9)
+        except Exception:
+            integer_like = False
+        if _looks_like_identifier_name(col_name) or (integer_like and ratio_unique > 0.90 and len(non_null) >= 50):
+            return "id_like"
+        return "numeric"
 
     sample = series.dropna().astype(str).head(200)
     if len(sample) > 0:
@@ -2031,9 +2269,7 @@ def _infer_logical_type(series: pd.Series) -> str:
         if parsed.notna().mean() > 0.9:
             return "datetime"
 
-    nunique = series.nunique(dropna=True)
-    ratio_unique = nunique / max(len(series), 1)
-    if ratio_unique > 0.9:
+    if _looks_like_identifier_name(col_name) or ratio_unique > 0.9:
         return "id_like"
 
     avg_len = (series.dropna().astype(str).str.len().mean()
@@ -2043,10 +2279,11 @@ def _infer_logical_type(series: pd.Series) -> str:
 
     return "categorical"
 
-
 def _try_detect_numeric_from_object(series: pd.Series) -> bool:
     """Czy obiektowa kolumna wygląda na liczbową po naszych regułach specjalnych?"""
     if series.dtype != object:
+        return False
+    if _is_date_part_column(getattr(series, "name", "")) or _looks_like_identifier_name(getattr(series, "name", "")):
         return False
     s = series.dropna().astype(str)
     if s.empty:
@@ -2457,12 +2694,13 @@ def _build_correlation_report(
 ) -> Tuple[alt.Chart | None, List[Dict[str, Any]], List[str]]:
     """Heatmapa i lista par korelacji dla kolumn numerycznych."""
     # Guard: tylko sensowne kolumny numeryczne
-    numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns if df[c].notna().sum() > 1]
+    numeric_cols = _numeric_measure_candidates(df, min_non_null=3)
     if len(numeric_cols) < 2:
         return None, [], []
 
     df_key = _df_cache_fingerprint(df)
-    corr_mat = stage2_cached("Stage2/7", (df_key, "corr_mat", tuple(numeric_cols)), lambda: df[numeric_cols].corr(method="pearson").fillna(0.0))
+    corr_source = pd.DataFrame({c: _numeric_series_for_candidate(df[c]) for c in numeric_cols})
+    corr_mat = stage2_cached("Stage2/7", (df_key, "corr_mat", tuple(numeric_cols)), lambda: corr_source.corr(method="pearson").fillna(0.0))
     if corr_mat.empty:
         return None, [], []
 
@@ -3243,8 +3481,8 @@ def _auto_prepare_for_training(
                 imputations[col] = f"mode='{fill_val}'"
 
     # Outliery + winsoryzacja
-    for col in df_work.select_dtypes(include=[np.number]).columns:
-        s = df_work[col]
+    for col in _numeric_measure_candidates(df_work, min_non_null=3):
+        s = pd.to_numeric(df_work[col], errors="coerce")
         q1 = s.quantile(0.25)
         q3 = s.quantile(0.75)
         if pd.isna(q1) or pd.isna(q3):
@@ -3893,8 +4131,8 @@ def _coerce_numeric_safe(s: pd.Series) -> pd.Series:
 def _guess_outcome_group_value_cols(df: pd.DataFrame) -> tuple[str|None, str|None, str|None]:
     cols = list(df.columns)
     # kandydaci
-    cat_cols = [c for c in cols if _is_categorical_like(df[c])]
-    num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c]) or _coerce_numeric_safe(df[c]).notna().any()]
+    cat_cols = _categorical_feature_candidates(df)
+    num_cols = _numeric_measure_candidates(df, min_non_null=2, allow_low_cardinality=True)
     # outcome: binarne / niska krotność
     binary = [c for c in cat_cols if df[c].nunique(dropna=True) == 2]
     prio_names = ["target","label","y","survived","churn","default","outcome"]
@@ -3923,7 +4161,7 @@ def _guess_cols_from_info_df(info_df: pd.DataFrame) -> Tuple[str | None, str | N
                 break
 
         # Value — numeric with sales/value/amount/qty semantics
-        num = cols.loc[cols["logical_type"].isin(["num", "int", "float"]) | cols["dtype_raw"].astype(str).str.contains("int|float", case=False, na=False)]
+        num = cols.loc[cols["logical_type"].isin(["num", "int", "float", "numeric"]) | cols["dtype_raw"].astype(str).str.contains("int|float", case=False, na=False)]
         value = None
         for pat in ["value", "wart", "sales", "sprzed", "amount", "revenue", "price", "qty", "quantity", "wolumen"]:
             hit = num.loc[num["name_l"].str.contains(pat, na=False), "kolumna"]
@@ -4053,7 +4291,7 @@ def _hero_time_series_overview(
 
     col_left, col_right = st.columns([4, 1.5])
 
-    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    num_cols = _numeric_measure_candidates(df, min_non_null=2)
     if not num_cols:
         st.info("Brak kolumn liczbowych – nie można narysować szeregu.")
         return
@@ -4168,7 +4406,7 @@ def _hero_time_series_overview(
             else:
                 # polyfit na czystych danych + bezpieczne obejście błędów LAPACK/SVD
                 try:
-                    slope = float(np.polyfit(x_idx, y_vals, 1)[0])
+                    slope = float(np.polyfit(x_fit, y_fit, 1)[0])
                 except np.linalg.LinAlgError:
                     slope = 0.0
 
@@ -4353,7 +4591,7 @@ def _hero_classification_overview(df: pd.DataFrame, y_col: str) -> None:
         )
         # Streamlit version compatibility: width='stretch' (new) vs use_container_width (old)
         # Streamlit multipage: avoid importing via "app.*" ("app" isn't a package at runtime)
-        from core.ui_safe import altair_chart_stretch
+        from core.ui_safe import altair_chart_stretch, dataframe_stretch
         altair_chart_stretch(st, chart)
     except Exception:
         # Streamlit multipage: avoid importing via "app.*" ("app" isn't a package at runtime)
@@ -4371,10 +4609,7 @@ def _hero_clustering_overview(df: pd.DataFrame, cluster_col: str | None) -> None
     # -------- LEWA: wybór osi + wykres -----------------
     with col_left:
         # kolumny numeryczne do osi X/Y
-        num_cols = [
-            c for c in df.columns
-            if pd.api.types.is_numeric_dtype(df[c])
-        ]
+        num_cols = _numeric_measure_candidates(df, min_non_null=2)
 
         if len(num_cols) < 2:
             st.info(
@@ -4383,10 +4618,7 @@ def _hero_clustering_overview(df: pd.DataFrame, cluster_col: str | None) -> None
             return
 
         # kolumny kategoryczne do kolorowania
-        cat_cols = [
-            c for c in df.columns
-            if not pd.api.types.is_numeric_dtype(df[c])
-        ]
+        cat_cols = _categorical_feature_candidates(df)
 
         # --- trzy selectboxy w jednej linii ---
         c1, c2, c3 = st.columns(3)
@@ -4431,7 +4663,12 @@ def _hero_clustering_overview(df: pd.DataFrame, cluster_col: str | None) -> None
         if color_choice != "(Brak)":
             cols_for_plot.append(color_choice)
 
-        df_plot = df[cols_for_plot].dropna()
+        df_plot = df[cols_for_plot].copy()
+        df_plot[x_col] = _numeric_series_for_candidate(df_plot[x_col])
+        df_plot[y_col] = _numeric_series_for_candidate(df_plot[y_col])
+        df_plot = df_plot.dropna(subset=[x_col, y_col])
+        if color_choice != "(Brak)":
+            df_plot = df_plot.dropna(subset=[color_choice])
 
         if df_plot.empty:
             st.info("Brak danych do wyświetlenia przestrzeni cech dla wybranych kolumn.")
@@ -5183,7 +5420,7 @@ def main():
     st.header("4. Analiza wybranej kolumny")
     st.caption("Zbadaj konkretną kolumnę: rozkład, odstające wartości, dominujące kategorie, pokrycie TOP segmentów.")
 
-    available_cols = list(df.columns)
+    available_cols = _ordered_analysis_columns(df)
     col_to_plot = st.selectbox(
         "Wybierz kolumnę do analizy:",
         options=available_cols,
@@ -6836,10 +7073,7 @@ def main():
                 f"Liczność klastra: **{len(df_cluster):,}** z **{len(df):,}** wszystkich rekordów."
             )
 
-            num_cols_profile = [
-                c for c in df.select_dtypes(include="number").columns
-                if c != cluster_col
-            ]
+            num_cols_profile = [c for c in _numeric_measure_candidates(df, min_non_null=3) if c != cluster_col]
             if not num_cols_profile or len(df_cluster) == 0:
                 st.info("Brak kolumn liczbowych lub pusty klaster – nie można policzyć profilu.")
             else:
@@ -7409,7 +7643,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
         _dup_banner_kind = "ok"
         _dup_banner_text = "Nie wykryto zduplikowanych pełnych wierszy."
 
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols = _numeric_measure_candidates(df, min_non_null=3)
     if numeric_cols:
         st.subheader("Podgląd wartości odstających — wybierz kolumnę numeryczną:", divider="gray")
         col_for_anomaly = st.selectbox("Kolumna do analizy anomalii", options=numeric_cols, index=0, label_visibility="collapsed")
@@ -7798,7 +8032,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                         options=list(df.columns),
                         default=basic_col_drop_default,
                     )
-                    numeric_cols_for_winsor = df.select_dtypes(include=[np.number]).columns.tolist()
+                    numeric_cols_for_winsor = _numeric_measure_candidates(df, min_non_null=3)
                     winsorize_cols_user = st.multiselect(
                         "Kolumny do przycięcia (winsoryzacja):",
                         options=numeric_cols_for_winsor,
@@ -8330,7 +8564,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
             if timings_df.empty:
                 st.caption("Brak danych timingowych (uruchom przygotowanie ponownie).")
             else:
-                st.dataframe(timings_df, width='stretch', hide_index=True)
+                st_df_safe(timings_df, width='stretch', hide_index=True)
 
         outlier_flags_count = len(prep_report["outlier_flags"])
         duplicates_removed  = prep_report["duplicates_removed"]
