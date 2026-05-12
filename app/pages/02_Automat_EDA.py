@@ -27,32 +27,52 @@ def _df_to_parquet(df: pd.DataFrame, path: Path) -> None:
     except Exception:
         df.to_parquet(path, index=False, compression="snappy")
 
-def _df_from_parquet(path: Path, max_rows: int | None = None) -> pd.DataFrame:
-    """Load Parquet. If max_rows is set, read only first N rows (fast preview)."""
+
+def _evenly_spaced_positions(total_rows: int, max_rows: int | None) -> np.ndarray | None:
+    """Deterministic row positions spread across the whole file."""
+    if max_rows is None:
+        return None
     try:
-        import pyarrow as pa
+        total = int(total_rows)
+        limit = int(max_rows)
+    except Exception:
+        return None
+    if limit <= 0 or total <= limit:
+        return None
+    return np.unique(np.linspace(0, total - 1, num=limit, dtype=np.int64))
+
+
+def _df_from_parquet(path: Path, max_rows: int | None = None) -> pd.DataFrame:
+    """Load Parquet. If max_rows is set, take an even sample from the whole file."""
+    try:
         import pyarrow.parquet as pq
         pf = pq.ParquetFile(path)
-        if not max_rows:
+        total_rows = int(getattr(pf.metadata, "num_rows", 0) or 0)
+        positions = _evenly_spaced_positions(total_rows, max_rows)
+        if positions is None:
             return pf.read().to_pandas()
 
-        batches = []
-        remaining = int(max_rows)
-        batch_size = max(1, min(remaining, 10_000))
-        for batch in pf.iter_batches(batch_size=batch_size):
-            if remaining <= 0:
-                break
-            if batch.num_rows > remaining:
-                batch = batch.slice(0, remaining)
-            batches.append(batch)
-            remaining -= batch.num_rows
-        if not batches:
+        frames: list[pd.DataFrame] = []
+        row_group_start = 0
+        for rg_idx in range(pf.num_row_groups):
+            rg_rows = int(pf.metadata.row_group(rg_idx).num_rows)
+            row_group_end = row_group_start + rg_rows
+            start_pos = int(np.searchsorted(positions, row_group_start, side="left"))
+            end_pos = int(np.searchsorted(positions, row_group_end, side="left"))
+            if end_pos > start_pos:
+                local_positions = positions[start_pos:end_pos] - row_group_start
+                rg_df = pf.read_row_group(rg_idx).to_pandas()
+                frames.append(rg_df.iloc[local_positions].copy())
+            row_group_start = row_group_end
+
+        if not frames:
             return pd.DataFrame()
-        return pa.Table.from_batches(batches, schema=pf.schema_arrow).to_pandas()
+        return pd.concat(frames, ignore_index=True)
     except Exception:
-        # fallback: pandas may still read full file
+        # fallback: pandas may still read the full file, then sample evenly
         df = pd.read_parquet(path)
-        return df.head(max_rows) if max_rows else df
+        positions = _evenly_spaced_positions(len(df), max_rows)
+        return df.iloc[positions].reset_index(drop=True) if positions is not None else df
 
 import streamlit as st
 
@@ -1858,19 +1878,8 @@ def _load_latest_dataset(max_rows: int | None = None) -> Tuple[pd.DataFrame | No
             read_limit = 500_000
         sample_note = None
         if read_limit:
-            random_sample_read_full = str(os.getenv("EDA_RANDOM_SAMPLE_READ_FULL", "0")).strip().lower() in {"1", "true", "yes", "tak"}
-            random_sample_max_mb = float(os.getenv("EDA_RANDOM_SAMPLE_MAX_MB", "50"))
-            if random_sample_read_full and size_mb <= random_sample_max_mb:
-                df_all = _df_from_parquet(path, max_rows=None)
-                if len(df_all) > read_limit:
-                    df = df_all.sample(n=read_limit, random_state=42).sort_index()
-                    sample_note = "robocza probke losowa"
-                else:
-                    df = df_all
-                    sample_note = "caly plik"
-            else:
-                df = _df_from_parquet(path, max_rows=read_limit)
-                sample_note = "szybka probke z pliku"
+            df = _df_from_parquet(path, max_rows=read_limit)
+            sample_note = "rownomierna probke z calego pliku"
         else:
             df = _df_from_parquet(path, max_rows=None)
         if read_limit:
@@ -4842,7 +4851,7 @@ def main():
             "⚡ Pracuj na próbce danych (szybsza EDA)",
             value=True,
             help=(
-                "Przy bardzo dużych zbiorach EDA będzie działać na losowej próbie danych, "
+                "Przy bardzo dużych zbiorach EDA będzie działać na równomiernej próbie z całego pliku, "
                 "a pełny zbiór zostanie wykorzystany później do trenowania modelu."
             ),
             key="eda_use_sample",
@@ -4906,8 +4915,8 @@ def main():
     eda_debug_slots = None
 
     # 0) Wczytanie danych
-    # Etap 2 na DO/Streamlit CC nie może najpierw ładować całego Parquetu,
-    # bo proces z 1 GB RAM potrafi zostać ubity zanim powstanie próbka.
+    # Etap 2 na DO/Streamlit CC probkuje bez brania samego poczatku pliku.
+    # Dla szeregów czasowych to krytyczne: próbka musi widzieć cały zakres dat.
     load_sample_rows = None
     if "use_sample" in locals() and "sample_rows_eda" in locals() and use_sample:
         load_sample_rows = int(sample_rows_eda)
@@ -4917,8 +4926,8 @@ def main():
         st.error(err)
         st.stop()
 
-    # W trybie próbki _load_latest_dataset zwraca już próbkę odczytaną bezpośrednio
-    # z Parquetu, więc nie wykonujemy kosztownego df_full.sample(...) po pełnym loadzie.
+    # W trybie próbki _load_latest_dataset zwraca juz rownomierna próbkę z calego
+    # Parquetu, więc nie wykonujemy kosztownego df_full.sample(...) po pelnym loadzie.
     df = df_full
     is_sampled = False
 
