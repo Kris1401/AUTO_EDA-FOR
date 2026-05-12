@@ -1858,8 +1858,9 @@ def _load_latest_dataset(max_rows: int | None = None) -> Tuple[pd.DataFrame | No
             read_limit = 500_000
         sample_note = None
         if read_limit:
+            random_sample_read_full = str(os.getenv("EDA_RANDOM_SAMPLE_READ_FULL", "0")).strip().lower() in {"1", "true", "yes", "tak"}
             random_sample_max_mb = float(os.getenv("EDA_RANDOM_SAMPLE_MAX_MB", "50"))
-            if size_mb <= random_sample_max_mb:
+            if random_sample_read_full and size_mb <= random_sample_max_mb:
                 df_all = _df_from_parquet(path, max_rows=None)
                 if len(df_all) > read_limit:
                     df = df_all.sample(n=read_limit, random_state=42).sort_index()
@@ -1869,7 +1870,7 @@ def _load_latest_dataset(max_rows: int | None = None) -> Tuple[pd.DataFrame | No
                     sample_note = "caly plik"
             else:
                 df = _df_from_parquet(path, max_rows=read_limit)
-                sample_note = "pierwsza lekka probke"
+                sample_note = "szybka probke z pliku"
         else:
             df = _df_from_parquet(path, max_rows=None)
         if read_limit:
@@ -1887,12 +1888,11 @@ def _calc_global_missing_pct(df: pd.DataFrame) -> float:
     """Procent braków w całym dataframe, licząc NaNy + puste stringi."""
     if df.shape[0] == 0 or df.shape[1] == 0:
         return 0.0
-    tmp = df.copy()
-    obj_cols = tmp.select_dtypes(include=["object"]).columns
-    for c in obj_cols:
-        tmp[c] = tmp[c].replace("", np.nan)
-    total_cells = tmp.shape[0] * tmp.shape[1]
-    missing_cells = tmp.isna().sum().sum()
+    total_cells = df.shape[0] * df.shape[1]
+    missing_cells = int(df.isna().sum().sum())
+    obj_cols = df.select_dtypes(include=["object"]).columns
+    if len(obj_cols):
+        missing_cells += int(df[obj_cols].eq("").sum().sum())
     return round(100.0 * (missing_cells / max(total_cells, 1)), 2)
 
 # ───────────────────── ROLES & HERO CHARTS (TASK-AWARE EDA) ─────────────────────
@@ -1917,6 +1917,7 @@ _VALUE_NAME_PRIORITY = (
     "target", "line_value", "value", "sales", "sprzed", "revenue", "amount",
     "total", "price", "qty", "quantity", "cost", "margin", "profit", "score",
 )
+_TYPE_DETECTION_SAMPLE_ROWS = int(os.getenv("EDA_TYPE_DETECTION_SAMPLE_ROWS", "1000"))
 
 
 def _col_name_l(col: Any) -> str:
@@ -1980,6 +1981,19 @@ def _numeric_series_for_candidate(series: pd.Series) -> pd.Series:
         return pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
 
 
+def _sample_non_null_for_detection(series: pd.Series, max_rows: int | None = None) -> pd.Series:
+    """Small deterministic sample for cheap type detection on text-heavy columns."""
+    limit = int(max_rows or _TYPE_DETECTION_SAMPLE_ROWS)
+    try:
+        s = series.dropna()
+        if len(s) <= limit:
+            return s
+        # Head is intentional here: it avoids full random sampling work on large frames.
+        return s.head(limit)
+    except Exception:
+        return series.dropna().head(limit)
+
+
 def _is_numeric_measure_candidate(
     df: pd.DataFrame,
     col: Any,
@@ -2000,6 +2014,8 @@ def _is_numeric_measure_candidate(
     if not name or name.startswith(_TECH_PREFIXES) or _is_date_part_column(col):
         return False
     if pd.api.types.is_datetime64_any_dtype(s) or _is_bool_like_series(s):
+        return False
+    if not pd.api.types.is_numeric_dtype(s) and not _try_detect_numeric_from_object(s):
         return False
 
     sn = _numeric_series_for_candidate(s)
@@ -2263,7 +2279,7 @@ def _infer_logical_type(series: pd.Series) -> str:
             return "id_like"
         return "numeric"
 
-    sample = series.dropna().astype(str).head(200)
+    sample = _sample_non_null_for_detection(series, 200).astype(str)
     if len(sample) > 0:
         parsed = pd.to_datetime(sample, errors="coerce", utc=False)
         if parsed.notna().mean() > 0.9:
@@ -2272,8 +2288,8 @@ def _infer_logical_type(series: pd.Series) -> str:
     if _looks_like_identifier_name(col_name) or ratio_unique > 0.9:
         return "id_like"
 
-    avg_len = (series.dropna().astype(str).str.len().mean()
-               if len(series.dropna()) > 0 else 0)
+    text_sample = _sample_non_null_for_detection(series, 1000).astype(str)
+    avg_len = (text_sample.str.len().mean() if len(text_sample) > 0 else 0)
     if avg_len and avg_len > 50:
         return "text_long"
 
@@ -2285,7 +2301,7 @@ def _try_detect_numeric_from_object(series: pd.Series) -> bool:
         return False
     if _is_date_part_column(getattr(series, "name", "")) or _looks_like_identifier_name(getattr(series, "name", "")):
         return False
-    s = series.dropna().astype(str)
+    s = _sample_non_null_for_detection(series).astype(str)
     if s.empty:
         return False
 
@@ -2309,29 +2325,45 @@ def _augment_numeric_derivatives_for_ui(df: pd.DataFrame) -> pd.DataFrame:
 
         # --- object: użyj Twoich parserów specjalnych ---
         if s.dtype == object:
-            ss = s.astype(str)
-            sec = ss.map(_parse_duration_to_seconds)
-            if pd.notna(sec).sum() >= max(5, int(0.6 * len(ss.dropna()))):
+            sample = _sample_non_null_for_detection(s).astype(str)
+            if sample.empty:
+                continue
+            sample_threshold = max(5, int(0.6 * len(sample)))
+            ss = None
+
+            def _full_strings() -> pd.Series:
+                nonlocal ss
+                if ss is None:
+                    ss = s.astype(str)
+                return ss
+
+            sec_sample = sample.map(_parse_duration_to_seconds)
+            if pd.notna(sec_sample).sum() >= sample_threshold:
+                sec = _full_strings().map(_parse_duration_to_seconds)
                 out[f"{col}_sec"] = pd.to_numeric(sec, errors="coerce")
                 continue
 
-            pace = ss.map(_parse_pace_min_per_km_to_sec_per_km)
-            if pd.notna(pace).sum() >= max(5, int(0.6 * len(ss.dropna()))):
+            pace_sample = sample.map(_parse_pace_min_per_km_to_sec_per_km)
+            if pd.notna(pace_sample).sum() >= sample_threshold:
+                pace = _full_strings().map(_parse_pace_min_per_km_to_sec_per_km)
                 out[f"{col}_sec_per_km"] = pd.to_numeric(pace, errors="coerce")
                 continue
 
-            perc = ss.map(_parse_percentage)
-            if pd.notna(perc).sum() >= max(5, int(0.6 * len(ss.dropna()))):
+            perc_sample = sample.map(_parse_percentage)
+            if pd.notna(perc_sample).sum() >= sample_threshold:
+                perc = _full_strings().map(_parse_percentage)
                 out[f"{col}_pct"] = pd.to_numeric(perc, errors="coerce")
                 continue
 
-            kmh = ss.map(_parse_kmh)
-            if pd.notna(kmh).sum() >= max(5, int(0.6 * len(ss.dropna()))):
+            kmh_sample = sample.map(_parse_kmh)
+            if pd.notna(kmh_sample).sum() >= sample_threshold:
+                kmh = _full_strings().map(_parse_kmh)
                 out[f"{col}_kmh"] = pd.to_numeric(kmh, errors="coerce")
                 continue
 
-            cur = ss.map(_parse_currency_or_plain_number)
-            if pd.notna(cur).sum() >= max(5, int(0.6 * len(ss.dropna()))):
+            cur_sample = sample.map(_parse_currency_or_plain_number)
+            if pd.notna(cur_sample).sum() >= sample_threshold:
+                cur = _full_strings().map(_parse_currency_or_plain_number)
                 out[f"{col}_num"] = pd.to_numeric(cur, errors="coerce")
                 continue
 
@@ -2349,7 +2381,7 @@ def _augment_numeric_derivatives_for_ui(df: pd.DataFrame) -> pd.DataFrame:
 
 def _try_detect_datetime_from_object(series: pd.Series) -> bool:
     if series.dtype == object:
-        sample = series.dropna().astype(str).head(200)
+        sample = _sample_non_null_for_detection(series, 200).astype(str)
         if len(sample) == 0:
             return False
         parsed = pd.to_datetime(sample, errors="coerce", utc=False)
@@ -2483,11 +2515,10 @@ def _analyze_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
         dtype_raw = str(s.dtype)
         logical = _infer_logical_type(s)
 
-        s_na_test = s.copy()
-        if s_na_test.dtype == object:
-            s_na_test = s_na_test.replace("", np.nan)
-
-        null_cnt = int(s_na_test.isna().sum())
+        if s.dtype == object:
+            null_cnt = int(s.isna().sum() + s.eq("").sum())
+        else:
+            null_cnt = int(s.isna().sum())
         null_pct = (null_cnt / max(n_rows, 1)) * 100.0 if n_rows else 0.0
         nunique = int(s.nunique(dropna=True))
 
@@ -4673,6 +4704,9 @@ def _hero_clustering_overview(df: pd.DataFrame, cluster_col: str | None) -> None
         if df_plot.empty:
             st.info("Brak danych do wyświetlenia przestrzeni cech dla wybranych kolumn.")
             return
+        if len(df_plot) > 5_000:
+            df_plot = df_plot.sample(5_000, random_state=42)
+            st.caption("Pokazuję próbkę 5,000 punktów, żeby wykres pozostał responsywny.")
 
         tooltip_fields = [x_col, y_col]
         encodings = {
@@ -4825,9 +4859,18 @@ def main():
 
     # ───────────────────────── SIDEBAR: Lektor & TL;DR ─────────────────────────
     with st.sidebar.expander("🎙️ Lektor & TL;DR", expanded=False):
-        fast_sidebar = st.checkbox("🧠 Generuj TL;DR (OpenAI)", value=True,
-                                  help="4–6 zwięzłych zdań na bazie metryk i wniosków")
-        openai_tldr_model = st.selectbox("OpenAI TL;DR model", ["gpt-4o-mini", "gpt-4o"], index=0)
+        fast_sidebar = st.checkbox(
+            "🧠 Generuj TL;DR (OpenAI)",
+            value=False,
+            key="eda_generate_tldr",
+            help="4–6 zwięzłych zdań na bazie metryk i wniosków",
+        )
+        openai_tldr_model = st.selectbox(
+            "OpenAI TL;DR model",
+            ["gpt-4o-mini", "gpt-4o"],
+            index=0,
+            disabled=not fast_sidebar,
+        )
         
         # defensywne domyślne wartości; dzięki temu zmienne zawsze istnieją
         openai_voice_selected = None
@@ -4836,7 +4879,7 @@ def main():
         eleven_tts_model_selected = os.getenv("ELEVEN_TTS_MODEL", "eleven_multilingual_v2")
 
         st.markdown("---")
-        st.checkbox("✅ Włącz lektora (TTS)", value=True, key="tts_enabled")
+        st.checkbox("✅ Włącz lektora (TTS)", value=False, key="tts_enabled")
 
         # Dostawca TTS: w Etapie 2 blokujemy wybór (zostawiamy OpenAI).
         provider = 'OpenAI'
@@ -4885,10 +4928,6 @@ def main():
     except Exception:
         is_sampled = bool(load_sample_rows and df.shape[0] >= int(load_sample_rows))
 
-    # ➜ na potrzeby Sekcji 2–6 dorzuć warianty liczbowe (np. Czas_sec)
-    df = _augment_numeric_derivatives_for_ui(df)
-    df = _eda_attach_temp_clusters_to_df(df)
-
     # -------------------------------------------------------------
     # CACHE core obliczeń per-dataset (żeby nie liczyć w kółko)
     # -------------------------------------------------------------
@@ -4920,14 +4959,17 @@ def main():
     core_sig = f"{sig_now}|sample={sample_flag}|n={sample_n}"
 
     if st.session_state.get("_cached_df_aug_sig") != core_sig:
-        st.session_state["_cached_df_aug"] = _augment_numeric_derivatives_for_ui(df)
+        df_aug_cached = _augment_numeric_derivatives_for_ui(df)
+        df_aug_cached = _eda_attach_temp_clusters_to_df(df_aug_cached)
+        st.session_state["_cached_df_aug"] = df_aug_cached
         st.session_state["_cached_df_aug_sig"] = core_sig
 
     if st.session_state.get("_cached_roles_sig") != core_sig:
-        st.session_state["_cached_roles"] = _infer_eda_roles(df, latest_info)
+        st.session_state["_cached_roles"] = _infer_eda_roles(st.session_state["_cached_df_aug"], latest_info)
         st.session_state["_cached_roles_sig"] = core_sig
 
     df_aug = st.session_state["_cached_df_aug"]
+    df = df_aug
     roles  = st.session_state["_cached_roles"]
 
     # ─────────────────────────────────────────────────────────────
@@ -4960,7 +5002,7 @@ def main():
     # Informacja dla użytkownika o pracy na próbce
     if "is_sampled" in locals() and is_sampled:
         st.caption(
-            f"⚡ EDA pracuje teraz na losowej próbie **{df.shape[0]:,}** wierszy "
+            f"⚡ EDA pracuje teraz na roboczej próbie **{df.shape[0]:,}** wierszy "
             f"z pełnego zbioru **{n_rows_raw:,}**. "
             "Pełny zbiór zostawiamy do trenowania modelu w kolejnym etapie."
         )
@@ -5508,7 +5550,7 @@ def main():
                     st.info("Brak danych jednocześnie w wybranej kolumnie i w targetcie.")
                 else:
                     # ─── próbkujemy dla wydajności ───
-                    MAX_PTS = 20000
+                    MAX_PTS = 5000
                     if len(df_num) > MAX_PTS:
                         df_plot = df_num.sample(MAX_PTS, random_state=42)
                         st.caption(f"Pokazuję próbkę {MAX_PTS:,} punktów (dla wydajności).")
@@ -7762,15 +7804,52 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
 
     # ── CTA do odsłonięcia sekcji 7 (PRIMARY) ──────────────────────────────────
     if not st.session_state["sec7_revealed"]:
-        if st.button("✨ Zrób podsumowanie (AI)", type="primary", 
-                    help="Wygeneruj narrację – odsłoni to całą sekcję 7."):
+        summary_cta_label = "✨ Zrób podsumowanie (AI)" if fast_sidebar else "✨ Zrób podsumowanie"
+        summary_cta_help = (
+            "Wygeneruj narrację – odsłoni to całą sekcję 7."
+            if fast_sidebar
+            else "Pokaż deterministyczne podsumowanie bez wywołania OpenAI."
+        )
+        if st.button(summary_cta_label, type="primary", help=summary_cta_help):
             st.session_state["sec7_revealed"] = True
             st.session_state["play_tts_now"] = True
 
     run_prep = False
     if st.session_state["sec7_revealed"]:
+        ai_tldr_enabled = bool(fast_sidebar)
         if (
-            _get_env_or_secret("OPENAI_API_KEY")
+            ai_tldr_enabled
+            and (st.session_state.get("eda_summary_debug_v1") or {}).get("final_source") == "deterministic_no_ai"
+        ):
+            st.session_state["latest_summary_text"] = ""
+            st.session_state.pop("eda_summary_debug_v1", None)
+
+        if not ai_tldr_enabled and not st.session_state.get("latest_summary_text"):
+            summary_text = _make_eda_summary_text(
+                source_name=source_name,
+                readiness_score=readiness_score,
+                duplicates_count=duplicates_count,
+                global_missing_pct=global_missing_pct,
+                auto_drop_candidates=auto_drop_candidates,
+                prep_report=None,
+            )
+            st.session_state["latest_summary_text"] = summary_text
+            st.session_state["eda_summary_debug_v1"] = {
+                "render_key": "deterministic_no_ai",
+                "model": None,
+                "raw_text": None,
+                "gate_ok": True,
+                "gate_reasons": [],
+                "used_fallback": False,
+                "error": None,
+                "postprocessed": False,
+                "final_one_sentence": "",
+                "final_source": "deterministic_no_ai",
+            }
+
+        if (
+            ai_tldr_enabled
+            and _get_env_or_secret("OPENAI_API_KEY")
             and (st.session_state.get("eda_summary_debug_v1") or {}).get("used_fallback")
             and not st.session_state.get("eda_ai_retry_after_secret_fix_v1")
         ):
@@ -7779,7 +7858,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
             st.session_state["eda_ai_retry_after_secret_fix_v1"] = True
 
         # ── Przygotowanie promptu do TL;DR (raz) ────────────────────────────────
-        if not st.session_state.get("latest_summary_text"):
+        if ai_tldr_enabled and not st.session_state.get("latest_summary_text"):
             base_facts = [
                 f"Liczba wierszy × kolumn: {n_rows_raw} × {n_cols_raw}",
                 f"Braki danych (globalnie): ~{global_missing_pct:.1f}%",
@@ -7799,7 +7878,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
             )
 
         # ── Generowanie TL;DR tylko gdy pusto ───────────────────────────────────
-        if not st.session_state.get("latest_summary_text"):
+        if ai_tldr_enabled and not st.session_state.get("latest_summary_text"):
             with st.spinner("⏳ Generuję podsumowanie (AI) i narrację lektora…"):
                 summary_text = ""
                 trace = lf.trace(
@@ -7864,7 +7943,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
             summary_text = st.session_state["latest_summary_text"]
 
         current_summary_debug = st.session_state.get("eda_summary_debug_v1") or {}
-        if not current_summary_debug:
+        if ai_tldr_enabled and not current_summary_debug:
             trace = lf.trace(
                 name="eda_tldr_gate",
                 user_id=st.session_state.get("wf_session_id", "anon"),
@@ -7894,6 +7973,20 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                 trace=trace,
             )
             st.session_state["latest_summary_text"] = summary_text
+        elif not current_summary_debug:
+            current_summary_debug = {
+                "render_key": "deterministic_no_ai",
+                "model": None,
+                "raw_text": None,
+                "gate_ok": True,
+                "gate_reasons": [],
+                "used_fallback": False,
+                "error": None,
+                "postprocessed": False,
+                "final_one_sentence": "",
+                "final_source": "deterministic_no_ai",
+            }
+            st.session_state["eda_summary_debug_v1"] = current_summary_debug
         else:
             _eda_record_checkpoint(
                 "eda.summary.cache_hit",
@@ -7906,11 +7999,11 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                 model=current_summary_debug.get("model"),
             )
 
-        if current_summary_debug.get("used_fallback"):
+        if ai_tldr_enabled and current_summary_debug.get("used_fallback"):
             st.warning("AI nie spelnilo wymagan gate dla TL;DR; pokazuje wersje deterministyczna.")
 
         # ── TL;DR: podgląd i edycja ─────────────────────────────────────────────
-        st.subheader("Podsumowanie (AI)", divider="gray")
+        st.subheader("Podsumowanie (AI)" if ai_tldr_enabled else "Podsumowanie", divider="gray")
         tab_view, tab_edit = st.tabs(["📄 Podsumowanie", "✍️ Edytuj tekst i zapisz"])
 
         with tab_view:
@@ -7957,7 +8050,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
 
         # --- Autoodtwarzanie TTS przy późniejszym odświeżaniu --- 
         _text_for_tts = (st.session_state.get("latest_summary_text", "") or "").strip()
-        tts_enabled   = st.session_state.get("tts_enabled", True)
+        tts_enabled   = st.session_state.get("tts_enabled", False)
 
         cur_tts_hash = _hash_key(
             _text_for_tts,
@@ -7971,7 +8064,8 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
         explicit_trigger = st.session_state.get("play_tts_now", False)
 
         should_play = (
-            tts_enabled
+            ai_tldr_enabled
+            and tts_enabled
             and _text_for_tts
             and (explicit_trigger or (last_tts_hash != cur_tts_hash))
         )
