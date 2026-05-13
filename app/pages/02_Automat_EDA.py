@@ -4404,7 +4404,14 @@ def _hero_time_series_overview(
 
         # mapowanie agregacji
         rule_map = {"Dzień": "D", "Tydzień": "W", "Miesiąc": "M", "Rok": "Y"}
+        x_title_map = {
+            "Dzień": "Data (dzień)",
+            "Tydzień": "Tydzień",
+            "Miesiąc": "Miesiąc",
+            "Rok": "Rok",
+        }
         rule = rule_map.get(agg_choice)
+        x_axis_title = x_title_map.get(agg_choice, x_choice)
 
         if x_choice == "Numer wiersza (pseudo-czas)":
             # pseudo-czas → oś numeryczna; agregujemy przez grupowanie co N wierszy
@@ -4447,7 +4454,7 @@ def _hero_time_series_overview(
                     .rename(columns={"__x__": "__x__", y_col: y_col})
                 )
 
-            x_enc = alt.X("__x__:T", title=x_choice)
+            x_enc = alt.X("__x__:T", title=x_axis_title)
 
         # finalne czyszczenie po wcześniejszej agregacji
         plot_df = plot_df.dropna(subset=["__x__", y_col])
@@ -4542,7 +4549,10 @@ def _hero_time_series_overview(
                 x=x_enc,
                 y=alt.Y(f"{y_col}:Q", title=y_col),
                 tooltip=[
-                    alt.Tooltip("__x__:T" if x_choice != "Numer wiersza (pseudo-czas)" else "__x__:Q", title=x_choice),
+                    alt.Tooltip(
+                        "__x__:T" if x_choice != "Numer wiersza (pseudo-czas)" else "__x__:Q",
+                        title=x_axis_title if x_choice != "Numer wiersza (pseudo-czas)" else x_choice,
+                    ),
                     alt.Tooltip(f"{y_col}:Q", title=y_col, format=".3g"),
                 ],
             )
