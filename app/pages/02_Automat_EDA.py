@@ -4494,6 +4494,13 @@ def _hero_time_series_overview(
         }
         rule = rule_map.get(agg_choice)
         x_axis_title = x_title_map.get(agg_choice, x_choice)
+        x_axis_format_map = {
+            "Dzień": "%Y-%m-%d",
+            "Tydzień": "%Y-%m-%d",
+            "Miesiąc": "%Y-%m",
+            "Rok": "%Y",
+        }
+        x_axis_format = x_axis_format_map.get(agg_choice, "%Y-%m-%d")
 
         if x_choice == "Numer wiersza (pseudo-czas)":
             # pseudo-czas → oś numeryczna; agregujemy przez grupowanie co N wierszy
@@ -4536,7 +4543,16 @@ def _hero_time_series_overview(
                     .rename(columns={"__x__": "__x__", y_col: y_col})
                 )
 
-            x_enc = alt.X("__x__:T", title=x_axis_title)
+            x_enc = alt.X(
+                "__x__:T",
+                axis=alt.Axis(
+                    title=x_axis_title,
+                    format=x_axis_format,
+                    labelAngle=-35,
+                    labelOverlap="greedy",
+                    labelLimit=140,
+                ),
+            )
 
         # finalne czyszczenie po wcześniejszej agregacji
         plot_df = plot_df.dropna(subset=["__x__", y_col])
