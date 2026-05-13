@@ -45,6 +45,7 @@ def _evenly_spaced_positions(total_rows: int, max_rows: int | None) -> np.ndarra
 def _df_from_parquet(path: Path, max_rows: int | None = None) -> pd.DataFrame:
     """Load Parquet. If max_rows is set, take an even sample from the whole file."""
     try:
+        import pyarrow as pa
         import pyarrow.parquet as pq
         pf = pq.ParquetFile(path)
         total_rows = int(getattr(pf.metadata, "num_rows", 0) or 0)
@@ -53,26 +54,26 @@ def _df_from_parquet(path: Path, max_rows: int | None = None) -> pd.DataFrame:
             return pf.read().to_pandas()
 
         frames: list[pd.DataFrame] = []
-        row_group_start = 0
-        for rg_idx in range(pf.num_row_groups):
-            rg_rows = int(pf.metadata.row_group(rg_idx).num_rows)
-            row_group_end = row_group_start + rg_rows
-            start_pos = int(np.searchsorted(positions, row_group_start, side="left"))
-            end_pos = int(np.searchsorted(positions, row_group_end, side="left"))
+        batch_start = 0
+        for batch in pf.iter_batches(batch_size=32_768):
+            batch_rows = int(batch.num_rows)
+            batch_end = batch_start + batch_rows
+            start_pos = int(np.searchsorted(positions, batch_start, side="left"))
+            end_pos = int(np.searchsorted(positions, batch_end, side="left"))
             if end_pos > start_pos:
-                local_positions = positions[start_pos:end_pos] - row_group_start
-                rg_df = pf.read_row_group(rg_idx).to_pandas()
-                frames.append(rg_df.iloc[local_positions].copy())
-            row_group_start = row_group_end
+                local_positions = positions[start_pos:end_pos] - batch_start
+                table = pa.Table.from_batches([batch])
+                idx = pa.array(local_positions.astype(np.int64), type=pa.int64())
+                frames.append(table.take(idx).to_pandas())
+            batch_start = batch_end
 
         if not frames:
             return pd.DataFrame()
         return pd.concat(frames, ignore_index=True)
     except Exception:
-        # fallback: pandas may still read the full file, then sample evenly
-        df = pd.read_parquet(path)
-        positions = _evenly_spaced_positions(len(df), max_rows)
-        return df.iloc[positions].reset_index(drop=True) if positions is not None else df
+        if max_rows is not None:
+            raise
+        return pd.read_parquet(path)
 
 import streamlit as st
 
@@ -1760,13 +1761,87 @@ def _make_eda_summary_text(
 
 # =====================  UTILITIES  =======================
 
+def _stage2_repo_root() -> Path:
+    try:
+        return Path(__file__).resolve().parents[2]
+    except Exception:
+        return Path.cwd()
+
+
+def _iter_ingest_roots() -> list[Path]:
+    roots: list[Path] = []
+    try:
+        cfg, _ = load_config()
+        roots.append(resolve_artifacts_dir(cfg) / "ingest")
+    except Exception:
+        pass
+
+    repo_root = _stage2_repo_root()
+    roots.extend(
+        [
+            repo_root / "artifacts" / "ingest",
+            repo_root / "app" / "artifacts" / "ingest",
+            Path.cwd() / "artifacts" / "ingest",
+        ]
+    )
+
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def _resolve_existing_artifact_path(raw_path: Any, *, expect_dir: bool = False) -> Path | None:
+    if raw_path is None:
+        return None
+    text = str(raw_path).strip()
+    if not text:
+        return None
+
+    raw = Path(text)
+    candidates: list[Path] = [raw]
+    if not raw.is_absolute():
+        repo_root = _stage2_repo_root()
+        candidates.extend([repo_root / raw, Path.cwd() / raw])
+        for ingest_root in _iter_ingest_roots():
+            candidates.append(ingest_root / raw)
+
+    for candidate in candidates:
+        try:
+            if expect_dir and candidate.is_dir():
+                return candidate.resolve()
+            if not expect_dir and candidate.is_file():
+                return candidate.resolve()
+        except Exception:
+            continue
+    return None
+
+
 def _valid_latest_artifacts(info: dict | None) -> dict | None:
     if not isinstance(info, dict):
         return None
     parquet_path = info.get("parquet_path") or info.get("csv_path")
-    if parquet_path and os.path.exists(str(parquet_path)):
-        return info
-    return None
+    resolved_parquet = _resolve_existing_artifact_path(parquet_path)
+    if resolved_parquet is None:
+        return None
+
+    valid = dict(info)
+    valid["parquet_path"] = str(resolved_parquet)
+    valid.pop("csv_path", None)
+
+    meta_path = _resolve_existing_artifact_path(valid.get("meta_path"))
+    if meta_path is not None:
+        valid["meta_path"] = str(meta_path)
+    run_dir = _resolve_existing_artifact_path(valid.get("run_dir"), expect_dir=True)
+    if run_dir is not None:
+        valid["run_dir"] = str(run_dir)
+    else:
+        valid["run_dir"] = str(resolved_parquet.parent)
+    return valid
 
 
 def _remember_latest_artifacts(info: dict | None) -> dict | None:
@@ -1781,26 +1856,25 @@ def _remember_latest_artifacts(info: dict | None) -> dict | None:
 
 def _restore_latest_artifacts_from_disk() -> dict | None:
     """Recover Stage 1 artifacts after Streamlit reruns/reconnects."""
-    try:
-        cfg, _ = load_config()
-        ingest_root = resolve_artifacts_dir(cfg) / "ingest"
-    except Exception:
-        return None
+    ingest_roots = _iter_ingest_roots()
 
-    pointer = ingest_root / "latest_artifacts.json"
-    if pointer.exists():
+    for ingest_root in ingest_roots:
+        pointer = ingest_root / "latest_artifacts.json"
+        if pointer.exists():
+            try:
+                info = json.loads(pointer.read_text(encoding="utf-8"))
+                valid = _remember_latest_artifacts(info)
+                if valid:
+                    return valid
+            except Exception:
+                pass
+
+    run_dirs: list[Path] = []
+    for ingest_root in ingest_roots:
         try:
-            info = json.loads(pointer.read_text(encoding="utf-8"))
-            valid = _remember_latest_artifacts(info)
-            if valid:
-                return valid
+            run_dirs.extend([p for p in ingest_root.iterdir() if p.is_dir()])
         except Exception:
-            pass
-
-    try:
-        run_dirs = [p for p in ingest_root.iterdir() if p.is_dir()]
-    except Exception:
-        run_dirs = []
+            continue
     run_dirs.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
 
     for run_dir in run_dirs:
@@ -1847,8 +1921,12 @@ def _restore_latest_artifacts_from_disk() -> dict | None:
             valid = _remember_latest_artifacts(info)
             if valid:
                 try:
-                    ingest_root.mkdir(parents=True, exist_ok=True)
-                    pointer.write_text(json.dumps(valid, ensure_ascii=False, indent=2), encoding="utf-8")
+                    for ingest_root in ingest_roots[:1]:
+                        ingest_root.mkdir(parents=True, exist_ok=True)
+                        (ingest_root / "latest_artifacts.json").write_text(
+                            json.dumps(valid, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
                 except Exception:
                     pass
                 return valid
@@ -1876,14 +1954,18 @@ def _load_latest_dataset(max_rows: int | None = None) -> Tuple[pd.DataFrame | No
         )
 
     parquet_path = latest_info.get("parquet_path") or latest_info.get("csv_path")
-    if not parquet_path or not os.path.exists(parquet_path):
+    resolved_path = _resolve_existing_artifact_path(parquet_path)
+    if resolved_path is None:
         return None, latest_info, (
             f"Nie mogę znaleźć pliku z danymi: {parquet_path!r}. "
             "Najpierw przejdź do 'Analiza Danych' i kliknij "
             "'Przelicz teraz (pełny zbiór)'."
         )
 
-    path = Path(parquet_path)
+    path = resolved_path
+    latest_info = dict(latest_info)
+    latest_info["parquet_path"] = str(path)
+    latest_info.pop("csv_path", None)
     try:
         size_mb = path.stat().st_size / (1024 * 1024)
         read_limit = int(max_rows) if max_rows and max_rows > 0 else None
