@@ -1769,6 +1769,16 @@ def _valid_latest_artifacts(info: dict | None) -> dict | None:
     return None
 
 
+def _remember_latest_artifacts(info: dict | None) -> dict | None:
+    """Keep the last known-good Stage 1 pointer across widget reruns."""
+    valid = _valid_latest_artifacts(info)
+    if valid:
+        st.session_state["latest_artifacts"] = valid
+        st.session_state["_stage2_last_valid_artifacts"] = valid
+        return valid
+    return None
+
+
 def _restore_latest_artifacts_from_disk() -> dict | None:
     """Recover Stage 1 artifacts after Streamlit reruns/reconnects."""
     try:
@@ -1781,9 +1791,8 @@ def _restore_latest_artifacts_from_disk() -> dict | None:
     if pointer.exists():
         try:
             info = json.loads(pointer.read_text(encoding="utf-8"))
-            valid = _valid_latest_artifacts(info)
+            valid = _remember_latest_artifacts(info)
             if valid:
-                st.session_state["latest_artifacts"] = valid
                 return valid
         except Exception:
             pass
@@ -1835,9 +1844,8 @@ def _restore_latest_artifacts_from_disk() -> dict | None:
                 "source_kind": meta_json.get("source_kind") or "uploaded",
                 "timestamp": meta_json.get("timestamp") or "",
             }
-            valid = _valid_latest_artifacts(info)
+            valid = _remember_latest_artifacts(info)
             if valid:
-                st.session_state["latest_artifacts"] = valid
                 try:
                     ingest_root.mkdir(parents=True, exist_ok=True)
                     pointer.write_text(json.dumps(valid, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1851,10 +1859,16 @@ def _restore_latest_artifacts_from_disk() -> dict | None:
 
 def _load_latest_dataset(max_rows: int | None = None) -> Tuple[pd.DataFrame | None, dict | None, str | None]:
     """Wczytuje zbiór z poprzedniego kroku (PARQUET only)."""
-    latest_info = _valid_latest_artifacts(st.session_state.get("latest_artifacts"))
+    latest_info = _remember_latest_artifacts(st.session_state.get("latest_artifacts"))
+    if latest_info is None:
+        latest_info = _remember_latest_artifacts(st.session_state.get("_stage2_last_valid_artifacts"))
     if latest_info is None:
         latest_info = _restore_latest_artifacts_from_disk()
     if latest_info is None:
+        cached_df = st.session_state.get("_stage2_loaded_df")
+        cached_info = _remember_latest_artifacts(st.session_state.get("_stage2_loaded_info"))
+        if isinstance(cached_df, pd.DataFrame) and cached_info is not None:
+            return cached_df.copy(), cached_info, None
         return None, None, (
             "Brak gotowych danych w pamięci aplikacji. "
             "Przejdź do zakładki 'Analiza Danych' i kliknij "
@@ -1876,6 +1890,13 @@ def _load_latest_dataset(max_rows: int | None = None) -> Tuple[pd.DataFrame | No
         # Smart preview for huge files to avoid hangs even when sample mode is off.
         if read_limit is None and size_mb >= 500:
             read_limit = 500_000
+        mtime = path.stat().st_mtime
+        cache_sig = f"{path}|{mtime}|rows={read_limit or 'all'}"
+        if st.session_state.get("_stage2_loaded_sig") == cache_sig:
+            cached_df = st.session_state.get("_stage2_loaded_df")
+            cached_info = _remember_latest_artifacts(st.session_state.get("_stage2_loaded_info") or latest_info)
+            if isinstance(cached_df, pd.DataFrame) and cached_info is not None:
+                return cached_df.copy(), cached_info, None
         sample_note = None
         if read_limit:
             df = _df_from_parquet(path, max_rows=read_limit)
@@ -1887,6 +1908,9 @@ def _load_latest_dataset(max_rows: int | None = None) -> Tuple[pd.DataFrame | No
                 f"Tryb probki EDA: wczytano {len(df):,} wierszy ({sample_note}) "
                 f"z pliku ~{size_mb:,.1f} MB."
             )
+        st.session_state["_stage2_loaded_df"] = df.copy()
+        st.session_state["_stage2_loaded_info"] = latest_info
+        st.session_state["_stage2_loaded_sig"] = cache_sig
     except Exception as e:
         return None, latest_info, f"Nie udało się wczytać danych z PARQUET: {e}"
 
@@ -3598,7 +3622,8 @@ def _persist_artifacts(
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(prep_report, f, ensure_ascii=False, indent=2)
 
-    st.session_state["latest_artifacts"].update(
+    base_artifacts = _remember_latest_artifacts(latest_info) or dict(latest_info or {})
+    base_artifacts.update(
         {
             # IMPORTANT: store as strings (safe for cache + JSON)
             "ready_parquet_path": str(ready_path),
@@ -3612,6 +3637,8 @@ def _persist_artifacts(
             "ingest_root": str(Path(run_dir).parent),
         }
     )
+    st.session_state["latest_artifacts"] = base_artifacts
+    st.session_state["_stage2_last_valid_artifacts"] = base_artifacts
 
     # Disk pointer for Stage 3 (works even after navigation / rerun)
     try:
@@ -6129,10 +6156,19 @@ def main():
                             row = st.columns([2.0, 1.0])
 
                             with row[0]:
+                                # Clamp persisted slider state before rendering. Streamlit keeps
+                                # widget values across reruns, while max_ma changes with aggregation.
+                                prev_ma = st.session_state.get("ts_ma_window", default_ma)
+                                try:
+                                    prev_ma = int(prev_ma)
+                                except Exception:
+                                    prev_ma = int(default_ma)
+                                safe_ma = int(max(2, min(max_ma, prev_ma)))
+                                st.session_state["ts_ma_window"] = safe_ma
                                 ma_window = st.slider(
                                     "Okno średniej kroczącej",
                                     min_value=2, max_value=max_ma,
-                                    value=default_ma, step=1,
+                                    value=safe_ma, step=1,
                                     key="ts_ma_window",
                                 )
 
