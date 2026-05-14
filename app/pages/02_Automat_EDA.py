@@ -77,6 +77,7 @@ def _df_from_parquet(path: Path, max_rows: int | None = None) -> pd.DataFrame:
         return pd.read_parquet(path)
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(
     page_title="Auto EDA",
@@ -1597,6 +1598,206 @@ def _render_tts_audio_player(audio_bytes: bytes, mime: str = "audio/mpeg", autop
     </audio>
     """
     st.markdown(html, unsafe_allow_html=True)
+
+
+def _browser_tts_chunks(text: str, max_chars: int = 220) -> list[str]:
+    """Split text into short browser-speech chunks to avoid truncated narration."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return []
+
+    chunks: list[str] = []
+    current = ""
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+
+    def _flush(value: str) -> None:
+        value = value.strip()
+        if value:
+            chunks.append(value)
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        if len(sentence) > max_chars:
+            if current:
+                _flush(current)
+                current = ""
+            words = sentence.split()
+            piece = ""
+            for word in words:
+                candidate = f"{piece} {word}".strip()
+                if len(candidate) <= max_chars:
+                    piece = candidate
+                else:
+                    _flush(piece)
+                    piece = word
+            _flush(piece)
+            continue
+
+        candidate = f"{current} {sentence}".strip()
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            _flush(current)
+            current = sentence
+
+    _flush(current)
+    return chunks
+
+
+def _render_browser_tts(markdown_text: str, voice_hint: str = "female", autoplay: bool = True) -> None:
+    """Render a non-blocking browser TTS player that reads the full summary."""
+    plain_text = _plain_text_for_tts(markdown_text, max_chars=0)
+    chunks = _browser_tts_chunks(plain_text)
+    if not chunks:
+        return
+
+    root_id = f"stage2-browser-tts-{_hash_key(plain_text, voice_hint)[:12]}"
+    html = """
+    <div id="__ROOT_ID__" class="stage2-browser-tts">
+      <style>
+        .stage2-browser-tts {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          min-height: 38px;
+          font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          color: #31333f;
+        }
+        .stage2-browser-tts .status {
+          flex: 1;
+          font-size: 14px;
+          color: #5f6b7a;
+        }
+        .stage2-browser-tts button {
+          border: 1px solid #d8dee9;
+          background: #ffffff;
+          border-radius: 7px;
+          padding: 7px 12px;
+          cursor: pointer;
+          color: #31333f;
+          font-size: 14px;
+        }
+        .stage2-browser-tts button:hover {
+          border-color: #ff4b4b;
+          color: #ff4b4b;
+        }
+      </style>
+      <div class="status">Przygotowuję narrację audio...</div>
+      <button type="button" class="replay">Odtwórz ponownie</button>
+      <button type="button" class="stop">Stop</button>
+    </div>
+    <script>
+    (function () {
+      const root = document.getElementById("__ROOT_ID__");
+      if (!root) return;
+
+      const chunks = __CHUNKS_JSON__;
+      const voiceHint = __VOICE_HINT_JSON__;
+      const shouldAutoplay = __AUTOPLAY_JSON__;
+      const status = root.querySelector(".status");
+      const replay = root.querySelector(".replay");
+      const stop = root.querySelector(".stop");
+      let idx = 0;
+      let active = false;
+      let voicesReady = false;
+
+      function setStatus(text) {
+        if (status) status.textContent = text;
+      }
+
+      function pickVoice() {
+        const voices = window.speechSynthesis.getVoices() || [];
+        const plVoices = voices.filter((v) => (v.lang || "").toLowerCase().startsWith("pl"));
+        const pool = plVoices.length ? plVoices : voices;
+        if (!pool.length) return null;
+
+        const hinted = pool.find((v) => {
+          const name = (v.name || "").toLowerCase();
+          return voiceHint === "male"
+            ? /male|mężczy|męski|jan|piotr|marek|adam/.test(name)
+            : /female|kobiet|żeński|ewa|zosia|paulina|maria/.test(name);
+        });
+        return hinted || pool[0];
+      }
+
+      function speakNext() {
+        if (!active) return;
+        if (idx >= chunks.length) {
+          active = false;
+          setStatus("Narracja zakończona.");
+          return;
+        }
+
+        const utterance = new SpeechSynthesisUtterance(chunks[idx]);
+        const voice = pickVoice();
+        if (voice) utterance.voice = voice;
+        utterance.lang = (voice && voice.lang) || "pl-PL";
+        utterance.rate = 1.02;
+        utterance.pitch = voiceHint === "male" ? 0.95 : 1.02;
+        utterance.onend = function () {
+          idx += 1;
+          speakNext();
+        };
+        utterance.onerror = function () {
+          idx += 1;
+          speakNext();
+        };
+
+        setStatus("Czytam podsumowanie " + (idx + 1) + "/" + chunks.length + "...");
+        window.speechSynthesis.speak(utterance);
+      }
+
+      function start() {
+        if (!("speechSynthesis" in window)) {
+          setStatus("Ta przeglądarka nie obsługuje automatycznej narracji.");
+          return;
+        }
+        window.speechSynthesis.cancel();
+        idx = 0;
+        active = true;
+        setTimeout(speakNext, 80);
+      }
+
+      function cancel() {
+        active = false;
+        if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+        setStatus("Narracja zatrzymana.");
+      }
+
+      replay.addEventListener("click", start);
+      stop.addEventListener("click", cancel);
+      window.addEventListener("beforeunload", cancel);
+
+      function boot() {
+        if (voicesReady) return;
+        voicesReady = true;
+        setStatus("Narracja gotowa.");
+        if (shouldAutoplay) setTimeout(start, 250);
+      }
+
+      if ("speechSynthesis" in window) {
+        if (window.speechSynthesis.getVoices().length) {
+          boot();
+        } else {
+          window.speechSynthesis.onvoiceschanged = boot;
+          setTimeout(boot, 600);
+        }
+      } else {
+        setStatus("Ta przeglądarka nie obsługuje automatycznej narracji.");
+      }
+    })();
+    </script>
+    """
+    html = (
+        html.replace("__ROOT_ID__", root_id)
+        .replace("__CHUNKS_JSON__", json.dumps(chunks, ensure_ascii=False))
+        .replace("__VOICE_HINT_JSON__", json.dumps(str(voice_hint or "").lower()))
+        .replace("__AUTOPLAY_JSON__", "true" if autoplay else "false")
+    )
+    components.html(html, height=58)
 
 # ==== TL;DR fallback (deterministyczny) ====
 def _make_eda_summary_text(
@@ -7573,7 +7774,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
             temp_df["is_outlier"] = ((temp_df["value"] < lower_o) | (temp_df["value"] > upper_o)).astype(int)
             med_val = float(temp_df["value"].median())
 
-            ui_col1, ui_col2 = st.columns(2)
+            ui_col1, ui_col2 = st.columns([2, 1])
             with ui_col1:
                 max_points = st.slider(
                     "Maks. punkty w scatterze",
@@ -7644,9 +7845,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                 .properties(spacing=10, bounds="flush",
                             padding={"left": 0, "right": 10, "top": 0, "bottom": 0})
             )
-            colL, colM, colR = st.columns([0.3, 10, 3.0])
-            with colM:
-                altair_chart_stretch(st, combined, width='content')
+            altair_chart_stretch(st, combined, width='content')
 
     # --- Po wykresach: najpierw informacja o duplikatach, potem info o outlierach ---
     if _dup_banner_kind == "ok":
@@ -7927,7 +8126,10 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                 st.caption("Podgląd aktualizuje się na bieżąco podczas pisania.")
 
         # --- TTS automatycznie po kliknięciu podsumowania, bez drugiego przycisku ---
-        _text_for_tts = _plain_text_for_tts(st.session_state.get("latest_summary_text", "") or "")
+        _text_for_tts = _plain_text_for_tts(
+            st.session_state.get("latest_summary_text", "") or "",
+            max_chars=0,
+        )
         tts_enabled   = st.session_state.get("tts_enabled", True)
 
         cur_tts_hash = _hash_key(
@@ -7941,6 +8143,22 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
         cached_audio_hash = st.session_state.get("latest_tts_audio_hash")
         audio_mime = st.session_state.get("latest_tts_audio_mime", "audio/mpeg")
         autoplay_audio = False
+        # Stage 2 uses browser speech synthesis now. Do not render old MP3 players
+        # left in session state from earlier runs, because they can overlap audio.
+        cached_audio = None
+        cached_audio_hash = None
+
+        if explicit_trigger and ai_tldr_enabled and tts_enabled and _text_for_tts:
+            voice_hint = (
+                "male"
+                if str(openai_voice_selected or "").lower() in set(OPENAI_VOICES.get("male", []))
+                else "female"
+            )
+            _render_browser_tts(_text_for_tts, voice_hint=voice_hint, autoplay=True)
+            st.session_state["play_tts_now"] = False
+            explicit_trigger = False
+            cached_audio = None
+            cached_audio_hash = None
 
         if not (ai_tldr_enabled and tts_enabled and _text_for_tts):
             st.session_state["play_tts_now"] = False
