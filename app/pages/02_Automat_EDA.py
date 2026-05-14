@@ -456,16 +456,8 @@ def _eda_internal_checkpoints_enabled() -> bool:
     return True
 
 
-def _eda_debug_ui_enabled() -> bool:
-    return bool(st.session_state.get("eda_debug_enabled", False))
-
-
 def _eda_collect_checkpoints() -> bool:
-    return _eda_internal_checkpoints_enabled() or bool(st.session_state.get("eda_debug_collect", False))
-
-
-def _eda_show_debug_details() -> bool:
-    return bool(st.session_state.get("eda_debug_show_details", False))
+    return _eda_internal_checkpoints_enabled()
 
 
 def _eda_reset_run_debug_state() -> None:
@@ -1316,174 +1308,8 @@ def _eda_create_temp_clusters_and_store(
     )
     return state
 
-def _describe_clusters_with_llm(
-    df: pd.DataFrame,
-    cluster_col: str,
-    max_features: int = 8,
-    max_examples_per_cluster: int = 3,
-    model: str = "gpt-4o-mini",
-    object_label: str | None = None,
-) -> dict[str, dict]:
-    """
-    Generuje AI-nazwy i opisy klastrów na podstawie krótkich statystyk.
 
-    object_label – ogólna nazwa obiektów w liczbie mnogiej (np. 'klienci', 'produkty',
-    'pokemony', 'miasta'). Jeśli None, używamy neutralnego określenia 'obiekty'.
-    """
-    if cluster_col not in df.columns:
-        return {}
-
-    if not _get_env_or_secret("OPENAI_API_KEY"):
-        return {}
-
-    # Neutralna, inkluzywna nazwa obiektów
-    label = (object_label or "obiekty").strip()
-    if len(label) > 40:
-        label = "obiekty"
-
-    # Kopia danych + wyrzucenie wierszy bez klastra
-    work = df.copy()
-    work = work.dropna(subset=[cluster_col])
-    if work.empty:
-        return {}
-
-    max_rows = 5000
-    if len(work) > max_rows:
-        work = work.sample(max_rows, random_state=0)
-
-    work["_cluster_id"] = work[cluster_col].astype(str)
-
-    # Wybór cech numerycznych i kategorycznych
-    num_cols = [c for c in _numeric_measure_candidates(work, min_non_null=3) if c not in (cluster_col, "_cluster_id")][:max_features]
-    for col in num_cols:
-        work[col] = _numeric_series_for_candidate(work[col])
-
-    cat_cols = [
-        c for c in _categorical_feature_candidates(work)
-        if c not in (cluster_col, "_cluster_id")
-    ][:max_features]
-
-    cluster_summaries: dict[str, dict] = {}
-
-    global_means = work[num_cols].mean(numeric_only=True) if num_cols else pd.Series(dtype=float)
-    global_stds = work[num_cols].std(numeric_only=True) if num_cols else pd.Series(dtype=float)
-
-    # Budujemy podsumowania dla każdego klastra
-    for cid, grp in work.groupby("_cluster_id"):
-        size = int(len(grp))
-        share = float(size / len(work)) if len(work) > 0 else 0.0
-
-        summary: dict[str, Any] = {
-            "size": size,
-            "share": round(share, 4),
-            "numeric_features": {},
-            "categorical_features": {},
-            "examples": [],
-        }
-
-        # Statystyki numeryczne: średnia w klastrze vs globalnie
-        for col in num_cols:
-            summary["numeric_features"][col] = {
-                "mean_cluster": float(grp[col].mean()),
-                "mean_global": float(global_means.get(col, np.nan)),
-                "std_global": float(global_stds.get(col, np.nan)),
-            }
-
-        # Statystyki kategoryczne: TOP 3 wartości
-        for col in cat_cols:
-            vc = grp[col].astype(str).value_counts().head(3)
-            if vc.empty:
-                continue
-            total = int(vc.sum())
-            summary["categorical_features"][col] = [
-                {
-                    "value": str(v),
-                    "count": int(cnt),
-                    "share": float(cnt / total) if total > 0 else 0.0,
-                }
-                for v, cnt in vc.items()
-            ]
-
-        # Kilka przykładowych rekordów
-        ex_cols = [cluster_col] + num_cols + cat_cols
-        ex_df = grp[ex_cols].head(max_examples_per_cluster)
-        summary["examples"] = ex_df.to_dict(orient="records")
-
-        cluster_summaries[str(cid)] = summary
-
-    if not cluster_summaries:
-        return {}
-
-    # ---------- Budowa promptu ----------
-    prompt = (
-        "Jesteś doświadczonym analitykiem danych.\n"
-        "Na podstawie krótkich statystyk klastrów przygotuj zwięzłe, praktyczne nazwy "
-        f"i opisy segmentów takich {label}.\n\n"
-        "Dla każdego klastra przygotuj:\n"
-        "  - \"name\": pełna, czytelna nazwa segmentu (np. \"Młodzi cyfrowi entuzjaści\"),\n"
-        "  - \"short_label\": bardzo krótka etykieta (2–4 słowa, np. \"Młodzi digitalowi\"),\n"
-        f"  - \"description\": 2–3 zdania opisu po polsku, opisujące typowe cechy tych {label}.\n\n"
-        "Zwróć **tylko** jeden obiekt JSON o strukturze:\n"
-        "{\n"
-        "  \"<cluster_id>\": {\n"
-        "    \"name\": \"...\",\n"
-        "    \"short_label\": \"...\",\n"
-        "    \"description\": \"...\"\n"
-        "  }, ...\n"
-        "}\n\n"
-        "Nie dodawaj żadnych komentarzy poza JSON-em.\n\n"
-        "Oto dane klastrów:\n"
-    )
-    prompt += json.dumps(cluster_summaries, ensure_ascii=False, indent=2)
-
-    try:
-        resp = _openai_chat_completion(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-
-        raw = (resp.choices[0].message.content or "").strip()
-
-        # ---------- Bezpieczne parsowanie JSON ----------
-        def _parse_json_like(s: str) -> dict:
-            s = s.strip()
-
-            # Usuwamy ewentualne ```json ... ```
-            if s.startswith("```"):
-                parts = s.split("```")
-                if len(parts) >= 3:
-                    s = parts[1]
-                else:
-                    s = s.replace("```json", "").replace("```", "").strip()
-
-            # Wytnij od pierwszej '{' do ostatniej '}'
-            first = s.find("{")
-            last = s.rfind("}")
-            if first != -1 and last != -1 and last > first:
-                s = s[first : last + 1]
-
-            return json.loads(s)
-
-        parsed = _parse_json_like(raw)
-        if isinstance(parsed, dict):
-            cleaned: dict[str, dict] = {}
-            for k, v in parsed.items():
-                if isinstance(v, dict):
-                    cleaned[str(k)] = {
-                        "name": str(v.get("name", "")),
-                        "short_label": str(v.get("short_label", "")),
-                        "description": str(v.get("description", "")),
-                    }
-            return cleaned
-
-    except Exception:
-        return {}
-
-    return {}
-
-# Legacy implementation above is intentionally overridden below with
-# the gated/checkpointed version used for production evaluation.
+# Production cluster narration with gate/checkpoints and deterministic fallback.
 def _describe_clusters_with_llm(
     df: pd.DataFrame,
     cluster_col: str,
@@ -2709,21 +2535,6 @@ def _analyze_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
 
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage2 micro-profiler + lightweight cache utilities (v1)
-# NOTE: defined here (before correlation helpers) to avoid NameError.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _perf_start(label: str) -> float:
-    """Start timer for a Stage2 section."""
-    t0 = time.perf_counter()
-    try:
-        _PERF_LOGGER.info(f"[PERF] enter: {label}")
-    except Exception:
-        pass
-    return t0
-
-
 @contextmanager
 def perf_step(label: str):
     """Context manager to micro-profile sub-steps."""
@@ -3808,53 +3619,6 @@ def reset_sec7_state():
     """Alias do _reset_sec7_state() – nie usuwać, bo używane w main()."""
     _reset_sec7_state()
 
-def _render_eda_debug_sidebar_exports(slots: dict[str, Any] | None) -> None:
-    if not slots:
-        return
-
-    exec_summary = st.session_state.get("eda_exec_summary_v1") or {}
-    summary_debug = st.session_state.get("eda_summary_debug_v1") or {}
-    cluster_debug = st.session_state.get("eda_cluster_debug_v1") or {}
-    full_log = st.session_state.get("eda_debug_log_v1") or []
-
-    exec_log = [row for row in full_log if str(row.get("where", "")).startswith("eda.exec.")]
-    summary_log = [row for row in full_log if str(row.get("where", "")).startswith("eda.summary.")]
-    cluster_log = [row for row in full_log if str(row.get("where", "")).startswith("eda.cluster.")]
-
-    with slots["plan95"].container():
-        st.caption("Automat EDA / Plan 9.5 - skopiuj ten JSON")
-        st.code(json.dumps(exec_summary, ensure_ascii=False), language="json")
-
-    with slots["exec"].container():
-        st.caption("Logi LLM / eda.exec.*")
-        st.code(json.dumps(exec_log, ensure_ascii=False), language="json")
-
-    with slots["summary"].container():
-        st.caption("Logi TL;DR / eda.summary.*")
-        st.code(json.dumps(summary_log, ensure_ascii=False), language="json")
-
-    with slots["cluster"].container():
-        st.caption("Logi cluster labels / eda.cluster.*")
-        st.code(json.dumps(cluster_log, ensure_ascii=False), language="json")
-
-    with slots["state"].container():
-        st.caption("LLM / gate debug")
-        st.code(
-            json.dumps(
-                {
-                    "summary_debug": summary_debug,
-                    "cluster_debug": cluster_debug,
-                },
-                ensure_ascii=False,
-            ),
-            language="json",
-        )
-
-    with slots["all"].container():
-        with st.expander("Pelne checkpointy Automat EDA (opcjonalnie)", expanded=False):
-            st.code(json.dumps(full_log, ensure_ascii=False), language="json")
-
-
 # ---------- UI helpers ----------
 
 def _metric_card_html(title: str, value: str, subtitle: str, bg: str = "#f8f9fa", fg: str = "#111", border: str = "#ddd") -> str:
@@ -3986,36 +3750,7 @@ def _pairs_dataframe(pairs_sorted: List[Dict[str, Any]]) -> pd.DataFrame:
 
 # ---------- TTS + AI TL;DR ----------
 
-# ───────────────────── Helpery / cache TTS i ElevenLabs ─────────────────────
-ELEVEN_VOICE_ID_RE = re.compile(r"^[A-Za-z0-9]{20,40}$")
-
-@st.cache_data(show_spinner=False, ttl=1800, max_entries=64)
-def _eleven_list_voices_cached(api_key: str):
-    """Zwraca listę głosów z konta ElevenLabs lub [] przy błędzie/braku uprawnień."""
-    if not api_key:
-        return []
-    try:
-        r = requests.get(
-            "https://api.elevenlabs.io/v1/voices",
-            headers={"xi-api-key": api_key, "accept": "application/json"},
-            timeout=20,
-        )
-        if r.ok:
-            j = r.json() or {}
-            voices = j.get("voices") or []
-            # Normalizujemy pola, które wykorzystujesz niżej
-            out = []
-            for v in voices:
-                if isinstance(v, dict):
-                    out.append({
-                        "voice_id": v.get("voice_id") or v.get("voiceID") or v.get("id"),
-                        "name": v.get("name") or "voice",
-                        "labels": v.get("labels") or {},
-                    })
-            return out
-    except Exception:
-        pass
-    return []
+# ───────────────────── Helpery / cache TTS ─────────────────────
 
 
 def _hash_key(*parts: str) -> str:
@@ -4024,68 +3759,11 @@ def _hash_key(*parts: str) -> str:
         h.update((p or "").encode("utf-8"))
     return h.hexdigest()
 
-@st.cache_data(show_spinner=False, ttl=1800, max_entries=64)
-def _tts_eleven_cached(text: str, voice_id: str, model: str, api_key: str):
-    """
-    Generuje audio przez ElevenLabs.
-    Zwraca krotkę: (audio_bytes, err_msg) – gdy OK, err_msg == "".
-    """
-    vid = (voice_id or "").strip()
-    if not vid:
-        return b"", "Brak voice_id (uzupełnij w .env lub w sidebarze)."
-
-    try:
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{vid}"
-        payload = {
-            "text": text,
-            "model_id": model,
-            "voice_settings": {"stability": 0.55, "similarity_boost": 0.65},
-        }
-        r = requests.post(
-            url,
-            json=payload,
-            headers={
-                "xi-api-key": api_key,
-                "accept": "audio/mpeg",
-                "Content-Type": "application/json",
-            },
-            timeout=60,
-        )
-        if r.ok and r.content:
-            return r.content, ""
-        # spróbuj odczytać komunikat z API
-        try:
-            j = r.json()
-            msg = j.get("detail") or j.get("message") or str(j)
-        except Exception:
-            msg = r.text[:400]
-        return b"", f"HTTP {r.status_code}: {msg}"
-    except requests.RequestException as e:
-        return b"", f"Network error: {e}"
-    except Exception as e:
-        return b"", f"Unexpected error: {e}"
-
-
-def _validate_eleven_voice_id(voice_id: str, api_key: str) -> tuple[bool, str]:
-    vid = (voice_id or "").strip()
-    if not vid:
-        return False, "Brak voice_id."
-    if not ELEVEN_VOICE_ID_RE.match(vid):
-        return False, "Podejrzany format voice_id (sprawdź literówki/ucięcie)."
-    voices = _eleven_list_voices_cached(api_key)
-    if not voices:
-        return False, "Brak dostępu do listy głosów (sprawdź ELEVENLABS_API_KEY / plan)."
-    if any(v.get("voice_id") == vid for v in voices):
-        return True, ""
-    return False, "Nie znaleziono takiego voice_id na Twoim koncie."
-
 def _run_tts_for_summary(
     text_for_tts: str,
     provider: str,
     openai_tts_model_selected: str,
     openai_voice_selected: str,
-    eleven_tts_model_selected: str,
-    eleven_voice_id_selected: str,
     cur_tts_hash: str | None = None,
 ):
     """
@@ -4104,13 +3782,10 @@ def _run_tts_for_summary(
             provider or "",
             openai_tts_model_selected or "",
             openai_voice_selected or "",
-            eleven_tts_model_selected or "",
-            eleven_voice_id_selected or "",
         )
 
     # Bezpieczniki na klucze/API
     openai_key = _get_env_or_secret("OPENAI_API_KEY")
-    eleven_key = _get_env_or_secret("ELEVENLABS_API_KEY")
 
     # Trace wspólny dla obu dostawców (opcjonalny – tylko jeśli Langfuse jest dostępny)
     lf_client = None
@@ -4128,7 +3803,6 @@ def _run_tts_for_summary(
             metadata={
                 "provider": provider,
                 "openai_model": openai_tts_model_selected if provider == "OpenAI" else None,
-                "eleven_model": eleven_tts_model_selected if provider == "ElevenLabs" else None,
             },
         )
         if lf_client
@@ -4150,8 +3824,7 @@ def _run_tts_for_summary(
                     api_key=openai_key,
                 )
         else:
-            # ElevenLabs: wyłączone w Etapie 2 (pojawi się w Etapie 3 / Data Chat)
-            pass
+            err = "Etap 2 obsługuje TTS przez OpenAI."
         if audio_bytes:
             _autoplay_audio(audio_bytes, mime="audio/mpeg")
             st.session_state["tts_last_hash"] = cur_tts_hash
@@ -4164,31 +3837,6 @@ def _run_tts_for_summary(
     finally:
         # resetujemy jednorazowy trigger
         st.session_state["play_tts_now"] = False
-
-@st.cache_data(show_spinner=False, ttl=3600, max_entries=32)
-def _eleven_list_models_cached(api_key: str):
-    """Zwraca listę modeli ElevenLabs lub [] przy błędzie/ braku uprawnień."""
-    try:
-        r = requests.get(
-            "https://api.elevenlabs.io/v1/models",
-            headers={"xi-api-key": api_key, "accept": "application/json"},
-            timeout=20,
-        )
-        if r.ok:
-            j = r.json() or []
-            # Ujednolicamy strukturę: każdy element ma 'model_id' i label 'name'
-            out = []
-            for m in j:
-                if isinstance(m, dict):
-                    out.append({
-                        "model_id": m.get("model_id") or m.get("id") or m.get("name"),
-                        "name": m.get("name") or m.get("model_id") or m.get("id"),
-                    })
-            return out
-    except Exception:
-        pass
-    return []
-
 
 @st.cache_data(show_spinner=False, ttl=1800, max_entries=64)
 def _tts_openai_cached(text: str, voice: str, model: str, api_key: str):
@@ -4231,71 +3879,7 @@ def _tts_openai_cached(text: str, voice: str, model: str, api_key: str):
         errors.append(f"OpenAI REST TTS: {e}")
         return b"", "OpenAI TTS error: " + "; ".join(errors)
 
-@st.cache_data(show_spinner=False, ttl=1800, max_entries=64)
-def _prep_anomaly_for_column(series: pd.Series, max_points_param: int = 5000):
-    """Szybkie przygotowanie danych i zakresów Y do sekcji 6 (bez użycia zmiennych globalnych)."""
-    s = pd.to_numeric(series, errors="coerce")
-    temp_df = pd.DataFrame({"idx": np.arange(len(s)), "value": s}).dropna()
-
-    if temp_df.empty:
-        return {"empty": True}
-
-    # sampling wyłącznie do WIZUALIZACJI (metryki licz na pełnym temp_df)
-    if len(temp_df) > max_points_param:
-        temp_df_vis = temp_df.sample(n=max_points_param, random_state=0).sort_values("idx")
-    else:
-        temp_df_vis = temp_df
-
-    q1 = temp_df["value"].quantile(0.25)
-    q3 = temp_df["value"].quantile(0.75)
-    iqr = q3 - q1
-    lower_o, upper_o = (q1, q3) if iqr == 0 else (q1 - 1.5 * iqr, q3 + 1.5 * iqr)
-    temp_df["is_outlier"] = ((temp_df["value"] < lower_o) | (temp_df["value"] > upper_o)).astype(int)
-    median_v = float(temp_df["value"].median())
-
-    eps = max(1e-6, 0.01 * max(1.0, float(temp_df["value"].max()) - float(temp_df["value"].min())))
-    y_min = float(min(0.0, temp_df["value"].min() - eps))
-    y_max = float(max(0.0, temp_df["value"].max() + eps))
-
-    return {
-        "empty": False,
-        "temp_df": temp_df,
-        "temp_df_vis": temp_df_vis,  # jeśli zechcesz użyć
-        "median": median_v,
-        "y_min": y_min,
-        "y_max": y_max,
-    }
-
 # ====================   MAIN VIEW   ======================
-def _is_categorical_like(s: pd.Series, max_unique_abs: int = 50, max_unique_ratio: float = 0.3) -> bool:
-    ser = s.astype("object")
-    n = ser.nunique(dropna=True)
-    return (n <= max_unique_abs) and (n / max(len(ser), 1) <= max_unique_ratio)
-
-def _coerce_numeric_safe(s: pd.Series) -> pd.Series:
-    if pd.api.types.is_numeric_dtype(s): 
-        return s
-    return pd.to_numeric(_coerce_to_numeric_special(s), errors="coerce")
-
-def _guess_outcome_group_value_cols(df: pd.DataFrame) -> tuple[str|None, str|None, str|None]:
-    cols = list(df.columns)
-    # kandydaci
-    cat_cols = _categorical_feature_candidates(df)
-    num_cols = _numeric_measure_candidates(df, min_non_null=2, allow_low_cardinality=True)
-    # outcome: binarne / niska krotność
-    binary = [c for c in cat_cols if df[c].nunique(dropna=True) == 2]
-    prio_names = ["target","label","y","survived","churn","default","outcome"]
-    def pick_by_name(cands: list[str]) -> str|None:
-        lower = {c.lower(): c for c in cands}
-        for p in prio_names:
-            if p in lower: return lower[p]
-        return cands[0] if cands else None
-
-    outcome = pick_by_name(binary) or pick_by_name(cat_cols) or (cols[0] if cols else None)
-    group   = pick_by_name([c for c in cat_cols if c != outcome]) or (cols[1] if len(cols) > 1 else outcome)
-    value   = pick_by_name([c for c in num_cols if c not in {outcome, group}]) or (num_cols[0] if num_cols else None)
-    return outcome, group, value
-
 def _guess_cols_from_info_df(info_df: pd.DataFrame) -> Tuple[str | None, str | None, str | None]:
     """Fast heuristics using precomputed per-column stats (no full-data scans)."""
     try:
@@ -4620,15 +4204,6 @@ def _hero_time_series_overview(
                 f"{arrow} {strength} {direction} "
                 f"(poziom {signed_level:+d}/3, znormalizowane nachylenie ≈ {norm:+.3f})."
             )
-
-        # --- Altair ma limit 5000 wierszy → rysujemy próbkę równomierną ---
-        plot_df_sorted = plot_df.sort_values("__x__")
-        plot_df_plot = plot_df_sorted
-        MAX_PLOT_POINTS = 5000
-
-        if len(plot_df_sorted) > MAX_PLOT_POINTS:
-            idx = np.linspace(0, len(plot_df_sorted) - 1, MAX_PLOT_POINTS).astype(int)
-            plot_df_plot = plot_df_sorted.iloc[idx].copy()
 
         # --- Altair ma limit ~5000 wierszy → rysujemy próbkę równomierną ---
         plot_df_sorted = plot_df.sort_values("__x__")
@@ -5019,8 +4594,6 @@ def main():
         # defensywne domyślne wartości; dzięki temu zmienne zawsze istnieją
         openai_voice_selected = None
         openai_tts_model_selected = OPENAI_TTS_MODELS[0]
-        eleven_voice_id_selected = None
-        eleven_tts_model_selected = os.getenv("ELEVEN_TTS_MODEL", "eleven_multilingual_v2")
 
         st.markdown("---")
         st.checkbox("✅ Włącz lektora (TTS)", value=True, key="tts_enabled")
@@ -5028,12 +4601,6 @@ def main():
         # Dostawca TTS: w Etapie 2 blokujemy wybór (zostawiamy OpenAI).
         provider = 'OpenAI'
         gender = st.radio("Głos", ["Kobieta", "Mężczyzna"], horizontal=True, index=0)
-
-        # Gdy użytkownik zmieni dostawcę lub głos – skasuj hash, by wymusić ponowny odczyt
-        _sidebar_sig = _hash_key(provider or "", str(openai_voice_selected or ""), str(eleven_voice_id_selected or ""))
-        if st.session_state.get("_sidebar_sig") != _sidebar_sig:
-            st.session_state["_sidebar_sig"] = _sidebar_sig
-            st.session_state.pop("tts_last_hash", None)
 
         if provider == "OpenAI":
             gender_key = "female" if gender == "Kobieta" else "male"
@@ -5044,10 +4611,11 @@ def main():
             openai_voice_selected = st.selectbox("OpenAI voice", options=voice_pool,
                                                  index=voice_pool.index(default_voice))
 
-    st.session_state["eda_debug_enabled"] = False
-    st.session_state["eda_debug_show_details"] = False
-    st.session_state["eda_debug_collect"] = False
-    eda_debug_slots = None
+        # Gdy użytkownik zmieni dostawcę lub głos – skasuj hash, by wymusić ponowny odczyt
+        _sidebar_sig = _hash_key(provider or "", str(openai_voice_selected or ""))
+        if st.session_state.get("_sidebar_sig") != _sidebar_sig:
+            st.session_state["_sidebar_sig"] = _sidebar_sig
+            st.session_state.pop("tts_last_hash", None)
 
     # 0) Wczytanie danych
     # Etap 2 na DO/Streamlit CC probkuje bez brania samego poczatku pliku.
@@ -8310,8 +7878,6 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
             provider or "",
             openai_tts_model_selected or "",
             openai_voice_selected or "",
-            eleven_tts_model_selected or "",
-            eleven_voice_id_selected or "",
         )
         last_tts_hash    = st.session_state.get("tts_last_hash")
         explicit_trigger = st.session_state.get("play_tts_now", False)
@@ -8332,8 +7898,6 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                     provider,
                     openai_tts_model_selected,
                     openai_voice_selected,
-                    eleven_tts_model_selected,
-                    eleven_voice_id_selected,
                     cur_tts_hash,
                 )
 
@@ -8940,8 +8504,6 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
             st.json(prep_report)
 
     st.markdown('</div>', unsafe_allow_html=True)
-    _render_eda_debug_sidebar_exports(eda_debug_slots)
-
     # --- Powtórzony potok na dole strony ---
     render_flow_nav(current_id="02_Automat_EDA", key_prefix="flow_bottom")
     st.markdown("---")
@@ -8957,4 +8519,3 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
 # Streamlit entrypoint
 if __name__ == "__main__":
     main()
-
