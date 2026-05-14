@@ -1661,13 +1661,16 @@ def _render_browser_tts(markdown_text: str, voice_hint: str = "female", autoplay
         .stage2-browser-tts {
           display: flex;
           align-items: center;
-          gap: 10px;
+          justify-content: flex-start;
+          gap: 8px;
+          flex-wrap: wrap;
           min-height: 38px;
           font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
           color: #31333f;
         }
         .stage2-browser-tts .status {
-          flex: 1;
+          flex: 0 0 auto;
+          margin-right: 2px;
           font-size: 14px;
           color: #5f6b7a;
         }
