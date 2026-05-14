@@ -1552,7 +1552,7 @@ DEFAULT_MALE_VOICE   = "verse"
 OPENAI_TTS_MODELS = [os.getenv("OPENAI_TTS_MODEL", "tts-1").strip() or "tts-1"]
 OPENAI_TTS_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TTS_TIMEOUT_SECONDS", "30"))
 OPENAI_TTS_SPEED = float(os.getenv("OPENAI_TTS_SPEED", "1.08"))
-STAGE2_TTS_MAX_CHARS = int(os.getenv("STAGE2_TTS_MAX_CHARS", "1200"))
+STAGE2_TTS_MAX_CHARS = int(os.getenv("STAGE2_TTS_MAX_CHARS", "900"))
 
 
 def _plain_text_for_tts(markdown_text: str, max_chars: int = STAGE2_TTS_MAX_CHARS) -> str:
@@ -1585,13 +1585,14 @@ def _plain_text_for_tts(markdown_text: str, max_chars: int = STAGE2_TTS_MAX_CHAR
     return clipped
 
 
-# ==== AUDIO AUTOPLAY (Streamlit nie autoodtwarza st.audio) ====
-def _autoplay_audio(audio_bytes: bytes, mime: str = "audio/mpeg"):
+# ==== AUDIO PLAYER (jeden kontrolowany odtwarzacz z opcjonalnym autoplay) ====
+def _render_tts_audio_player(audio_bytes: bytes, mime: str = "audio/mpeg", autoplay: bool = False):
     if not audio_bytes:
         return
     b64 = base64.b64encode(audio_bytes).decode("ascii")
+    autoplay_attr = " autoplay" if autoplay else ""
     html = f"""
-    <audio autoplay>
+    <audio controls{autoplay_attr} preload="auto" style="width:100%; height:38px;">
       <source src="data:{mime};base64,{b64}" type="{mime}">
     </audio>
     """
@@ -3802,9 +3803,8 @@ def _run_tts_for_summary(
     cur_tts_hash: str | None = None,
 ):
     """
-    Generuje audio do podsumowania (AI) i odpala autoplay.
-    Używana zarówno przy pierwszym generowaniu TL;DR (w jednym spinnerze),
-    jak i przy ręcznym odświeżeniu TTS niżej.
+    Generuje audio do podsumowania (AI) i zapisuje je w sesji.
+    Odtwarzacz renderujemy osobno, żeby uniknąć równoległych ścieżek audio.
     """
     text_for_tts = _plain_text_for_tts(text_for_tts)
     if not text_for_tts:
@@ -3864,7 +3864,6 @@ def _run_tts_for_summary(
             st.session_state["latest_tts_audio_bytes"] = audio_bytes
             st.session_state["latest_tts_audio_mime"] = "audio/mpeg"
             st.session_state["latest_tts_audio_hash"] = cur_tts_hash
-            _autoplay_audio(audio_bytes, mime="audio/mpeg")
             st.session_state["tts_last_hash"] = cur_tts_hash
             if tts_trace:
                 tts_trace.update(status="success", metadata={"bytes": len(audio_bytes)})
@@ -7687,7 +7686,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
         )
         if st.button(summary_cta_label, type="primary", help=summary_cta_help):
             st.session_state["sec7_revealed"] = True
-            st.session_state["play_tts_now"] = False
+            st.session_state["play_tts_now"] = bool(st.session_state.get("tts_enabled", True))
 
     run_prep = False
     if st.session_state["sec7_revealed"]:
@@ -7754,7 +7753,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
 
         # ── Generowanie TL;DR tylko gdy pusto ───────────────────────────────────
         if ai_tldr_enabled and not st.session_state.get("latest_summary_text"):
-            with st.spinner("⏳ Generuję podsumowanie (AI) i narrację lektora…"):
+            with st.spinner("⏳ Generuję podsumowanie (AI)…"):
                 summary_text = ""
                 trace = lf.trace(
                     name="eda_tldr",
@@ -7927,7 +7926,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                 )
                 st.caption("Podgląd aktualizuje się na bieżąco podczas pisania.")
 
-        # --- TTS uruchamiany ręcznie, żeby nie blokować renderu Etapu 2 ---
+        # --- TTS automatycznie po kliknięciu podsumowania, bez drugiego przycisku ---
         _text_for_tts = _plain_text_for_tts(st.session_state.get("latest_summary_text", "") or "")
         tts_enabled   = st.session_state.get("tts_enabled", True)
 
@@ -7937,51 +7936,39 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
             openai_tts_model_selected or "",
             openai_voice_selected or "",
         )
-        last_tts_hash    = st.session_state.get("tts_last_hash")
-        explicit_trigger = st.session_state.get("play_tts_now", False)
+        explicit_trigger = bool(st.session_state.get("play_tts_now", False))
         cached_audio = st.session_state.get("latest_tts_audio_bytes")
         cached_audio_hash = st.session_state.get("latest_tts_audio_hash")
+        audio_mime = st.session_state.get("latest_tts_audio_mime", "audio/mpeg")
+        autoplay_audio = False
 
-        if ai_tldr_enabled and tts_enabled:
-            tts_left, tts_right = st.columns([1, 3], gap="medium")
-            with tts_left:
-                if st.button(
-                    "🔊 Wygeneruj / odtwórz narrację audio",
-                    key="stage2_generate_tts_audio",
-                    disabled=not bool(_text_for_tts),
-                ):
-                    st.session_state["play_tts_now"] = True
-                    explicit_trigger = True
-            with tts_right:
-                if cached_audio and cached_audio_hash == cur_tts_hash:
-                    st.audio(
-                        cached_audio,
-                        format=st.session_state.get("latest_tts_audio_mime", "audio/mpeg"),
-                    )
-        else:
+        if not (ai_tldr_enabled and tts_enabled and _text_for_tts):
             st.session_state["play_tts_now"] = False
+        else:
+            should_generate_tts = explicit_trigger and cached_audio_hash != cur_tts_hash
 
-        should_play = (
-            ai_tldr_enabled
-            and tts_enabled
-            and _text_for_tts
-            and explicit_trigger
-        )
+            if should_generate_tts:
+                with st.spinner("🔊 Generuję narrację audio…"):
+                    _run_tts_for_summary(
+                        _text_for_tts,
+                        provider,
+                        openai_tts_model_selected,
+                        openai_voice_selected,
+                        cur_tts_hash,
+                    )
+                cached_audio = st.session_state.get("latest_tts_audio_bytes")
+                cached_audio_hash = st.session_state.get("latest_tts_audio_hash")
+                audio_mime = st.session_state.get("latest_tts_audio_mime", "audio/mpeg")
+                autoplay_audio = bool(cached_audio and cached_audio_hash == cur_tts_hash)
+            elif explicit_trigger and cached_audio and cached_audio_hash == cur_tts_hash:
+                autoplay_audio = True
+                st.session_state["play_tts_now"] = False
 
-        if should_play:
-            with st.spinner("🔊 Generuję narrację audio…"):
-                _run_tts_for_summary(
-                    _text_for_tts,
-                    provider,
-                    openai_tts_model_selected,
-                    openai_voice_selected,
-                    cur_tts_hash,
-                )
-            refreshed_audio = st.session_state.get("latest_tts_audio_bytes")
-            if refreshed_audio and st.session_state.get("latest_tts_audio_hash") == cur_tts_hash:
-                st.audio(
-                    refreshed_audio,
-                    format=st.session_state.get("latest_tts_audio_mime", "audio/mpeg"),
+            if cached_audio and cached_audio_hash == cur_tts_hash:
+                _render_tts_audio_player(
+                    cached_audio,
+                    mime=audio_mime,
+                    autoplay=autoplay_audio,
                 )
 
 
