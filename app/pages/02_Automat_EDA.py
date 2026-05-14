@@ -7,6 +7,7 @@ import json
 import math
 import base64
 import time
+import re
 from contextlib import contextmanager
 import logging
 from datetime import datetime
@@ -1546,8 +1547,42 @@ OPENAI_VOICES = {
 DEFAULT_FEMALE_VOICE = "shimmer"
 DEFAULT_MALE_VOICE   = "verse"
 
-# jeśli kiedyś dodasz inne modele TTS, dopisz je tutaj
-OPENAI_TTS_MODELS = [os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")]
+# Jeśli kiedyś dodasz inne modele TTS, dopisz je tutaj. Domyślnie używamy
+# szybszego modelu, a dokładniejszy model można wymusić przez OPENAI_TTS_MODEL.
+OPENAI_TTS_MODELS = [os.getenv("OPENAI_TTS_MODEL", "tts-1").strip() or "tts-1"]
+OPENAI_TTS_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TTS_TIMEOUT_SECONDS", "30"))
+OPENAI_TTS_SPEED = float(os.getenv("OPENAI_TTS_SPEED", "1.08"))
+STAGE2_TTS_MAX_CHARS = int(os.getenv("STAGE2_TTS_MAX_CHARS", "1200"))
+
+
+def _plain_text_for_tts(markdown_text: str, max_chars: int = STAGE2_TTS_MAX_CHARS) -> str:
+    """Clean and shorten markdown so TTS stays fast and reads naturally."""
+    text = str(markdown_text or "").strip()
+    if not text:
+        return ""
+
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+    text = re.sub(r"(?m)^\s*[-*+]\s+", "", text)
+    text = re.sub(r"(?m)^\s*\d+[.)]\s+", "", text)
+    text = re.sub(r"[*_~>#|]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+
+    clipped = text[:max_chars].rstrip()
+    sentence_end = max(clipped.rfind("."), clipped.rfind("!"), clipped.rfind("?"))
+    if sentence_end > int(max_chars * 0.55):
+        clipped = clipped[: sentence_end + 1]
+    else:
+        word_end = clipped.rfind(" ")
+        if word_end > int(max_chars * 0.55):
+            clipped = clipped[:word_end].rstrip() + "."
+    return clipped
 
 
 # ==== AUDIO AUTOPLAY (Streamlit nie autoodtwarza st.audio) ====
@@ -3771,7 +3806,7 @@ def _run_tts_for_summary(
     Używana zarówno przy pierwszym generowaniu TL;DR (w jednym spinnerze),
     jak i przy ręcznym odświeżeniu TTS niżej.
     """
-    text_for_tts = (text_for_tts or "").strip()
+    text_for_tts = _plain_text_for_tts(text_for_tts)
     if not text_for_tts:
         return
 
@@ -3826,6 +3861,9 @@ def _run_tts_for_summary(
         else:
             err = "Etap 2 obsługuje TTS przez OpenAI."
         if audio_bytes:
+            st.session_state["latest_tts_audio_bytes"] = audio_bytes
+            st.session_state["latest_tts_audio_mime"] = "audio/mpeg"
+            st.session_state["latest_tts_audio_hash"] = cur_tts_hash
             _autoplay_audio(audio_bytes, mime="audio/mpeg")
             st.session_state["tts_last_hash"] = cur_tts_hash
             if tts_trace:
@@ -3849,7 +3887,9 @@ def _tts_openai_cached(text: str, voice: str, model: str, api_key: str):
             res = client.audio.speech.create(
                 model=model,
                 voice=voice,
-                input=text
+                input=text,
+                response_format="mp3",
+                speed=OPENAI_TTS_SPEED,
             )
             return res.read(), ""
         errors.append("pakiet openai nie jest dostepny")
@@ -3857,20 +3897,31 @@ def _tts_openai_cached(text: str, voice: str, model: str, api_key: str):
         errors.append(f"OpenAI SDK TTS: {e}")
 
     try:
+        payload = {
+            "model": model,
+            "voice": voice,
+            "input": (text or "")[:STAGE2_TTS_MAX_CHARS],
+            "response_format": "mp3",
+            "speed": OPENAI_TTS_SPEED,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
         response = requests.post(
             "https://api.openai.com/v1/audio/speech",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "voice": voice,
-                "input": (text or "")[:4096],
-                "response_format": "mp3",
-            },
-            timeout=90,
+            headers=headers,
+            json=payload,
+            timeout=OPENAI_TTS_TIMEOUT_SECONDS,
         )
+        if response.status_code >= 400 and "speed" in (response.text or "").lower():
+            payload.pop("speed", None)
+            response = requests.post(
+                "https://api.openai.com/v1/audio/speech",
+                headers=headers,
+                json=payload,
+                timeout=OPENAI_TTS_TIMEOUT_SECONDS,
+            )
         if response.status_code >= 400:
             errors.append(_openai_error_message(response))
             return b"", "OpenAI TTS error: " + "; ".join(errors)
@@ -4616,6 +4667,9 @@ def main():
         if st.session_state.get("_sidebar_sig") != _sidebar_sig:
             st.session_state["_sidebar_sig"] = _sidebar_sig
             st.session_state.pop("tts_last_hash", None)
+            st.session_state.pop("latest_tts_audio_hash", None)
+            st.session_state.pop("latest_tts_audio_bytes", None)
+            st.session_state.pop("latest_tts_audio_mime", None)
 
     # 0) Wczytanie danych
     # Etap 2 na DO/Streamlit CC probkuje bez brania samego poczatku pliku.
@@ -7633,7 +7687,7 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
         )
         if st.button(summary_cta_label, type="primary", help=summary_cta_help):
             st.session_state["sec7_revealed"] = True
-            st.session_state["play_tts_now"] = True
+            st.session_state["play_tts_now"] = False
 
     run_prep = False
     if st.session_state["sec7_revealed"]:
@@ -7842,6 +7896,10 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                 )
                 if st.button("💾 Zapisz podsumowanie do artefaktów", type="primary"):
                     st.session_state["latest_summary_text"] = edited
+                    st.session_state.pop("tts_last_hash", None)
+                    st.session_state.pop("latest_tts_audio_hash", None)
+                    st.session_state.pop("latest_tts_audio_bytes", None)
+                    st.session_state.pop("latest_tts_audio_mime", None)
                     st.session_state["eda_summary_debug_v1"] = {
                         "render_key": "manual_override",
                         "model": None,
@@ -7869,8 +7927,8 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                 )
                 st.caption("Podgląd aktualizuje się na bieżąco podczas pisania.")
 
-        # --- Autoodtwarzanie TTS przy późniejszym odświeżaniu --- 
-        _text_for_tts = (st.session_state.get("latest_summary_text", "") or "").strip()
+        # --- TTS uruchamiany ręcznie, żeby nie blokować renderu Etapu 2 ---
+        _text_for_tts = _plain_text_for_tts(st.session_state.get("latest_summary_text", "") or "")
         tts_enabled   = st.session_state.get("tts_enabled", True)
 
         cur_tts_hash = _hash_key(
@@ -7881,16 +7939,35 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
         )
         last_tts_hash    = st.session_state.get("tts_last_hash")
         explicit_trigger = st.session_state.get("play_tts_now", False)
+        cached_audio = st.session_state.get("latest_tts_audio_bytes")
+        cached_audio_hash = st.session_state.get("latest_tts_audio_hash")
+
+        if ai_tldr_enabled and tts_enabled:
+            tts_left, tts_right = st.columns([1, 3], gap="medium")
+            with tts_left:
+                if st.button(
+                    "🔊 Wygeneruj / odtwórz narrację audio",
+                    key="stage2_generate_tts_audio",
+                    disabled=not bool(_text_for_tts),
+                ):
+                    st.session_state["play_tts_now"] = True
+                    explicit_trigger = True
+            with tts_right:
+                if cached_audio and cached_audio_hash == cur_tts_hash:
+                    st.audio(
+                        cached_audio,
+                        format=st.session_state.get("latest_tts_audio_mime", "audio/mpeg"),
+                    )
+        else:
+            st.session_state["play_tts_now"] = False
 
         should_play = (
             ai_tldr_enabled
             and tts_enabled
             and _text_for_tts
-            and (explicit_trigger or (last_tts_hash != cur_tts_hash))
+            and explicit_trigger
         )
 
-        # Uwaga: gdy TTS został już wygenerowany w spinnerze wyżej,
-        # tts_last_hash == cur_tts_hash → tutaj nic się nie odpala.
         if should_play:
             with st.spinner("🔊 Generuję narrację audio…"):
                 _run_tts_for_summary(
@@ -7899,6 +7976,12 @@ padding:0.75rem 1rem;font-size:0.9rem;line-height:1.4;color:#856404;margin-top:0
                     openai_tts_model_selected,
                     openai_voice_selected,
                     cur_tts_hash,
+                )
+            refreshed_audio = st.session_state.get("latest_tts_audio_bytes")
+            if refreshed_audio and st.session_state.get("latest_tts_audio_hash") == cur_tts_hash:
+                st.audio(
+                    refreshed_audio,
+                    format=st.session_state.get("latest_tts_audio_mime", "audio/mpeg"),
                 )
 
 
