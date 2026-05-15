@@ -771,6 +771,87 @@ def _read_url_bytes(url: str, label: str) -> bytes:
         raise RuntimeError(f"{label}: przekroczono limit czasu pobierania pliku.") from e
 
 
+def _demo_cache_dir() -> Path:
+    """Disk cache for demo datasets downloaded from remote storage."""
+    try:
+        cfg_local, _ = load_config()
+        root = resolve_artifacts_dir(cfg_local) / "demo_cache"
+    except Exception:
+        root = Path.cwd() / ".auto_eda_cache" / "demo_cache"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _safe_cache_suffix(file_format: str, url: str = "") -> str:
+    fmt = (file_format or "").lower().strip(".")
+    if fmt not in ("csv", "parquet"):
+        fmt = "parquet" if str(url).lower().split("?")[0].endswith(".parquet") else "csv"
+    return f".{fmt}"
+
+
+def _download_url_to_demo_cache(url: str, label: str, file_format: str) -> Path:
+    """Download a remote demo file once, then reuse it across reruns."""
+    suffix = _safe_cache_suffix(file_format, url)
+    digest = hashlib.sha256(f"{label}|{url}".encode("utf-8")).hexdigest()[:20]
+    target = _demo_cache_dir() / f"{digest}{suffix}"
+    meta_path = target.with_suffix(target.suffix + ".json")
+
+    if target.exists() and target.stat().st_size > 0:
+        return target
+
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    req = Request(url, headers={"User-Agent": "AutoEDA-Streamlit/1.0"})
+    try:
+        with urlopen(req, timeout=120) as response, tmp.open("wb") as f:
+            shutil.copyfileobj(response, f, length=1024 * 1024)
+        if not tmp.exists() or tmp.stat().st_size <= 0:
+            raise RuntimeError(f"{label}: pobrany plik jest pusty.")
+        tmp.replace(target)
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "label": label,
+                    "url_hash": hashlib.sha256(url.encode("utf-8")).hexdigest(),
+                    "file_format": suffix.lstrip("."),
+                    "downloaded_at": datetime.now().isoformat(timespec="seconds"),
+                    "bytes": int(target.stat().st_size),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return target
+    except HTTPError as e:
+        raise RuntimeError(
+            f"{label}: serwer zwrocil HTTP {e.code}. Sprawdz, czy URL prowadzi "
+            "bezposrednio do publicznego pliku i czy link nie wygasl."
+        ) from e
+    except URLError as e:
+        raise RuntimeError(
+            f"{label}: nie udalo sie polaczyc z adresem URL ({e.reason})."
+        ) from e
+    except TimeoutError as e:
+        raise RuntimeError(f"{label}: przekroczono limit czasu pobierania pliku.") from e
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _persist_demo_frame_to_cache(df: pd.DataFrame, label: str) -> Path | None:
+    """Persist non-file demos so the full run can reload them without session RAM."""
+    try:
+        digest = hashlib.sha256(label.encode("utf-8")).hexdigest()[:20]
+        target = _demo_cache_dir() / f"{digest}.parquet"
+        _df_to_parquet(df, target)
+        return target
+    except Exception:
+        return None
+
+
 def _read_tabular_source(path_or_url: str | Path, file_format: str, label: str) -> pd.DataFrame:
     path_txt = str(path_or_url)
     fmt = (file_format or "").lower()
@@ -787,6 +868,29 @@ def _read_tabular_source(path_or_url: str | Path, file_format: str, label: str) 
     if fmt == "parquet":
         return pd.read_parquet(path_or_url)
     return pd.read_csv(path_or_url)
+
+
+def _read_parquet_preview_and_shape(path: Path, preview_limit: int | None) -> tuple[pd.DataFrame, int, int]:
+    """Read only a preview from Parquet plus footer metadata for full shape."""
+    try:
+        import pyarrow.parquet as pq
+
+        parquet_file = pq.ParquetFile(path)
+        n_rows = int(parquet_file.metadata.num_rows)
+        n_cols = len(parquet_file.schema.names)
+        limit = int(preview_limit or n_rows)
+        if limit <= 0 or n_rows <= limit:
+            df_preview = pd.read_parquet(path)
+        else:
+            first_batch = next(parquet_file.iter_batches(batch_size=limit))
+            df_preview = first_batch.to_pandas()
+        return df_preview.head(limit).copy(), n_rows, n_cols
+    except Exception:
+        df = pd.read_parquet(path)
+        n_rows, n_cols = df.shape
+        if preview_limit is not None and n_rows > preview_limit:
+            return df.head(preview_limit).copy(), n_rows, n_cols
+        return df, n_rows, n_cols
 
 
 def _builtin_public_ts_dataset(spec: dict) -> pd.DataFrame | None:
@@ -976,6 +1080,14 @@ def _load_demo_dataset(spec: dict, preview_limit: int | None = None):
     """
     kind = spec.get("kind")
     task = spec.get("task") or ""
+    source_name = spec.get("label_short") or spec.get("dataset") or spec.get("url_env")
+    source_path: Path | None = None
+    source_format: str | None = None
+    source_cached = False
+    df_full: pd.DataFrame | None = None
+    df_preview: pd.DataFrame | None = None
+    n_full_rows: int | None = None
+    n_cols: int | None = None
 
     # 1) Wczytanie pełnego zbioru
     if kind == "pycaret":
@@ -1026,14 +1138,26 @@ def _load_demo_dataset(spec: dict, preview_limit: int | None = None):
         if url:
             # wariant 1: wczytujemy tabelę z URL (CSV lub Parquet)
             try:
-                df_full = _read_table(url)
+                cached_path = _download_url_to_demo_cache(url, url_env or str(source_name), file_format)
+                source_path = cached_path
+                source_format = _infer_format(str(cached_path))
+                source_cached = True
+                if source_format == "parquet":
+                    df_preview, n_full_rows, n_cols = _read_parquet_preview_and_shape(cached_path, preview_limit)
+                else:
+                    df_full = _read_table(str(cached_path))
             except Exception as e:
                 if local_existing_path:
                     st.warning(
                         f"Nie udało się pobrać `{url_env}` z URL, więc używam "
                         f"lokalnego fallbacku: `{local_existing_path}`.\n\nSzczegóły: {e}"
                     )
-                    df_full = _read_table(str(local_existing_path))
+                    source_path = local_existing_path
+                    source_format = _infer_format(str(local_existing_path))
+                    if source_format == "parquet":
+                        df_preview, n_full_rows, n_cols = _read_parquet_preview_and_shape(local_existing_path, preview_limit)
+                    else:
+                        df_full = _read_table(str(local_existing_path))
                 else:
                     builtin_df = _builtin_public_ts_dataset(spec)
                     if builtin_df is not None:
@@ -1054,7 +1178,12 @@ def _load_demo_dataset(spec: dict, preview_limit: int | None = None):
                         st.stop()
         elif local_existing_path:
             # wariant 2: fallback – lokalny plik w repo
-            df_full = _read_table(str(local_existing_path))
+            source_path = local_existing_path
+            source_format = _infer_format(str(local_existing_path))
+            if source_format == "parquet":
+                df_preview, n_full_rows, n_cols = _read_parquet_preview_and_shape(local_existing_path, preview_limit)
+            else:
+                df_full = _read_table(str(local_existing_path))
         else:
             builtin_df = _builtin_public_ts_dataset(spec)
             if builtin_df is not None:
@@ -1080,27 +1209,44 @@ def _load_demo_dataset(spec: dict, preview_limit: int | None = None):
         st.stop()
 
     # 2) Bezpieczne rzutowanie na DataFrame (naprawia możliwy błąd 'not enough values to unpack')
-    if isinstance(df_full, pd.Series):
-        df_full = df_full.to_frame()
-    elif not isinstance(df_full, pd.DataFrame):
-        df_full = pd.DataFrame(df_full)
+    if df_full is not None:
+        if isinstance(df_full, pd.Series):
+            df_full = df_full.to_frame()
+        elif not isinstance(df_full, pd.DataFrame):
+            df_full = pd.DataFrame(df_full)
 
-    n_full_rows, n_cols = df_full.shape
+    if df_full is not None and source_path is None:
+        persisted_path = _persist_demo_frame_to_cache(df_full, str(source_name or "demo"))
+        if persisted_path is not None:
+            source_path = persisted_path
+            source_format = "parquet"
+            source_cached = True
+
+    if df_full is not None:
+        n_full_rows, n_cols = df_full.shape
+
+    if df_preview is None and df_full is None:
+        raise RuntimeError("Nie udało się przygotować podglądu zestawu demo.")
 
     # 3) Podgląd (preview) – lekkie przycięcie do preview_limit
-    if preview_limit is not None and n_full_rows > preview_limit:
+    if df_preview is not None:
+        n_prev_rows = len(df_preview)
+    elif preview_limit is not None and n_full_rows > preview_limit:
         df_preview = df_full.head(preview_limit).copy()
         n_prev_rows = preview_limit
     else:
         df_preview = df_full.copy()
         n_prev_rows = n_full_rows
 
+    n_full_rows = int(n_full_rows or len(df_preview))
+    n_cols = int(n_cols or len(df_preview.columns))
+
     # 4) Notatki + opis silnika
     notes = spec.get("description") or ""
     if kind == "pycaret":
         notes = (notes + " (źródło: pycaret.datasets.get_data)").strip()
     elif kind in ("remote_csv", "remote_file"):
-        fmt = (spec.get("file_format") or "").lower()
+        fmt = (source_format or spec.get("file_format") or "").lower()
         if fmt == "parquet":
             suffix = " (plik z URL, Parquet)"
         elif fmt == "csv":
@@ -1115,7 +1261,7 @@ def _load_demo_dataset(spec: dict, preview_limit: int | None = None):
     if kind == "pycaret":
         engine_name = "demo_pycaret"
     else:
-        fmt = (spec.get("file_format") or "").lower()
+        fmt = (source_format or spec.get("file_format") or "").lower()
         engine_name = "demo_remote_parquet" if fmt == "parquet" else "demo_remote_csv"
 
     # 6) Metadane – TU dodajemy task, żeby Etap 2 widział „Szereg czasowy”
@@ -1127,6 +1273,9 @@ def _load_demo_dataset(spec: dict, preview_limit: int | None = None):
         encoding=None,
         notes=notes,
         task=task,        # ⬅️ KLUCZOWE: zadanie trafia do meta.json
+        source_path=str(source_path) if source_path else None,
+        source_format=source_format,
+        cached_source=bool(source_cached),
     )
     meta_full = SimpleNamespace(
         n_rows=n_full_rows,
@@ -1136,13 +1285,21 @@ def _load_demo_dataset(spec: dict, preview_limit: int | None = None):
         encoding=None,
         notes=notes,
         task=task,        # ⬅️ to samo dla pełnego meta
+        source_path=str(source_path) if source_path else None,
+        source_format=source_format,
+        cached_source=bool(source_cached),
     )
 
     # 7) Szacowany rozmiar w MB – tylko info, nie wpływa na CPU
-    approx_size_mb = round(
-        df_full.memory_usage(deep=True).sum() / (1024 ** 2),
-        2,
-    )
+    if source_path and source_path.exists():
+        approx_size_mb = round(source_path.stat().st_size / (1024 ** 2), 2)
+    elif df_full is None:
+        approx_size_mb = 0.0
+    else:
+        approx_size_mb = round(
+            df_full.memory_usage(deep=True).sum() / (1024 ** 2),
+            2,
+        )
 
     return df_preview, df_full, meta_preview, meta_full, approx_size_mb
 
@@ -1512,9 +1669,12 @@ else:
     already_loaded = (
         demo_state.get("label") == demo_label
         and demo_state.get("df_preview") is not None
-        and demo_state.get("df_full_demo") is not None
         and demo_state.get("meta") is not None
         and demo_state.get("meta_full_demo") is not None
+        and (
+            demo_state.get("source_path")
+            or getattr(demo_state.get("meta_full_demo"), "source_path", None)
+        )
     )
 
     load_demo = st.button(
@@ -1542,16 +1702,18 @@ else:
         demo_state = {
             "label": demo_label,
             "df_preview": df_preview,
-            "df_full_demo": df_full_demo,
             "meta": meta,
             "meta_full_demo": meta_full_demo,
             "size_mb": size_mb,
+            "source_path": getattr(meta_full_demo, "source_path", None),
+            "source_format": getattr(meta_full_demo, "source_format", None),
         }
         st.session_state[demo_state_key] = demo_state
+        df_full_demo = None
     else:
         # 3) Kolejne reruny – korzystamy z danych zapisanych w stanie
         df_preview = demo_state["df_preview"]
-        df_full_demo = demo_state["df_full_demo"]
+        df_full_demo = None
         meta = demo_state["meta"]
         meta_full_demo = demo_state["meta_full_demo"]
         size_mb = demo_state["size_mb"]
@@ -1755,9 +1917,67 @@ if st.session_state.get("full_run_requested", False):
         full_n_cols: int | None = None
 
         if is_demo:
-            df_full = df_full_demo.copy()
+            df_full = None
             meta_full = meta_full_demo
-            status.write("✔ 1/3 – Wczytywanie pełnego zbioru zakończone (demo).")
+            demo_source_raw = (
+                demo_state.get("source_path") if isinstance(demo_state, dict) else None
+            ) or getattr(meta_full_demo, "source_path", None)
+            demo_source_format = (
+                demo_state.get("source_format") if isinstance(demo_state, dict) else None
+            ) or getattr(meta_full_demo, "source_format", None)
+            demo_source_path = Path(str(demo_source_raw)) if demo_source_raw else None
+
+            if not (demo_source_path and demo_source_path.exists()):
+                status.update(label="Brak lokalnego cache danych demo", state="error")
+                st.error(
+                    "Nie mam lokalnego pliku demo do pełnego przeliczenia. "
+                    "Kliknij ponownie **Załaduj dane demo**."
+                )
+                st.session_state["full_run_requested"] = False
+                st.stop()
+
+            fmt = (demo_source_format or "").lower()
+            if not fmt:
+                fmt = "parquet" if demo_source_path.suffix.lower() == ".parquet" else "csv"
+
+            if fmt == "parquet":
+                meta_candidate, parquet_columns = _parquet_metadata_for_passthrough(
+                    demo_source_path,
+                    str(getattr(meta_full, "source_name", base_name)),
+                )
+                pii_name_hits = [
+                    col for col in parquet_columns if str(col).strip().lower() in PII_COL_GUESSES
+                ]
+                if meta_candidate is not None and (not mask_pii or not pii_name_hits):
+                    meta_full = SimpleNamespace(
+                        **(
+                            meta_full.__dict__
+                            | {
+                                "n_rows": int(meta_candidate.n_rows),
+                                "n_cols": int(meta_candidate.n_cols),
+                                "engine": "demo_remote_parquet_passthrough",
+                                "notes": f"{getattr(meta_full, 'notes', '')} (cache disk, passthrough)",
+                                "source_path": str(demo_source_path),
+                                "source_format": "parquet",
+                            }
+                        )
+                    )
+                    passthrough_source_path = demo_source_path
+                    status.write("Parquet demo: kopiuję pełny plik z cache bez odczytu wszystkich wierszy do RAM.")
+                else:
+                    df_full = _read_tabular_source(
+                        demo_source_path,
+                        fmt,
+                        str(getattr(meta_full, "source_name", base_name)),
+                    )
+                    status.write("✔ 1/3 – Wczytywanie pełnego zbioru zakończone (demo z cache).")
+            else:
+                df_full = _read_tabular_source(
+                    demo_source_path,
+                    fmt,
+                    str(getattr(meta_full, "source_name", base_name)),
+                )
+                status.write("✔ 1/3 – Wczytywanie pełnego zbioru zakończone (demo z cache).")
         else:
             df_full = None
             meta_full = None
