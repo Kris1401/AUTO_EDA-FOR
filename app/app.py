@@ -787,10 +787,10 @@ def _render_datachat_question_router_section() -> None:
         "gałąź odpowiedzi i zestaw wykresów najlepiej dopasowany do celu pytania."
     )
 
-    chart_path = Path(__file__).resolve().parent / "assets" / "andrew_abela_chart_chooser.jpg"
+    chart_path = Path(__file__).resolve().parent / "assets" / "chart_choice_schema_pl.png"
     st.image(
         str(chart_path),
-        caption="Schemat referencyjny: Andrew Abela — typ pytania determinuje najlepszą rodzinę wizualizacji.",
+        caption="Schemat wyboru wizualizacji: pytanie użytkownika prowadzi do właściwej rodziny wykresów.",
         width="stretch",
     )
 
@@ -972,11 +972,45 @@ def _render_datachat_question_router_section() -> None:
     )
 
 
+def _render_footer() -> None:
+    st.markdown(
+        """
+        <style>
+          .home-footer {
+            margin-top: 2.5rem;
+            padding: 1.1rem 0 0.5rem;
+            border-top: 1px solid rgba(148, 163, 184, 0.45);
+            color: #64748b;
+            font-size: 0.92rem;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.45rem 1rem;
+            align-items: center;
+            justify-content: space-between;
+          }
+          .home-footer a {
+            color: #2563eb;
+            text-decoration: none;
+            font-weight: 600;
+          }
+          .home-footer a:hover {
+            text-decoration: underline;
+          }
+        </style>
+        <footer class="home-footer">
+          <span>© 2026 AUTO EDA FOR. Wszelkie prawa zastrzeżone.</span>
+          <span>Kontakt: <a href="mailto:krzysztof.milan@data.pl">krzysztof.milan@data.pl</a></span>
+        </footer>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 st.set_page_config(
     page_title="AUTO EDA FOR",
     page_icon="\U0001F9E0",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 hide_default_multipage_nav()
@@ -1024,3 +1058,5 @@ st.success(
 )
 
 _render_datachat_question_router_section()
+
+_render_footer()
